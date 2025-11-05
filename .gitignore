@@ -8,3 +8,25 @@
 version.py
 __pycache__
 model_repo
+
+# Python virtual env and caches
+.venv/
+**/__pycache__/
+*.pyc
+
+# Local audio I/O (can be large)
+input_audio/
+output_audio/
+
+# Downloaded model weights and checkpoints (nested locations)
+resemble_enhance/model_repo/
+**/model_repo/
+**/ds/
+*.pt
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+
+# Accidental stray file
+' 

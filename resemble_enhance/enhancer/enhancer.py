@@ -10,7 +10,6 @@ from ..common import Normalizer
 from ..denoiser.inference import load_denoiser
 from ..melspec import MelSpectrogram
 from ..utils.distributed import global_leader_only
-from ..utils.train_loop import TrainLoop
 from .hparams import HParams
 from .lcfm import CFM, IRMAE, LCFM
 from .univnet import UnivNet
@@ -109,6 +108,12 @@ class Enhancer(nn.Module):
     @global_leader_only
     @torch.no_grad()
     def _visualize(self, original_mel, denoised_mel):
+        try:
+            # Imported lazily to avoid hard dependency on deepspeed during inference
+            from ..utils.train_loop import TrainLoop  # type: ignore
+        except Exception:
+            return
+
         loop = TrainLoop.get_running_loop()
         if loop is None or loop.global_step % 100 != 0:
             return

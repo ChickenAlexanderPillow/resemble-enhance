@@ -4,7 +4,8 @@ from functools import cache
 import torch
 
 from ..inference import inference
-from .train import Denoiser, HParams
+from .denoiser import Denoiser
+from .hparams import HParams
 
 logger = logging.getLogger(__name__)
 

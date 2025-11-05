@@ -3,10 +3,28 @@ import socket
 from functools import cache, partial, wraps
 from typing import Callable
 
-import deepspeed
 import torch
-from deepspeed.accelerator import get_accelerator
-from torch.distributed import broadcast_object_list
+try:
+    import deepspeed  # type: ignore
+    from deepspeed.accelerator import get_accelerator  # type: ignore
+    _HAVE_DEEPSPEED = True
+except Exception:
+    deepspeed = None  # type: ignore
+    _HAVE_DEEPSPEED = False
+
+    def get_accelerator():  # fallback with minimal API
+        class _Dummy:
+            def communication_backend_name(self):
+                # Not used during inference; return a sensible default
+                return "nccl" if torch.cuda.is_available() else "gloo"
+
+        return _Dummy()
+
+try:
+    from torch.distributed import broadcast_object_list  # type: ignore
+except Exception:
+    def broadcast_object_list(obj_list, src=0):  # no-op fallback
+        return obj_list
 
 
 def get_free_port():
@@ -31,8 +49,10 @@ def fix_unset_envs():
 @cache
 def init_distributed():
     fix_unset_envs()
-    deepspeed.init_distributed(get_accelerator().communication_backend_name())
-    torch.cuda.set_device(local_rank())
+    if _HAVE_DEEPSPEED:
+        deepspeed.init_distributed(get_accelerator().communication_backend_name())
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank())
 
 
 def local_rank():

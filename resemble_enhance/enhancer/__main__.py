@@ -120,10 +120,11 @@ def main():
         out_path.parent.mkdir(parents=True, exist_ok=True)
         torchaudio.save(out_path, hwav[None], sr)
 
-    # Cool emoji effect saying the job is done
+    # Print completion message (cross-platform safe)
     elapsed_time = time.perf_counter() - start_time
-    print(f"🌟 Enhancement done! {len(paths)} files processed in {elapsed_time:.2f}s")
+    print(f"Enhancement done! {len(paths)} files processed in {elapsed_time:.2f}s")
 
 
 if __name__ == "__main__":
     main()
+

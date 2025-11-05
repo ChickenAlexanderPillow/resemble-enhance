@@ -31,6 +31,39 @@ pip install resemble-enhance --upgrade --pre
 resemble-enhance in_dir out_dir
 ```
 
+### Inference Without DeepSpeed (Windows-friendly)
+
+- No additional flags are required to skip DeepSpeed for inference. The CLI below works without installing DeepSpeed.
+- The model weights download automatically on first run.
+
+Common flags:
+
+- `--device {cuda|cpu}`: choose GPU or CPU. Example: `--device cuda`
+- `--nfe <int>`: number of function evaluations (speed/quality tradeoff). Lower is faster. Example: `--nfe 16`
+- `--solver {midpoint|rk4|euler}`: ODE solver for the enhancer. Example: `--solver midpoint`
+- `--tau <0..1>`: CFM prior temperature. Example: `--tau 0.5`
+- `--lambd <0..1>`: denoise strength blending during enhancement. Example: `--lambd 1.0`
+- `--denoise_only`: only run the denoiser (no enhancement)
+- `--run_dir <path>`: use a specific run directory with checkpoints and `hparams.yaml`
+
+Examples:
+
+```
+# GPU inference (recommended if available)
+resemble-enhance in_dir out_dir --device cuda --nfe 90 --solver midpoint --tau 0.5
+
+# Faster test run (lower quality but quicker)
+resemble-enhance in_dir out_dir --device cuda --nfe 16 --solver midpoint
+
+# CPU fallback
+resemble-enhance in_dir out_dir --device cpu --nfe 16 --solver euler
+
+# Denoise only
+resemble-enhance in_dir out_dir --denoise_only --device cuda
+```
+python.exe -m resemble_enhance.enhancer input_audio output_audio --denoise_only --device cuda
+
+
 ### Denoise only
 
 ```
@@ -44,6 +77,12 @@ We provide a web demo built with Gradio, you can try it out [here](https://huggi
 ```
 python app.py
 ```
+
+Notes
+
+- Inference does not require DeepSpeed. Training does. If you are on Windows, use the commands above without installing DeepSpeed.
+- The first run downloads the default model to `resemble_enhance/model_repo/enhancer_stage2`.
+- For custom checkpoints, pass `--run_dir <your_run_dir>` containing `hparams.yaml` and `ds/G/default/mp_rank_00_model_states.pt`.
 
 ## Train your own model
 

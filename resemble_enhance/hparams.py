@@ -3,6 +3,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from omegaconf import OmegaConf
+import yaml
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -90,8 +91,22 @@ class HParams:
     @classmethod
     def from_yaml(cls, path: Path) -> "HParams":
         logger.info(f"Reading hparams from {path}")
-        # First merge to fix types (e.g., str -> Path)
-        return cls(**dict(OmegaConf.merge(cls(), OmegaConf.load(path))))
+        # Use a safe YAML loader that converts PosixPath tags to platform paths
+        class _SafeLoader(yaml.SafeLoader):
+            pass
+
+        def _posix_path_constructor(loader, node):
+            parts = loader.construct_sequence(node)
+            return Path(*parts)
+
+        _tag = "tag:yaml.org,2002:python/object/apply:pathlib.PosixPath"
+        _SafeLoader.add_constructor(_tag, _posix_path_constructor)
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.load(f, Loader=_SafeLoader)
+
+        # Merge with defaults to ensure types and missing keys are handled
+        return cls(**dict(OmegaConf.merge(cls(), data)))
 
     def save_if_not_exists(self, run_dir: Path):
         path = run_dir / "hparams.yaml"
