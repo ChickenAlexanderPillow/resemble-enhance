@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Resemble Enhance — Drop Zone</title>
+    <link rel="stylesheet" href="/static/style.css?v={{ app_version }}" />
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>Resemble Enhance <small style="opacity:.6;font-weight:normal">v{{ app_version }}</small></h1>
+      <div id="drop" class="drop">Drop audio files here</div>
+      <div class="hint">or click to select</div>
+      <input id="file" type="file" multiple accept="audio/*,.wav" hidden />
+
+      <div id="log" class="log"></div>
+    </div>
+    <script src="/static/app.js?v={{ app_version }}"></script>
+  </body>
+  </html>

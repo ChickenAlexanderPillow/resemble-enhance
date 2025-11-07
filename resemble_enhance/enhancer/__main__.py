@@ -1,4 +1,5 @@
 import argparse
+import os
 import random
 import time
 from pathlib import Path
@@ -115,6 +116,7 @@ def main():
         args.chunk_seconds = 31.0
         args.overlap_seconds = 1.0
         args.align_max_shift_ratio = 0.25
+        args.align_disable = True
 
     device = args.device
 
@@ -142,6 +144,8 @@ def main():
         if args.parallel_mode and out_path.exists():
             continue
         pbar.set_description(f"Processing {out_path}")
+        # Expose file path for progress reporting in inference
+        os.environ["RESEMBLE_FILE"] = str(path)
         dwav, sr = torchaudio.load(path)
         orig_sr = sr
         orig_len = dwav.shape[-1]

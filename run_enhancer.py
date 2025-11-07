@@ -85,42 +85,19 @@ def main() -> int:
 
     proc = subprocess.run(cmd)
 
-    # Only attempt deletion if the run completed successfully
+    # Keep input files untouched. Optionally, sanity-check outputs exist.
     if proc.returncode == 0:
-        # Determine suffix pattern used by the enhancer; default to .wav
         suffix = _get_arg_value(sys.argv, "--suffix") or ".wav"
-
-        # Collect candidate input files matching suffix pattern
-        candidates: list[Path] = [
-            p for p in in_dir.rglob(f"*{suffix}") if p.is_file()
-        ]
-
-        removed = 0
+        candidates = [p for p in in_dir.rglob(f"*{suffix}") if p.is_file()]
         checked = 0
+        missing = 0
         for src in candidates:
             rel = src.relative_to(in_dir)
             dst = out_dir / rel
             checked += 1
-
-            if not dst.exists() or dst.stat().st_size <= 44:  # minimal WAV header
-                # Skip deletion if output missing or looks invalid
-                continue
-
-            din = _compute_wav_duration_sec(src)
-            dout = _compute_wav_duration_sec(dst)
-
-            # If we can read durations, ensure they match closely
-            if din is not None and dout is not None:
-                if abs(din - dout) > 1e-3:  # 1 ms tolerance
-                    continue
-
-            if _safe_delete(src):
-                removed += 1
-
-        print(f"Cleanup: checked {checked} inputs; deleted {removed} after successful enhance.")
-
-        # Attempt to prune any now-empty directories under input root
-        _prune_empty_dirs(in_dir)
+            if not dst.exists() or dst.stat().st_size <= 44:
+                missing += 1
+        print(f"Post-run: checked {checked} inputs; {missing} missing/invalid outputs.")
 
     return proc.returncode
 

@@ -35,6 +35,7 @@ def denoise(
     overlap_seconds: float = 1.0,
     align_max_shift_ratio: float = 0.25,
     align_disable: bool = False,
+    progress_cb=None,
 ):
     enhancer = load_enhancer(run_dir, device)
     return inference(
@@ -46,6 +47,7 @@ def denoise(
         overlap_seconds=overlap_seconds,
         align_max_shift_ratio=align_max_shift_ratio,
         disable_align=align_disable,
+        progress_cb=progress_cb,
     )
 
 
@@ -63,6 +65,7 @@ def enhance(
     overlap_seconds: float = 1.0,
     align_max_shift_ratio: float = 0.25,
     align_disable: bool = False,
+    progress_cb=None,
 ):
     assert 0 < nfe <= 128, f"nfe must be in (0, 128], got {nfe}"
     assert solver in ("midpoint", "rk4", "euler"), f"solver must be in ('midpoint', 'rk4', 'euler'), got {solver}"
@@ -79,4 +82,5 @@ def enhance(
         overlap_seconds=overlap_seconds,
         align_max_shift_ratio=align_max_shift_ratio,
         disable_align=align_disable,
+        progress_cb=progress_cb,
     )

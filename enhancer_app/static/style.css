@@ -1,0 +1,11 @@
+:root{color-scheme: dark light}
+body{font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin:0;padding:0;display:grid;place-items:center;min-height:100dvh;background:#0f1115;color:#e6e6e6}
+.wrap{max-width:720px;padding:32px}
+h1{font-size:20px;margin:0 0 16px 0;color:#9ad}
+.drop{border:2px dashed #567; border-radius:12px; padding:40px; text-align:center; font-size:18px; background:#111723}
+.drop.hover{background:#132133; border-color:#7ab}
+.hint{opacity:.7; font-size:12px; margin-top:6px}
+.log{margin-top:18px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space:pre-wrap; background:#0b0e14; border:1px solid #333; border-radius:8px; padding:12px}
+button{background:#2a4; color:#fff; border:none; padding:8px 12px; border-radius:8px; cursor:pointer}
+button.secondary{background:#345}
+

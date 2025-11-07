@@ -1,5 +1,7 @@
 import logging
 import time
+import os
+import math
 
 import torch
 import torch.nn.functional as F
@@ -87,10 +89,12 @@ def merge_chunks(
     overlap_length = chunk_length - hop_length
     signal = torch.zeros(signal_length, device=chunks[0].device)
 
-    fadein = torch.linspace(0, 1, overlap_length, device=chunks[0].device)
-    fadein = torch.cat([fadein, torch.ones(hop_length, device=chunks[0].device)])
-    fadeout = torch.linspace(1, 0, overlap_length, device=chunks[0].device)
-    fadeout = torch.cat([torch.ones(hop_length, device=chunks[0].device), fadeout])
+    # Equal-power crossfade to reduce perceptual loops at boundaries
+    t = torch.linspace(0, torch.pi / 2, overlap_length, device=chunks[0].device)
+    fadein_overlap = torch.sin(t) ** 2
+    fadeout_overlap = torch.cos(t) ** 2
+    fadein = torch.cat([torch.ones(hop_length, device=chunks[0].device), fadein_overlap])
+    fadeout = torch.cat([fadeout_overlap, torch.ones(hop_length, device=chunks[0].device)])
 
     for i, chunk in enumerate(chunks):
         start = i * hop_length
@@ -156,6 +160,7 @@ def inference(
     overlap_seconds: float = 1.0,
     align_max_shift_ratio: float = 0.25,
     disable_align: bool = False,
+    progress_cb=None,
 ):
     remove_weight_norm_recursively(model)
 
@@ -185,8 +190,27 @@ def inference(
     hop_length = chunk_length - overlap_length
 
     chunks = []
-    for start in trange(0, dwav.shape[-1], hop_length):
+    # Optional progress reporting for external UIs
+    report = os.environ.get("RESEMBLE_PROGRESS", "0") == "1"
+    cur_file = os.environ.get("RESEMBLE_FILE", "")
+    n_chunks = max(1, math.ceil(dwav.shape[-1] / hop_length))
+    if report:
+        print(f"PROGRESS START file={cur_file} n={n_chunks}")
+    if progress_cb is not None:
+        try:
+            progress_cb("start", cur_file, 0, n_chunks)
+        except Exception:
+            pass
+
+    for i, start in enumerate(trange(0, dwav.shape[-1], hop_length), start=1):
         chunks.append(inference_chunk(model, dwav[start : start + chunk_length], sr, device))
+        if report:
+            print(f"PROGRESS CHUNK file={cur_file} i={i} n={n_chunks}")
+        if progress_cb is not None:
+            try:
+                progress_cb("chunk", cur_file, i, n_chunks)
+            except Exception:
+                pass
 
     hwav = merge_chunks(
         chunks,
@@ -203,5 +227,12 @@ def inference(
 
     elapsed_time = time.perf_counter() - start_time
     logger.info(f"Elapsed time: {elapsed_time:.3f} s, {hwav.shape[-1] / elapsed_time / 1000:.3f} kHz")
+    if report:
+        print(f"PROGRESS END file={cur_file}")
+    if progress_cb is not None:
+        try:
+            progress_cb("end", cur_file, n_chunks, n_chunks)
+        except Exception:
+            pass
 
     return hwav, sr
