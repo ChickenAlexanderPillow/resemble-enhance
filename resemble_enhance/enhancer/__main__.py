@@ -34,9 +34,45 @@ def main():
         help="Device to use for computation, recommended to use CUDA",
     )
     parser.add_argument(
+        "--target_sr",
+        type=int,
+        default=None,
+        help="Optional output sample rate (e.g., 48000). If omitted, preserves the input file's sample rate",
+    )
+    parser.add_argument(
         "--denoise_only",
         action="store_true",
         help="Only apply denoising without enhancement",
+    )
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        choices=["camera_sync"],
+        help="Preset for common workflows (e.g., camera_sync)",
+    )
+    parser.add_argument(
+        "--chunk_seconds",
+        type=float,
+        default=31.0,
+        help="Chunk length in seconds",
+    )
+    parser.add_argument(
+        "--overlap_seconds",
+        type=float,
+        default=1.0,
+        help="Overlap between chunks in seconds",
+    )
+    parser.add_argument(
+        "--align_max_shift_ratio",
+        type=float,
+        default=0.25,
+        help="Maximum fraction of overlap allowed for alignment shift (0-1)",
+    )
+    parser.add_argument(
+        "--align_disable",
+        action="store_true",
+        help="Disable cross-chunk alignment correction",
     )
     parser.add_argument(
         "--lambd",
@@ -71,6 +107,15 @@ def main():
 
     args = parser.parse_args()
 
+    # Apply profile presets if requested
+    if args.profile == "camera_sync":
+        # Favor sync safety and seam robustness
+        if args.target_sr is None:
+            args.target_sr = 48000
+        args.chunk_seconds = 31.0
+        args.overlap_seconds = 1.0
+        args.align_max_shift_ratio = 0.25
+
     device = args.device
 
     if device == "cuda" and not torch.cuda.is_available():
@@ -98,6 +143,8 @@ def main():
             continue
         pbar.set_description(f"Processing {out_path}")
         dwav, sr = torchaudio.load(path)
+        orig_sr = sr
+        orig_len = dwav.shape[-1]
         dwav = dwav.mean(0)
         if args.denoise_only:
             hwav, sr = denoise(
@@ -105,6 +152,10 @@ def main():
                 sr=sr,
                 device=device,
                 run_dir=args.run_dir,
+                chunk_seconds=args.chunk_seconds,
+                overlap_seconds=args.overlap_seconds,
+                align_max_shift_ratio=args.align_max_shift_ratio,
+                align_disable=args.align_disable,
             )
         else:
             hwav, sr = enhance(
@@ -116,7 +167,31 @@ def main():
                 lambd=args.lambd,
                 tau=args.tau,
                 run_dir=run_dir,
+                chunk_seconds=args.chunk_seconds,
+                overlap_seconds=args.overlap_seconds,
+                align_max_shift_ratio=args.align_max_shift_ratio,
+                align_disable=args.align_disable,
             )
+        # Choose destination sample rate: fixed target or original
+        dest_sr = args.target_sr if args.target_sr is not None else orig_sr
+
+        # Resample back to the requested output rate to preserve timeline sync
+        if sr != dest_sr:
+            hwav = torchaudio.functional.resample(hwav, orig_freq=sr, new_freq=dest_sr)
+            sr = dest_sr
+
+        # Enforce exact sample count to avoid off-by-one drift
+        if args.target_sr is not None:
+            expected_len = round(orig_len * dest_sr / orig_sr)
+        else:
+            expected_len = orig_len
+
+        cur_len = hwav.shape[-1]
+        if cur_len > expected_len:
+            hwav = hwav[:expected_len]
+        elif cur_len < expected_len:
+            hwav = torch.nn.functional.pad(hwav, (0, expected_len - cur_len))
+
         out_path.parent.mkdir(parents=True, exist_ok=True)
         torchaudio.save(out_path, hwav[None], sr)
 
@@ -127,4 +202,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

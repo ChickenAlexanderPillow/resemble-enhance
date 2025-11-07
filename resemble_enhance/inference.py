@@ -74,7 +74,15 @@ def compute_offset(chunk1, chunk2, sr=44100):
     return offset
 
 
-def merge_chunks(chunks, chunk_length, hop_length, sr=44100, length=None):
+def merge_chunks(
+    chunks,
+    chunk_length,
+    hop_length,
+    sr=44100,
+    length=None,
+    max_shift_ratio: float = 0.25,
+    disable_align: bool = False,
+):
     signal_length = (len(chunks) - 1) * hop_length + chunk_length
     overlap_length = chunk_length - hop_length
     signal = torch.zeros(signal_length, device=chunks[0].device)
@@ -92,9 +100,21 @@ def merge_chunks(chunks, chunk_length, hop_length, sr=44100, length=None):
             chunk = F.pad(chunk, (0, chunk_length - len(chunk)))
 
         if i > 0:
-            pre_region = chunks[i - 1][-overlap_length:]
-            cur_region = chunk[:overlap_length]
-            offset = compute_offset(pre_region, cur_region, sr=sr)
+            if disable_align:
+                offset = 0
+            else:
+                pre_region = chunks[i - 1][-overlap_length:]
+                cur_region = chunk[:overlap_length]
+                offset = compute_offset(pre_region, cur_region, sr=sr)
+
+                # Clamp offset to a configurable fraction of the overlap
+                max_shift = int(overlap_length * max_shift_ratio)
+                if offset > max_shift:
+                    offset = max_shift
+                elif offset < -max_shift:
+                    offset = -max_shift
+
+            # Apply alignment offset; keep sign consistent with compute_offset
             start -= offset
             end -= offset
 
@@ -105,7 +125,14 @@ def merge_chunks(chunks, chunk_length, hop_length, sr=44100, length=None):
         else:
             chunk = chunk * fadein * fadeout
 
-        signal[start:end] += chunk[: len(signal[start:end])]
+        # Safely add chunk into the signal buffer with clamped indices
+        write_start = max(start, 0)
+        write_end = min(end, signal_length)
+
+        if write_end > write_start:
+            chunk_start = write_start - start
+            chunk_end = chunk_start + (write_end - write_start)
+            signal[write_start:write_end] += chunk[chunk_start:chunk_end]
 
     signal = signal[:length]
 
@@ -120,7 +147,16 @@ def remove_weight_norm_recursively(module):
             pass
 
 
-def inference(model, dwav, sr, device, chunk_seconds: float = 30.0, overlap_seconds: float = 1.0):
+def inference(
+    model,
+    dwav,
+    sr,
+    device,
+    chunk_seconds: float = 31.0,
+    overlap_seconds: float = 1.0,
+    align_max_shift_ratio: float = 0.25,
+    disable_align: bool = False,
+):
     remove_weight_norm_recursively(model)
 
     hp: HParams = model.hp
@@ -152,7 +188,15 @@ def inference(model, dwav, sr, device, chunk_seconds: float = 30.0, overlap_seco
     for start in trange(0, dwav.shape[-1], hop_length):
         chunks.append(inference_chunk(model, dwav[start : start + chunk_length], sr, device))
 
-    hwav = merge_chunks(chunks, chunk_length, hop_length, sr=sr, length=dwav.shape[-1])
+    hwav = merge_chunks(
+        chunks,
+        chunk_length,
+        hop_length,
+        sr=sr,
+        length=dwav.shape[-1],
+        max_shift_ratio=align_max_shift_ratio,
+        disable_align=disable_align,
+    )
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()

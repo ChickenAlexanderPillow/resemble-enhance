@@ -17,7 +17,10 @@ model_repo
 # Local audio I/O (can be large)
 input_audio/
 output_audio/
-
+Shoot/
+.pp_test_in/
+.pp_test_out_cli/
+.pp_test_out_global/
 # Downloaded model weights and checkpoints (nested locations)
 resemble_enhance/model_repo/
 **/model_repo/
