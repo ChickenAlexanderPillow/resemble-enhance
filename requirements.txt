@@ -18,3 +18,4 @@ tabulate>=0.8.10
 gradio>=4.8.0
 Flask>=2.3.0
 audalign>=0.4.0
+pyloudnorm>=0.1.1

@@ -14,7 +14,7 @@ from ctypes import wintypes
 
 # Optional drag-and-drop support via tkinterdnd2 (if available)
 try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
+    from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore[import-not-found]
     DND_AVAILABLE = True
 except Exception:  # noqa: BLE001
     DND_AVAILABLE = False
@@ -156,7 +156,8 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
             if m:
                 name = m.group(1)
                 try:
-                    i = int(m.group(2)); n = int(m.group(3))
+                    i = int(m.group(2))
+                    n = int(m.group(3))
                 except Exception:
                     i, n = 0, 0
                 if chunk_progress_cb:
@@ -300,28 +301,33 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             style.theme_use('clam')
         except Exception:
             pass
-        # Dark, sleek palette
-        self._bg = "#D1D1D1"
-        self._panel = "#BBBBBB"
-        self._text = "#161616"
-        self._muted = "#ffffff"
-        self._accent = "#464646"
+        # Modern dark palette
+        self._bg = "#0f1115"
+        self._panel = "#151923"
+        self._text = "#e5e7eb"
+        self._muted = "#9aa4b2"
+        self._accent = "#3b82f6"
         self.configure(bg=self._bg)
         style.configure('.', background=self._bg, foreground=self._text)
         style.configure('TFrame', background=self._bg)
-        style.configure('Title.TLabel', background=self._bg, foreground=self._muted, font=('Segoe UI', 13, 'bold'))
-        style.configure('Info.TLabel', background=self._bg, foreground=self._text)
-        style.configure('TButton', padding=8)
-        style.map('TButton', background=[('active', "#7a7a7a")])
-        style.configure('Drop.TFrame', background=self._panel, bordercolor='#1f2a44', relief='solid')
-        style.configure('Horizontal.TProgressbar', troughcolor='#0c0f14', background=self._accent, bordercolor=self._panel, lightcolor=self._accent, darkcolor=self._accent)
+        style.configure('Title.TLabel', background=self._bg, foreground=self._text, font=('Segoe UI', 13, 'bold'))
+        style.configure('Info.TLabel', background=self._bg, foreground=self._muted)
+        style.configure('TButton', padding=8, background=self._panel, foreground=self._text)
+        style.map('TButton', background=[('active', "#1f2937")])
+        style.configure('Drop.TFrame', background=self._panel, bordercolor='#1f2937', relief='solid')
+        style.configure('Horizontal.TProgressbar', troughcolor='#0b0f16', background=self._accent, bordercolor=self._panel, lightcolor=self._accent, darkcolor=self._accent)
         style.configure('Treeview', background=self._panel, fieldbackground=self._panel, foreground=self._text, bordercolor=self._panel)
-        style.map('Treeview', background=[('selected', '#1f3d66')], foreground=[('selected', self._text)])
+        style.map('Treeview', background=[('selected', '#1e293b')], foreground=[('selected', self._text)])
+        # Treeview heading styling (match button hover palette)
+        style.configure('Treeview.Heading', background=self._panel, foreground=self._text)
+        style.map('Treeview.Heading', background=[('active', '#1e293b')])
         # Accent button styles
-        style.configure('Accent.TButton', background=self._accent, foreground=self._text)
-        style.configure('AccentHover.TButton', background="#242424", foreground=self._text)
+        style.configure('Accent.TButton', background=self._accent, foreground="#0b0f16")
+        style.configure('AccentHover.TButton', background="#60a5fa", foreground="#0b0f16")
         # Standard hover style for normal buttons
-        style.configure('Hover.TButton', background='#1b2333', foreground=self._text)
+        style.configure('Hover.TButton', background='#1e293b', foreground=self._text)
+        # Option checkbuttons
+        style.configure('Opt.TCheckbutton', background=self._panel, foreground=self._text, padding=4)
 
         # Helper to apply a simple hover effect to any ttk.Button
         def _bind_hover(b: ttk.Button, base_style: str = 'TButton', hover_style: str = 'Hover.TButton'):
@@ -337,44 +343,46 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         pw = ttk.Panedwindow(self, orient='horizontal')
         pw.pack(fill='both', expand=True, padx=12, pady=12)
 
-        left = ttk.Frame(pw)
+        left = ttk.Frame(pw, width=360)
         right = ttk.Frame(pw)
-        pw.add(left, weight=1)
-        pw.add(right, weight=2)
+        # Fix left column width for consistent visibility
+        pw.add(left, weight=0)
+        pw.add(right, weight=1)
+        # Ensure sash is positioned after layout and stays fixed
+        self._left_fixed_width = 360
+        def _set_sash():
+            try:
+                pw.sashpos(0, self._left_fixed_width)
+            except Exception:
+                pass
+        self.after(100, _set_sash)
+        pw.bind('<Configure>', lambda e: _set_sash())
+        self.bind('<Configure>', lambda e: _set_sash())
 
-        # Left column: title, drop zone, buttons, queue list
+        # Left column: title, buttons, options, queue list
         title = "Drop or select audio files to enhance" if DND_AVAILABLE else "Select audio files to enhance"
         ttk.Label(left, text=title, style='Title.TLabel').pack(anchor='w')
 
-        dzframe = ttk.Frame(left, style='Drop.TFrame')
-        dzframe.pack(fill='x', pady=(8, 10))
-        self.drop_zone = tk.Label(dzframe, text='Drop files here', font=('Segoe UI', 13), fg=self._accent, bg=self._panel, bd=2, relief='solid', height=3)
-        self.drop_zone.pack(fill='x')
-        self.drop_zone.bind('<Button-1>', lambda e: self.add_files())
-        self.drop_zone.bind('<Enter>', lambda e: self._dz_hover(True))
-        self.drop_zone.bind('<Leave>', lambda e: self._dz_hover(False))
-        if DND_AVAILABLE:
-            try:
-                self.drop_zone.drop_target_register(DND_FILES)
-                self.drop_zone.dnd_bind('<<Drop>>', self._on_drop)
-            except Exception:
-                pass
-        else:
-            _install_win_dnd(self.drop_zone, lambda files: self._add_paths(files) or self._enable_run())
+        # (Removed dedicated drop zone; drag-and-drop works on the list below.)
 
         btns = ttk.Frame(left)
-        btns.pack(fill='x', pady=(0, 8))
+        btns.pack(fill='x', pady=(0, 6))
         btn_add = ttk.Button(btns, text='Add Files', command=self.add_files)
         btn_add.pack(side='left')
         self._bind_hover(btn_add)
         btn_clear = ttk.Button(btns, text='Clear', command=self.clear_files)
         btn_clear.pack(side='left', padx=6)
         self._bind_hover(btn_clear)
+
+        # Options block (cleaner checkbox layout)
+        opts = ttk.Frame(left, style='TFrame')
+        opts.pack(fill='x', pady=(2, 8))
         self.var_profile = tk.BooleanVar(value=True)
-        ttk.Checkbutton(btns, text='Camera Sync Profile (48k, safe)', variable=self.var_profile).pack(side='left', padx=12)
-        # Optional: sync and export as multichannel via Audalign
         self.var_sync_export = tk.BooleanVar(value=False)
-        ttk.Checkbutton(btns, text='Sync + export multichannel (Audalign)', variable=self.var_sync_export).pack(side='left', padx=12)
+        self.var_postproc = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opts, text='Camera Sync (48 kHz)', style='Opt.TCheckbutton', variable=self.var_profile).pack(anchor='w', fill='x', pady=1)
+        ttk.Checkbutton(opts, text='Sync + Multichannel', style='Opt.TCheckbutton', variable=self.var_sync_export).pack(anchor='w', fill='x', pady=1)
+        ttk.Checkbutton(opts, text='Level + Brighten', style='Opt.TCheckbutton', variable=self.var_postproc).pack(anchor='w', fill='x', pady=1)
 
         self.listbox = tk.Listbox(left, height=14, selectmode='extended', bg=self._panel, fg=self._text, highlightthickness=0, selectbackground='#1f3d66', selectforeground=self._text)
         self.listbox.pack(fill='both', expand=True)
@@ -389,12 +397,11 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         if not dnd_enabled:
             _install_win_dnd(self.listbox, lambda files: self._add_paths(files) or self._enable_run())
 
-        # Right column: action, progress, log, history
-        topbar = ttk.Frame(right)
-        topbar.pack(fill='x')
-        self.run_btn = ttk.Button(topbar, text='Enhance', command=self.run_task, state='disabled', style='Accent.TButton')
-        self.run_btn.pack(side='right')
-        # Hover effect for enhance button
+        # Action button at bottom of left column
+        bottom_actions = ttk.Frame(left)
+        bottom_actions.pack(fill='x', side='bottom', pady=(8, 0))
+        self.run_btn = ttk.Button(bottom_actions, text='Enhance', command=self.run_task, state='disabled', style='Accent.TButton')
+        self.run_btn.pack(fill='x')
         self.run_btn.bind('<Enter>', lambda e: self.run_btn.configure(style='AccentHover.TButton'))
         self.run_btn.bind('<Leave>', lambda e: self.run_btn.configure(style='Accent.TButton'))
 
@@ -586,13 +593,44 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 )
                 # Log and show history
                 self.after(0, lambda: self._log(f"Done. {len(results)} file(s) enhanced."))
-                self.after(0, lambda: self._append_history(results))
+                # If syncing later, don't show per-file outputs to avoid confusion
+                if not self.var_sync_export.get():
+                    self.after(0, lambda: self._append_history(results))
+                # Optional post-processing: loudness normalize + brighten
+                if self.var_postproc.get() and results:
+                    try:
+                        outs = [out for _, out in results]
+                        self.after(0, lambda: self._log("Applying level normalization and brightening..."))
+                        _postprocess_level_brighten(outs)
+                        self.after(0, lambda: self._log("Level + brighten applied."))
+                    except Exception as e:
+                        self.after(0, lambda e=e: self._log(f"Post-process error: {e}"))
                 # Optional: sync and export as multichannel using Audalign
                 if self.var_sync_export.get() and results:
                     try:
                         self.after(0, lambda: self._log("Syncing with Audalign and exporting multichannel..."))
-                        out_path = _sync_and_export_multichannel([out for _, out in results], prefer_48k=self.var_profile.get())
+                        outs = [out for _, out in results]
+                        out_path = _sync_and_export_multichannel(outs, prefer_48k=self.var_profile.get(), log=lambda m: self.after(0, self._log, m))
+                        # Remove per-file enhanced folders to keep only the combined output
+                        try:
+                            import shutil as _sh
+                            parents = {str(Path(p).parent) for p in outs}
+                            for d in parents:
+                                if Path(d).name.startswith('Enhanced_'):
+                                    _sh.rmtree(d, ignore_errors=True)
+                            self.after(0, lambda: self._log("Cleaned per-file enhanced folders."))
+                        except Exception as _e:
+                            self.after(0, lambda _e=_e: self._log(f"Cleanup warning: {_e}"))
                         if out_path:
+                            # Show final multichannel export in history
+                            try:
+                                import torchaudio as _ta
+                                info = _ta.info(out_path)
+                                ch = getattr(info, 'num_channels', 0) or 0
+                            except Exception:
+                                ch = 0
+                            label = f"Multichannel ({ch} ch)" if ch else "Multichannel"
+                            self.after(0, lambda: self._append_history([(label, out_path)]))
                             self.after(0, lambda: self._log(f"Multichannel export written: {out_path}"))
                         else:
                             self.after(0, lambda: self._log("Multichannel export failed: no output produced"))
@@ -610,7 +648,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
 
 # --- Alignment and multichannel export helpers (Audalign-based) ---
 
-def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True) -> str | None:
+def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True, log=None) -> str | None:
     """Align given enhanced files using audalign and export a single multichannel WAV.
 
     Returns the output multichannel wav path or None on failure.
@@ -625,14 +663,18 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
 
     # Import audalign lazily
     ad = importlib.import_module('audalign')
+    if log:
+        log('Building proxies for alignment...')
 
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     first_parent = Path(file_paths[0]).parent
     # Intermediate working dir to avoid leaving per-file outputs
     tmp_dir = (Path.cwd() / ".enhancer_runs_gui" / "tmp_sync" / stamp)
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    # Final folder should contain ONLY the combined multichannel file
-    final_dir = first_parent / f"Synced_{stamp}"
+    # Final folder should contain ONLY the combined multichannel file.
+    # Place it alongside originals (not inside Enhanced_*), so cleanup won't remove it.
+    base_dir = first_parent.parent if first_parent.name.startswith('Enhanced_') else first_parent
+    final_dir = base_dir / f"Synced_{stamp}"
     final_dir.mkdir(parents=True, exist_ok=True)
 
     # Choose recognizers
@@ -648,19 +690,41 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
         except Exception:
             fine_rec = None
 
-    # 1) Coarse alignment (prefer fast correlation) and write padded copies if needed
+    # Build low-sample-rate proxies for faster alignment
+    proxy_sr = 16000
+    proxy_dir = tmp_dir / "proxies"
+    proxy_dir.mkdir(parents=True, exist_ok=True)
+
+    from torchaudio.functional import resample as ta_resample
+
+    proxies: list[Path] = []
+    for p in file_paths:
+        wav, sr = torchaudio.load(str(p))
+        # downmix to mono for alignment
+        if wav.dim() == 2 and wav.size(0) > 1:
+            wav = wav.mean(0)
+        else:
+            wav = wav.squeeze(0)
+        if sr != proxy_sr:
+            wav = ta_resample(wav, orig_freq=sr, new_freq=proxy_sr)
+        outp = proxy_dir / Path(p).name
+        torchaudio.save(str(outp), wav.unsqueeze(0), proxy_sr)
+        proxies.append(outp)
+
+    # 1) Coarse alignment (prefer fast correlation) using proxies
     results = None
     try:
         align_files = getattr(ad, 'align_files')
-        # Try correlation-only first for speed
-        if hasattr(ad, 'CorrelationRecognizer'):
-            corr_rec = getattr(ad, 'CorrelationRecognizer')()
-            results = align_files(*file_paths, recognizer=corr_rec)
-        # Fallback to fingerprinting if needed
-        if not results and fingerprint_rec:
-            results = align_files(*file_paths, recognizer=fingerprint_rec)
+        with _suppress_stdout_stderr():
+            if hasattr(ad, 'CorrelationRecognizer'):
+                corr_rec = getattr(ad, 'CorrelationRecognizer')()
+                results = align_files(*[str(p) for p in proxies], recognizer=corr_rec)
+            if not results and fingerprint_rec:
+                results = align_files(*[str(p) for p in proxies], recognizer=fingerprint_rec)
     except Exception:
         results = None
+    if log:
+        log('Coarse alignment complete.' if results else 'Coarse alignment failed, attempting fallback...')
 
     # Fallback: correlation-only alignment when fingerprinting doesn't match
     try:
@@ -673,7 +737,34 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
     # 2) Fine align if available
     try:
         if results is not None and fine_rec is not None and hasattr(ad, 'fine_align'):
-            results = ad.fine_align(results, recognizer=fine_rec)
+            if log:
+                log('Running fine alignment...')
+            with _suppress_stdout_stderr():
+                results = ad.fine_align(results, recognizer=fine_rec)
+            if log:
+                log('Fine alignment complete.')
+    except Exception:
+        pass
+
+    # 2.5) Estimate and correct drift on originals using windowed correlation (proxies)
+    try:
+        if len(file_paths) >= 2:
+            ref_proxy = proxies[0]
+            drift_dir = tmp_dir / "driftcorr"
+            drift_dir.mkdir(parents=True, exist_ok=True)
+            corrected_files: list[str] = [file_paths[0]]
+            for i in range(1, len(file_paths)):
+                ratio = _estimate_drift_ratio(str(ref_proxy), str(proxies[i]), proxy_sr)
+                # Correct if outside tiny tolerance (> 50 ppm)
+                if abs(1.0 - ratio) > 5e-5:
+                    src = Path(file_paths[i])
+                    dst = drift_dir / src.name
+                    _resample_with_ratio(str(src), str(dst), ratio)
+                    corrected_files.append(str(dst))
+                else:
+                    corrected_files.append(file_paths[i])
+            # Use corrected list for writing shifts/export
+            file_paths = corrected_files
     except Exception:
         pass
 
@@ -682,7 +773,10 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
     # Preferred: write shifts from results
     try:
         if results is not None and hasattr(ad, 'write_shifts_from_results'):
-            ad.write_shifts_from_results(results, str(tmp_dir), file_paths)
+            if log:
+                log('Writing aligned files (temp)...')
+            with _suppress_stdout_stderr():
+                ad.write_shifts_from_results(results, str(tmp_dir), file_paths)
             wrote_aligned = True
     except Exception:
         wrote_aligned = False
@@ -690,10 +784,11 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
     if not wrote_aligned:
         try:
             align_files = getattr(ad, 'align_files')
-            if fingerprint_rec:
-                align_files(*file_paths, destination_path=str(tmp_dir), recognizer=fingerprint_rec)
-            else:
-                align_files(*file_paths, destination_path=str(tmp_dir))
+            with _suppress_stdout_stderr():
+                if fingerprint_rec:
+                    align_files(*file_paths, destination_path=str(tmp_dir), recognizer=fingerprint_rec)
+                else:
+                    align_files(*file_paths, destination_path=str(tmp_dir))
             wrote_aligned = True
         except Exception:
             wrote_aligned = False
@@ -702,6 +797,8 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
         return None
 
     # 4) Load aligned files from tmp_dir and build multichannel tensor
+    if log:
+        log('Assembling multichannel file...')
     # Try to keep channel order same as input list
     basenames = [Path(p).name for p in file_paths]
     aligned_paths: list[Path] = []
@@ -756,31 +853,44 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
         return None
 
     multich = torch.cat(chan_tensors, dim=0)
+    n_ch = int(multich.size(0))
     out_wav = final_dir / f"Synced_Multichannel_{stamp}.wav"
     torchaudio.save(str(out_wav), multich, target_sr)
 
-    # Optional: clear channel mask to avoid L/R stereo interpretation in some NLEs
-    # Requires ffmpeg on PATH. This remuxes headers so channels are treated as generic (centered) mono channels.
+    # Optional: clear channel mask and encode as PCM 24-bit for Premiere dual-mono import behavior
     try:
-        subprocess.run([
-            _get_console_python(), '-c', 'import sys'
-        ], check=True)
+        subprocess.run([_get_console_python(), '-c', 'import sys'], check=True)
     except Exception:
         pass
     try:
         ff = shutil.which('ffmpeg') or shutil.which('ffmpeg.exe')
         if ff:
-            tmp_out = final_dir / f"Synced_Multichannel_{stamp}_nomask.wav"
-            # -write_channel_mask 0 clears speaker assignment; copy to avoid re-encoding
-            cmd = [ff, '-y', '-i', str(out_wav), '-c', 'copy', '-write_channel_mask', '0', str(tmp_out)]
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if tmp_out.exists() and tmp_out.stat().st_size > 44:
+            # Build a MOV with N mono audio streams (dual-/multi-mono), best for Premiere
+            out_mov = final_dir / f"Synced_Multichannel_{stamp}.mov"
+            parts = [f"[0:a]pan=mono|c0=c{idx}[ch{idx}]" for idx in range(n_ch)]
+            filt = ";".join(parts)
+            cmd = [ff, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(out_wav), '-filter_complex', filt]
+            for idx in range(n_ch):
+                cmd += ['-map', f'[ch{idx}]', f'-c:a:{idx}', 'pcm_s24le']
+            cmd += [str(out_mov)]
+            if log:
+                log('Converting to dual-/multi-mono MOV...')
+            try:
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+            except subprocess.TimeoutExpired:
+                # Fallback: keep WAV
+                out_mov = None
+            if out_mov and out_mov.exists() and out_mov.stat().st_size > 44:
                 try:
                     out_wav.unlink(missing_ok=True)
                 except Exception:
                     pass
-                tmp_out.replace(out_wav)
+                out_wav = out_mov
+        else:
+            # No ffmpeg available: keep WAV (discrete channels preserved in container)
+            pass
     except Exception:
+        # Keep WAV if ffmpeg conversion fails
         pass
 
     # Cleanup tmp_dir completely so only the combined file remains
@@ -791,6 +901,232 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
         pass
 
     return str(out_wav)
+
+
+def _estimate_drift_ratio(ref_path: str, other_path: str, sr: int, win_s: float = 20.0) -> float:
+    """Estimate relative drift (clock ratio) between other and ref using windowed GCC-PHAT.
+
+    Returns a multiplicative ratio such that resampling other by this ratio compensates the drift.
+    A ratio > 1.0 means other is slightly fast and should be slowed down.
+    """
+    import numpy as np
+    try:
+        import soundfile as sf
+    except Exception:
+        import torchaudio
+        r, sr_r = torchaudio.load(ref_path)
+        o, sr_o = torchaudio.load(other_path)
+        ref = r.mean(0).numpy() if r.dim() == 2 else r.squeeze(0).numpy()  # type: ignore[attr-defined]
+        oth = o.mean(0).numpy() if o.dim() == 2 else o.squeeze(0).numpy()  # type: ignore[attr-defined]
+        sr_r = int(sr_r)
+        sr_o = int(sr_o)
+    else:
+        ref, sr_r = sf.read(ref_path, dtype='float32', always_2d=False)
+        oth, sr_o = sf.read(other_path, dtype='float32', always_2d=False)
+        if ref.ndim > 1:
+            ref = ref.mean(axis=1)
+        if oth.ndim > 1:
+            oth = oth.mean(axis=1)
+    if sr_r != sr or sr_o != sr:
+        # Proxies should already be at sr
+        sr = sr
+    n = min(len(ref), len(oth))
+    ref = ref[:n]
+    oth = oth[:n]
+    win = int(win_s * sr)
+    if n < 3 * win:
+        # Use two windows if too short
+        starts = [0, max(0, n - win)]
+    else:
+        starts = [0, (n - win) // 2, n - win]
+    ts = []
+    lags = []
+    for s in starts:
+        rseg = ref[s:s+win]
+        oseg = oth[s:s+win]
+        lag = _gcc_phat_lag(rseg, oseg)
+        ts.append(s / sr)
+        lags.append(lag)
+    if len(ts) < 2:
+        return 1.0
+    # Fit lag(samples) = a * t(sec) + b
+    a, b = np.polyfit(np.asarray(ts), np.asarray(lags), 1)
+    # Drift ratio: resample other by (1 - a/sr)
+    ratio = 1.0 - (a / float(sr))
+    return float(ratio)
+
+
+def _gcc_phat_lag(x, y) -> int:
+    import numpy as np
+    n = int(2 ** np.ceil(np.log2(len(x) + len(y))))
+    X = np.fft.rfft(x, n=n)
+    Y = np.fft.rfft(y, n=n)
+    R = X * np.conj(Y)
+    denom = np.abs(R) + 1e-12
+    R /= denom
+    cc = np.fft.irfft(R, n=n)
+    # Shift zero-lag to center
+    cc = np.concatenate((cc[-(n//2):], cc[:(n//2)]))
+    max_idx = int(np.argmax(np.abs(cc)))
+    lag = max_idx - (n // 2)
+    return int(lag)
+
+
+def _resample_with_ratio(src_path: str, dst_path: str, ratio: float) -> None:
+    """Resample audio by an arbitrary ratio using polyphase filter, preserving sample rate metadata.
+
+    Writes to dst_path with the same sample rate as input, effectively time-stretching.
+    """
+    import numpy as np
+    import soundfile as sf
+    from fractions import Fraction
+    from scipy.signal import resample_poly
+
+    y, sr = sf.read(src_path, dtype='float32', always_2d=False)
+    was_mono = (y.ndim == 1)
+    if y.ndim == 1:
+        y = y[:, None]
+    # Rational approximation for ratio
+    frac = Fraction(ratio).limit_denominator(1000)
+    up, down = frac.numerator, frac.denominator
+    # Apply on each channel
+    ys = []
+    for c in range(y.shape[1]):
+        ys.append(resample_poly(y[:, c], up, down))
+    y2 = np.stack(ys, axis=1)
+    if was_mono:
+        y2 = y2[:, 0]
+    sf.write(dst_path, y2, sr)
+
+
+from contextlib import contextmanager
+import io as _io, sys as _sys
+
+@contextmanager
+def _suppress_stdout_stderr():
+    """Temporarily suppress stdout/stderr (used to quiet audalign progress)."""
+    old_out, old_err = _sys.stdout, _sys.stderr
+    try:
+        _sys.stdout = _io.StringIO()
+        _sys.stderr = _io.StringIO()
+        yield
+    finally:
+        _sys.stdout = old_out
+        _sys.stderr = old_err
+
+
+def _postprocess_level_brighten(paths: list[str], target_lufs: float = -16.0, range_min: float = -20.0, range_max: float = -14.0) -> None:
+    """Apply loudness normalization and brightening, with de-click + hard limiter.
+
+    - De-click pass for transient clicks; DC removal high-pass.
+    - Loudness toward a LUFS range if meter available, else RMS-based.
+    - Apply pre-gain to approach about -6 dB average (RMS) if too soft.
+    - Hard limiter with lookahead (soft knee) to avoid overs.
+    - Gentle brightening EQ.
+    """
+    import math
+    import torchaudio
+    import torch
+    import numpy as np
+    try:
+        import pyloudnorm as pyln
+    except Exception:
+        pyln = None
+
+    from torchaudio.functional import equalizer_biquad, highpass_biquad
+
+    for p in paths:
+        wav, sr = torchaudio.load(str(p))
+        # Work in float32 and mono reference for metrics
+        if wav.dtype != torch.float32:
+            wav = wav.to(torch.float32)
+        # DC removal
+        try:
+            wav = highpass_biquad(wav, sr, cutoff_freq=20.0, Q=0.707)
+        except Exception:
+            pass
+        # Simple de-click: interpolate isolated spikes relative to local median
+        try:
+            mono = wav.mean(0) if wav.dim() == 2 else wav.squeeze(0)
+            diff = torch.abs(mono[1:] - mono[:-1])
+            thr = torch.quantile(diff, 0.95).item() * 4.0 if diff.numel() > 100 else 0.0
+            if thr > 0:
+                spike_idx = (diff > thr).nonzero(as_tuple=False).flatten()
+                for idx in spike_idx.tolist():
+                    a = max(0, idx - 2); b = min(mono.numel() - 1, idx + 3)
+                    mono[a:b] = torch.linspace(float(mono[a]), float(mono[b-1]), b - a)
+                if wav.dim() == 2:
+                    wav = wav * 0  + mono.unsqueeze(0).repeat(wav.size(0), 1)
+                else:
+                    wav = mono.unsqueeze(0)
+        except Exception:
+            pass
+        # Measure loudness if possible
+        gain = 0.0
+        if pyln is not None:
+            meter = pyln.Meter(sr)
+            x = wav.mean(0).numpy() if wav.dim() == 2 else wav.squeeze(0).numpy()
+            try:
+                lufs = meter.integrated_loudness(x)
+                if not (range_min <= lufs <= range_max):
+                    gain = float(target_lufs - lufs)
+            except Exception:
+                gain = 0.0
+        else:
+            # Fallback RMS-based normalization toward approx -16 LUFS (rough)
+            x = wav.mean(0)
+            rms = torch.sqrt(torch.mean(x * x) + 1e-12)
+            if rms > 0:
+                cur_db = 20.0 * math.log10(float(rms))
+                if not (-21.0 <= cur_db <= -13.0):
+                    gain = float(-16.0 - cur_db)
+
+        # Apply LUFS or RMS-based gain
+        if abs(gain) > 1e-6:
+            scale = 10.0 ** (gain / 20.0)
+            wav = wav * float(scale)
+        # If still soft, push average RMS toward -6 dBFS
+        try:
+            mono = wav.mean(0)
+            rms = torch.sqrt(torch.mean(mono * mono) + 1e-12)
+            target_rms = 10 ** (-6.0 / 20.0)
+            if float(rms) < target_rms * 0.98:
+                boost = float(target_rms / float(rms))
+                boost = min(boost, 8.0)
+                wav = wav * boost
+        except Exception:
+            pass
+
+        # Hard limiter with lookahead and soft knee; final ceiling at -1 dBFS
+        try:
+            thr = 10 ** (-1.0 / 20.0)
+            look = max(1, int(sr * 0.005))
+            x = wav
+            # Approximate lookahead via max pooling on abs signal
+            absx = torch.abs(x)
+            pool = torch.nn.functional.max_pool1d(absx.unsqueeze(0), kernel_size=look, stride=1, padding=look//2)
+            env = pool.squeeze(0).clamp(min=1e-6)
+            gain_env = torch.clamp(thr / env, max=1.0)
+            # Soft knee via tanh shaping
+            y = x * gain_env
+            y = torch.tanh(3.0 * y) / torch.tanh(torch.tensor(3.0))
+            # Final safety trim
+            peak = float(torch.max(torch.abs(y)))
+            ceiling = 10 ** (-1.0 / 20.0)
+            if peak > ceiling:
+                y = y * (ceiling / peak)
+            wav = y
+        except Exception:
+            pass
+
+        # Gentle brightening: two peaking EQ bands
+        try:
+            wav = equalizer_biquad(wav, sr, center_freq=3500.0, gain=2.0, Q=0.707)
+            wav = equalizer_biquad(wav, sr, center_freq=8000.0, gain=1.5, Q=0.707)
+        except Exception:
+            pass
+
+        torchaudio.save(str(p), wav, sr)
 
 
 if __name__ == "__main__":
