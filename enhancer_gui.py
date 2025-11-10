@@ -372,6 +372,9 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self._bind_hover(btn_clear)
         self.var_profile = tk.BooleanVar(value=True)
         ttk.Checkbutton(btns, text='Camera Sync Profile (48k, safe)', variable=self.var_profile).pack(side='left', padx=12)
+        # Optional: sync and export as multichannel via Audalign
+        self.var_sync_export = tk.BooleanVar(value=False)
+        ttk.Checkbutton(btns, text='Sync + export multichannel (Audalign)', variable=self.var_sync_export).pack(side='left', padx=12)
 
         self.listbox = tk.Listbox(left, height=14, selectmode='extended', bg=self._panel, fg=self._text, highlightthickness=0, selectbackground='#1f3d66', selectforeground=self._text)
         self.listbox.pack(fill='both', expand=True)
@@ -584,6 +587,17 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 # Log and show history
                 self.after(0, lambda: self._log(f"Done. {len(results)} file(s) enhanced."))
                 self.after(0, lambda: self._append_history(results))
+                # Optional: sync and export as multichannel using Audalign
+                if self.var_sync_export.get() and results:
+                    try:
+                        self.after(0, lambda: self._log("Syncing with Audalign and exporting multichannel..."))
+                        out_path = _sync_and_export_multichannel([out for _, out in results], prefer_48k=self.var_profile.get())
+                        if out_path:
+                            self.after(0, lambda: self._log(f"Multichannel export written: {out_path}"))
+                        else:
+                            self.after(0, lambda: self._log("Multichannel export failed: no output produced"))
+                    except Exception as e:
+                        self.after(0, lambda e=e: self._log(f"Sync/export error: {e}"))
                 # Clear the queue after successful enhance
                 self.after(0, self._clear_queue)
             except Exception as e:  # noqa: BLE001
@@ -592,6 +606,166 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 self.after(0, lambda: self.run_btn.config(state="normal"))
 
         threading.Thread(target=worker, daemon=True).start()
+
+
+# --- Alignment and multichannel export helpers (Audalign-based) ---
+
+def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True) -> str | None:
+    """Align given enhanced files using audalign and export a single multichannel WAV.
+
+    Returns the output multichannel wav path or None on failure.
+    """
+    import importlib
+    from datetime import datetime
+    import torchaudio
+    import torch
+
+    if not file_paths:
+        return None
+
+    # Import audalign lazily
+    ad = importlib.import_module('audalign')
+
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    first_parent = Path(file_paths[0]).parent
+    out_dir = first_parent / f"Synced_{stamp}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Choose recognizers
+    try:
+        fingerprint_rec = getattr(ad, 'FingerprintRecognizer')()
+    except Exception:
+        fingerprint_rec = None
+    try:
+        fine_rec = getattr(ad, 'CorrelationSpectrogramRecognizer')()
+    except Exception:
+        try:
+            fine_rec = getattr(ad, 'CorrelationRecognizer')()
+        except Exception:
+            fine_rec = None
+
+    # 1) Coarse alignment and write padded copies if possible
+    results = None
+    try:
+        align_files = getattr(ad, 'align_files')
+        # Compute results first (no writing) for potential fine-align
+        if fingerprint_rec:
+            results = align_files(*file_paths, recognizer=fingerprint_rec)
+        else:
+            results = align_files(*file_paths)
+    except Exception:
+        results = None
+
+    # Fallback: correlation-only alignment when fingerprinting doesn't match
+    try:
+        if (not results) and 'CorrelationRecognizer' in dir(ad):
+            corr_rec = getattr(ad, 'CorrelationRecognizer')()
+            results = align_files(*file_paths, recognizer=corr_rec)
+    except Exception:
+        pass
+
+    # 2) Fine align if available
+    try:
+        if results is not None and fine_rec is not None and hasattr(ad, 'fine_align'):
+            results = ad.fine_align(results, recognizer=fine_rec)
+    except Exception:
+        pass
+
+    # 3) Write aligned, padded mono files to out_dir
+    wrote_aligned = False
+    # Preferred: write shifts from results
+    try:
+        if results is not None and hasattr(ad, 'write_shifts_from_results'):
+            ad.write_shifts_from_results(results, str(out_dir), file_paths)
+            wrote_aligned = True
+    except Exception:
+        wrote_aligned = False
+    # Fallback: directly call align_files with destination_path
+    if not wrote_aligned:
+        try:
+            align_files = getattr(ad, 'align_files')
+            if fingerprint_rec:
+                align_files(*file_paths, destination_path=str(out_dir), recognizer=fingerprint_rec)
+            else:
+                align_files(*file_paths, destination_path=str(out_dir))
+            wrote_aligned = True
+        except Exception:
+            wrote_aligned = False
+
+    if not wrote_aligned:
+        return None
+
+    # 4) Load aligned files from out_dir and build multichannel tensor
+    # Try to keep channel order same as input list
+    basenames = [Path(p).name for p in file_paths]
+    aligned_paths: list[Path] = []
+    for base in basenames:
+        cand = out_dir / base
+        if cand.exists():
+            aligned_paths.append(cand)
+        else:
+            # Try to find by stem if audalign changed extension/casing
+            stem = Path(base).stem
+            matches = list(out_dir.glob(f"{stem}*"))
+            if matches:
+                aligned_paths.append(matches[0])
+
+    if not aligned_paths:
+        # As a last resort, take all wavs in out_dir excluding an obvious sum file
+        aligned_paths = sorted([p for p in out_dir.glob("*.wav") if 'sum' not in p.stem.lower()])
+
+    if not aligned_paths:
+        return None
+
+    wavs = []
+    srs = []
+    max_len = 0
+    for p in aligned_paths:
+        wav, sr = torchaudio.load(str(p))
+        if wav.dim() == 2 and wav.size(0) > 1:
+            wav = wav.mean(0, keepdim=True)  # downmix to mono
+        elif wav.dim() == 1:
+            wav = wav.unsqueeze(0)
+        srs.append(int(sr))
+        max_len = max(max_len, int(wav.size(-1)))
+        wavs.append((wav, int(sr)))
+
+    # Choose target SR
+    target_sr = 48000 if prefer_48k else (srs[0] if srs else 48000)
+    from torchaudio.functional import resample as ta_resample
+
+    chan_tensors = []
+    for wav, sr in wavs:
+        mono = wav[0]
+        if sr != target_sr:
+            mono = ta_resample(mono, orig_freq=sr, new_freq=target_sr)
+        cur_len = mono.size(-1)
+        if cur_len < max_len:
+            mono = torch.nn.functional.pad(mono, (0, max_len - cur_len))
+        elif cur_len > max_len:
+            mono = mono[:max_len]
+        chan_tensors.append(mono.unsqueeze(0))
+
+    if not chan_tensors:
+        return None
+
+    multich = torch.cat(chan_tensors, dim=0)
+    out_wav = out_dir / f"Synced_Multichannel_{stamp}.wav"
+    torchaudio.save(str(out_wav), multich, target_sr)
+
+    # Write channel map CSV for traceability
+    try:
+        import csv
+        csv_path = out_dir / f"Synced_Multichannel_{stamp}_channels.csv"
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            w = csv.writer(f)
+            w.writerow(["channel_index", "source_file"])
+            for idx, p in enumerate(aligned_paths):
+                w.writerow([idx, str(p)])
+    except Exception:
+        pass
+
+    return str(out_wav)
 
 
 if __name__ == "__main__":
