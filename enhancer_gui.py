@@ -301,25 +301,25 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         except Exception:
             pass
         # Dark, sleek palette
-        self._bg = "#222222"
-        self._panel = '#111827'
-        self._text = '#e6edf3'
-        self._muted = '#9aaec2'
-        self._accent = '#2a7bd0'
+        self._bg = "#D1D1D1"
+        self._panel = "#BBBBBB"
+        self._text = "#161616"
+        self._muted = "#ffffff"
+        self._accent = "#464646"
         self.configure(bg=self._bg)
         style.configure('.', background=self._bg, foreground=self._text)
         style.configure('TFrame', background=self._bg)
         style.configure('Title.TLabel', background=self._bg, foreground=self._muted, font=('Segoe UI', 13, 'bold'))
         style.configure('Info.TLabel', background=self._bg, foreground=self._text)
         style.configure('TButton', padding=8)
-        style.map('TButton', background=[('active', '#173a64')])
+        style.map('TButton', background=[('active', "#7a7a7a")])
         style.configure('Drop.TFrame', background=self._panel, bordercolor='#1f2a44', relief='solid')
         style.configure('Horizontal.TProgressbar', troughcolor='#0c0f14', background=self._accent, bordercolor=self._panel, lightcolor=self._accent, darkcolor=self._accent)
         style.configure('Treeview', background=self._panel, fieldbackground=self._panel, foreground=self._text, bordercolor=self._panel)
         style.map('Treeview', background=[('selected', '#1f3d66')], foreground=[('selected', self._text)])
         # Accent button styles
         style.configure('Accent.TButton', background=self._accent, foreground=self._text)
-        style.configure('AccentHover.TButton', background='#3891e6', foreground=self._text)
+        style.configure('AccentHover.TButton', background="#242424", foreground=self._text)
         # Standard hover style for normal buttons
         style.configure('Hover.TButton', background='#1b2333', foreground=self._text)
 
