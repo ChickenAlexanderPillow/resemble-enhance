@@ -628,8 +628,12 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
 
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     first_parent = Path(file_paths[0]).parent
-    out_dir = first_parent / f"Synced_{stamp}"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Intermediate working dir to avoid leaving per-file outputs
+    tmp_dir = (Path.cwd() / ".enhancer_runs_gui" / "tmp_sync" / stamp)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    # Final folder should contain ONLY the combined multichannel file
+    final_dir = first_parent / f"Synced_{stamp}"
+    final_dir.mkdir(parents=True, exist_ok=True)
 
     # Choose recognizers
     try:
@@ -644,15 +648,17 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
         except Exception:
             fine_rec = None
 
-    # 1) Coarse alignment and write padded copies if possible
+    # 1) Coarse alignment (prefer fast correlation) and write padded copies if needed
     results = None
     try:
         align_files = getattr(ad, 'align_files')
-        # Compute results first (no writing) for potential fine-align
-        if fingerprint_rec:
+        # Try correlation-only first for speed
+        if hasattr(ad, 'CorrelationRecognizer'):
+            corr_rec = getattr(ad, 'CorrelationRecognizer')()
+            results = align_files(*file_paths, recognizer=corr_rec)
+        # Fallback to fingerprinting if needed
+        if not results and fingerprint_rec:
             results = align_files(*file_paths, recognizer=fingerprint_rec)
-        else:
-            results = align_files(*file_paths)
     except Exception:
         results = None
 
@@ -676,7 +682,7 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
     # Preferred: write shifts from results
     try:
         if results is not None and hasattr(ad, 'write_shifts_from_results'):
-            ad.write_shifts_from_results(results, str(out_dir), file_paths)
+            ad.write_shifts_from_results(results, str(tmp_dir), file_paths)
             wrote_aligned = True
     except Exception:
         wrote_aligned = False
@@ -685,9 +691,9 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
         try:
             align_files = getattr(ad, 'align_files')
             if fingerprint_rec:
-                align_files(*file_paths, destination_path=str(out_dir), recognizer=fingerprint_rec)
+                align_files(*file_paths, destination_path=str(tmp_dir), recognizer=fingerprint_rec)
             else:
-                align_files(*file_paths, destination_path=str(out_dir))
+                align_files(*file_paths, destination_path=str(tmp_dir))
             wrote_aligned = True
         except Exception:
             wrote_aligned = False
@@ -695,24 +701,24 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
     if not wrote_aligned:
         return None
 
-    # 4) Load aligned files from out_dir and build multichannel tensor
+    # 4) Load aligned files from tmp_dir and build multichannel tensor
     # Try to keep channel order same as input list
     basenames = [Path(p).name for p in file_paths]
     aligned_paths: list[Path] = []
     for base in basenames:
-        cand = out_dir / base
+        cand = tmp_dir / base
         if cand.exists():
             aligned_paths.append(cand)
         else:
             # Try to find by stem if audalign changed extension/casing
             stem = Path(base).stem
-            matches = list(out_dir.glob(f"{stem}*"))
+            matches = list(tmp_dir.glob(f"{stem}*"))
             if matches:
                 aligned_paths.append(matches[0])
 
     if not aligned_paths:
         # As a last resort, take all wavs in out_dir excluding an obvious sum file
-        aligned_paths = sorted([p for p in out_dir.glob("*.wav") if 'sum' not in p.stem.lower()])
+        aligned_paths = sorted([p for p in tmp_dir.glob("*.wav") if 'sum' not in p.stem.lower() and 'total' not in p.stem.lower()])
 
     if not aligned_paths:
         return None
@@ -750,18 +756,37 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
         return None
 
     multich = torch.cat(chan_tensors, dim=0)
-    out_wav = out_dir / f"Synced_Multichannel_{stamp}.wav"
+    out_wav = final_dir / f"Synced_Multichannel_{stamp}.wav"
     torchaudio.save(str(out_wav), multich, target_sr)
 
-    # Write channel map CSV for traceability
+    # Optional: clear channel mask to avoid L/R stereo interpretation in some NLEs
+    # Requires ffmpeg on PATH. This remuxes headers so channels are treated as generic (centered) mono channels.
     try:
-        import csv
-        csv_path = out_dir / f"Synced_Multichannel_{stamp}_channels.csv"
-        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-            w = csv.writer(f)
-            w.writerow(["channel_index", "source_file"])
-            for idx, p in enumerate(aligned_paths):
-                w.writerow([idx, str(p)])
+        subprocess.run([
+            _get_console_python(), '-c', 'import sys'
+        ], check=True)
+    except Exception:
+        pass
+    try:
+        ff = shutil.which('ffmpeg') or shutil.which('ffmpeg.exe')
+        if ff:
+            tmp_out = final_dir / f"Synced_Multichannel_{stamp}_nomask.wav"
+            # -write_channel_mask 0 clears speaker assignment; copy to avoid re-encoding
+            cmd = [ff, '-y', '-i', str(out_wav), '-c', 'copy', '-write_channel_mask', '0', str(tmp_out)]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if tmp_out.exists() and tmp_out.stat().st_size > 44:
+                try:
+                    out_wav.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                tmp_out.replace(out_wav)
+    except Exception:
+        pass
+
+    # Cleanup tmp_dir completely so only the combined file remains
+    try:
+        import shutil as _sh
+        _sh.rmtree(tmp_dir, ignore_errors=True)
     except Exception:
         pass
 
