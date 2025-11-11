@@ -196,6 +196,18 @@ def main():
         elif cur_len < expected_len:
             hwav = torch.nn.functional.pad(hwav, (0, expected_len - cur_len))
 
+        # Apply a small peak ceiling before saving to avoid transient clipping
+        # during integer PCM encoding or container conversions (e.g., MOV).
+        try:
+            ceiling_db = -1.0  # dBFS
+            ceiling = 10 ** (ceiling_db / 20.0)
+            peak = float(hwav.abs().max().item()) if hasattr(hwav, "abs") else 0.0
+            if peak > ceiling and peak > 0:
+                hwav = hwav * (ceiling / peak)
+        except Exception:
+            # On any failure, proceed without ceiling rather than failing the run
+            pass
+
         out_path.parent.mkdir(parents=True, exist_ok=True)
         torchaudio.save(out_path, hwav[None], sr)
 

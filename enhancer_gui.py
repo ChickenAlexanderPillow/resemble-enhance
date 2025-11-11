@@ -34,6 +34,23 @@ INPUT_TMP_ROOT = BASE / ".enhancer_runs_gui"
 OUTPUT_ROOT = BASE / "output_audio"
 
 
+def _apply_peak_ceiling(wav_t, ceiling_db: float = -1.0):
+    """Return a version of wav_t scaled so its absolute peak <= ceiling.
+    Accepts a 1D or 2D torch tensor; returns original on failure.
+    """
+    try:
+        import torch  # local import to avoid global dependency when unused
+        if not isinstance(wav_t, torch.Tensor):
+            return wav_t
+        ceiling = 10 ** (ceiling_db / 20.0)
+        peak = float(wav_t.abs().max().item())
+        if peak > ceiling and peak > 0:
+            return wav_t * (ceiling / peak)
+    except Exception:
+        pass
+    return wav_t
+
+
 def _get_console_python() -> str:
     exe = sys.executable or "python"
     lower = exe.lower()
@@ -115,6 +132,7 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
             import torch
             hwav = torch.nn.functional.pad(hwav, (0, exp_len - hwav.shape[-1]))
         out_path = dest_dir / name
+        hwav = _apply_peak_ceiling(hwav, ceiling_db=-1.0)
         torchaudio.save(str(out_path), hwav[None], dest_sr)
         done += 1
         if progress_cb:
@@ -467,7 +485,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         btn_clear.pack(side='left', padx=6)
         self._bind_hover(btn_clear)
 
-        # Advanced options (collapsed dropdown)
+        # Advanced Options [+]
         self.var_profile = tk.BooleanVar(value=True)
         self.var_sync_export = tk.BooleanVar(value=True)
         self.var_postproc = tk.BooleanVar(value=True)
@@ -480,7 +498,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         adv_hdr = ttk.Frame(left)
         adv_hdr.pack(fill='x', pady=(4, 2))
         self._adv_open = False
-        self._adv_btn = ttk.Button(adv_hdr, text='Advanced Options â–¸', command=self._toggle_advanced)
+        self._adv_btn = ttk.Button(adv_hdr, text='Advanced Options [+]', command=self._toggle_advanced)
         self._adv_btn.pack(anchor='w')
 
         self._adv_opts = ttk.Frame(left, style='TFrame')
@@ -720,7 +738,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         # Trash can button bottom-right under queue
         queue_footer = ttk.Frame(left)
         queue_footer.pack(fill='x', pady=(4, 0))
-        self.trash_btn = ttk.Button(queue_footer, text='ðŸ—‘', width=3, command=self._remove_selected)
+        self.trash_btn = ttk.Button(queue_footer, text='Remove', width=8, command=self._remove_selected)
         self.trash_btn.pack(side='right')
         self._bind_hover(self.trash_btn)
         dnd_enabled = False
@@ -966,14 +984,14 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 self._adv_opts.pack_forget()
                 self._adv_open = False
                 try:
-                    self._adv_btn.configure(text='Advanced Options ▸')
+                    self._adv_btn.configure(text='Advanced Options [+]')
                 except Exception:
                     pass
             else:
                 self._adv_opts.pack(fill='x', pady=(2, 8))
                 self._adv_open = True
                 try:
-                    self._adv_btn.configure(text='Advanced Options ▾')
+                    self._adv_btn.configure(text='Advanced Options [-]')
                 except Exception:
                     pass
         except Exception:
@@ -1430,6 +1448,7 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
         if sr != proxy_sr:
             wav = ta_resample(wav, orig_freq=sr, new_freq=proxy_sr)
         outp = proxy_dir / Path(p).name
+        wav = _apply_peak_ceiling(wav, ceiling_db=-1.0)
         torchaudio.save(str(outp), wav.unsqueeze(0), proxy_sr)
         proxies.append(outp)
         step(1, f'Proxy {idx}/{len(file_paths)}')
@@ -1600,6 +1619,7 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
     multich = torch.cat(chan_tensors, dim=0)
     n_ch = int(multich.size(0))
     out_wav = final_dir / f"Synced_Multichannel_{stamp}.wav"
+    multich = _apply_peak_ceiling(multich, ceiling_db=-1.0)
     torchaudio.save(str(out_wav), multich, target_sr)
 
     # Optional: clear channel mask and encode as PCM 24-bit for Premiere dual-mono import behavior
@@ -1975,6 +1995,7 @@ def _seam_smooth_files(paths: list[str], progress_cb=None) -> None:
             if wav.dim() == 1:
                 wav = wav.unsqueeze(0)
             fixed = _smooth_wave(wav, sr)
+            fixed = _apply_peak_ceiling(fixed, ceiling_db=-1.0)
             torchaudio.save(str(p), fixed, sr)
         except Exception:
             pass
@@ -2063,9 +2084,11 @@ def _postprocess_level_brighten(paths: list[str], target_lufs: float = -16.0, ra
         if progress_cb:
             progress_cb(idx, total, f'Post process {idx}/{total}')
 
+        wav = _apply_peak_ceiling(wav, ceiling_db=-1.0)
         torchaudio.save(str(p), wav, sr)
 
 
 if __name__ == "__main__":
     app = App()
     app.mainloop()
+
