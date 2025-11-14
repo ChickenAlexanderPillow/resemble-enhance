@@ -91,10 +91,16 @@ def merge_chunks(
 
     # Equal-power crossfade to reduce perceptual loops at boundaries
     t = torch.linspace(0, torch.pi / 2, overlap_length, device=chunks[0].device)
-    fadein_overlap = torch.sin(t) ** 2
-    fadeout_overlap = torch.cos(t) ** 2
-    fadein = torch.cat([torch.ones(hop_length, device=chunks[0].device), fadein_overlap])
-    fadeout = torch.cat([fadeout_overlap, torch.ones(hop_length, device=chunks[0].device)])
+    # Head of a chunk should fade in (0->1) over the overlap, and tail should fade out (1->0)
+    # Previous implementation accidentally applied the reverse at the head of the first chunk,
+    # causing an unintended fade-down and audible choppiness when the first loud transient appears.
+    fadein_overlap = torch.sin(t) ** 2   # 0 -> 1 over overlap
+    fadeout_overlap = torch.cos(t) ** 2  # 1 -> 0 over overlap
+    # Correct layout over the full chunk_length = hop_length + overlap_length:
+    # - fadein: apply head fade-in over the first overlap, then ones
+    # - fadeout: ones over the first hop region, then tail fade-out over the last overlap
+    fadein = torch.cat([fadein_overlap, torch.ones(hop_length, device=chunks[0].device)])
+    fadeout = torch.cat([torch.ones(hop_length, device=chunks[0].device), fadeout_overlap])
 
     for i, chunk in enumerate(chunks):
         start = i * hop_length
@@ -109,7 +115,23 @@ def merge_chunks(
             else:
                 pre_region = chunks[i - 1][-overlap_length:]
                 cur_region = chunk[:overlap_length]
-                offset = compute_offset(pre_region, cur_region, sr=sr)
+                # Transient-safe alignment: avoid shifting when a sharp transient is detected
+                def _has_sharp_transient(x):
+                    try:
+                        if x.numel() < 1024:
+                            return False
+                        d = (x[1:] - x[:-1]).abs()
+                        mu = d.mean()
+                        sd = d.std()
+                        thr = mu + sd * 8.0
+                        return bool((d > thr).any().item())
+                    except Exception:
+                        return False
+
+                if _has_sharp_transient(pre_region) or _has_sharp_transient(cur_region):
+                    offset = 0
+                else:
+                    offset = compute_offset(pre_region, cur_region, sr=sr)
 
                 # Clamp offset to a configurable fraction of the overlap
                 max_shift = int(overlap_length * max_shift_ratio)
@@ -123,10 +145,13 @@ def merge_chunks(
             end -= offset
 
         if i == 0:
+            # First chunk: no head fade (already at start), tail should fade out
             chunk = chunk * fadeout
         elif i == len(chunks) - 1:
+            # Last chunk: head should fade in from previous, no tail fade needed
             chunk = chunk * fadein
         else:
+            # Middle chunks: head fade-in from previous and tail fade-out into next
             chunk = chunk * fadein * fadeout
 
         # Safely add chunk into the signal buffer with clamped indices
@@ -204,6 +229,13 @@ def inference(
 
     for i, start in enumerate(trange(0, dwav.shape[-1], hop_length), start=1):
         chunks.append(inference_chunk(model, dwav[start : start + chunk_length], sr, device))
+        # Proactive GPU cache trim to reduce fragmentation on long files
+        try:
+            import torch as _t
+            if _t.cuda.is_available():
+                _t.cuda.empty_cache()
+        except Exception:
+            pass
         if report:
             print(f"PROGRESS CHUNK file={cur_file} i={i} n={n_chunks}")
         if progress_cb is not None:
@@ -221,6 +253,112 @@ def inference(
         max_shift_ratio=align_max_shift_ratio,
         disable_align=disable_align,
     )
+
+    # Optional strict sanitizer to avoid NaN/Inf and extreme spikes
+    try:
+        import os as _os
+        import torch as _t
+        if not _t.isfinite(hwav).all():
+            mask = ~_t.isfinite(hwav)
+            hwav = hwav.clone()
+            hwav[mask] = 0.0
+        if _os.environ.get("RESEMBLE_STRICT_SANITIZE", "0") == "1":
+            # Clamp extreme outliers relative to local RMS (~50 ms)
+            k = max(16, int(sr * 0.05))
+            pad = k // 2
+            x = hwav
+            xx = x.unsqueeze(0).unsqueeze(0)
+            w = _t.ones(1, 1, k, dtype=xx.dtype, device=xx.device) / float(k)
+            rms = _t.sqrt(_t.nn.functional.conv1d(xx * xx, w, padding=pad).squeeze() + 1e-12)
+            thr = 8.0 * rms
+            over = x.abs() > thr
+            if over.any():
+                hwav = x.sign() * thr.where(over, x.abs())
+    except Exception:
+        pass
+
+    # Optional transient bypass: replace small windows with original to avoid choppy artifacts
+    try:
+        import os as _os
+        import torch as _t
+
+        def _parse_bypass_env():
+            raw = _os.environ.get("RESEMBLE_BYPASS", "").strip()
+            out = []
+            if raw:
+                for part in raw.split(','):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    if ':' in part:
+                        a, b = part.split(':', 1)
+                    else:
+                        a, b = part, '0.2'
+                    try:
+                        start = float(a); dur = float(b)
+                        if start >= 0 and dur > 0:
+                            out.append((start, dur))
+                    except Exception:
+                        pass
+            return out
+
+        def _bypass_windows(proc: _t.Tensor, orig: _t.Tensor, sr: int, wins):
+            try:
+                if not wins:
+                    return proc
+                x = proc.clone(); y = orig
+                n = min(x.numel(), y.numel())
+                x = x[:n]; y = y[:n]
+                ease = max(16, int(sr * 0.01))
+                for (start_s, dur_s) in wins:
+                    a = int(max(0, start_s * sr)); b = int(min(n, (start_s + dur_s) * sr))
+                    if b <= a + 8:
+                        continue
+                    a0 = max(0, a - ease); b0 = min(n, b + ease)
+                    mlen = b0 - a0
+                    w = _t.linspace(0, 1, steps=mlen, dtype=x.dtype, device=x.device)
+                    x[a0:b0] = x[a0:b0] * (1 - w) + y[a0:b0] * w
+                return x
+            except Exception:
+                return proc
+
+        def _auto_detect_transients(x: _t.Tensor, sr: int):
+            try:
+                d = (x[1:] - x[:-1]).abs()
+                if d.numel() < 1000:
+                    return []
+                mu = _t.mean(d)
+                sd = _t.std(d)
+                thr = mu + sd * 8.0
+                idxs = (d > thr).nonzero(as_tuple=False).flatten().tolist()
+                # Merge nearby indices into windows ~200 ms each
+                win_s = 0.2
+                min_gap = int(sr * 0.4)
+                wins = []
+                last = -10**9
+                for i in idxs:
+                    if i - last >= min_gap:
+                        t0 = max(0, i - int(sr * (win_s / 2))) / sr
+                        wins.append((t0, win_s))
+                        last = i
+                    if len(wins) >= 6:
+                        break
+                return wins
+            except Exception:
+                return []
+
+        # Manual bypass via env
+        wins = _parse_bypass_env()
+        if wins:
+            hwav = _bypass_windows(hwav, dwav, sr, wins)
+
+        # Auto bypass if requested
+        if _os.environ.get("RESEMBLE_AUTO_BYPASS", "0") == "1":
+            auto_wins = _auto_detect_transients(hwav, sr)
+            if auto_wins:
+                hwav = _bypass_windows(hwav, dwav, sr, auto_wins)
+    except Exception:
+        pass
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()

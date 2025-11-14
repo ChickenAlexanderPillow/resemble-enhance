@@ -1,0 +1,267 @@
+import os
+import shutil
+import tempfile
+from pathlib import Path
+
+import gradio as gr
+import numpy as np
+import torch
+import torchaudio
+from torchaudio.functional import resample as ta_resample
+
+from resemble_enhance.enhancer.inference import denoise
+
+
+# ----- Helpers -----
+
+def _which_ffmpeg() -> str | None:
+    return shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+
+
+def _apply_peak_ceiling(wav_t: torch.Tensor, ceiling_db: float = -1.0) -> torch.Tensor:
+    try:
+        ceiling = 10 ** (ceiling_db / 20.0)
+        peak = float(wav_t.abs().max().item())
+        if peak > ceiling and peak > 0:
+            return wav_t * (ceiling / peak)
+    except Exception:
+        pass
+    return wav_t
+
+
+def _safe_pretranscode(src: str, start: float | None, dur: float | None) -> str:
+    ff = _which_ffmpeg()
+    dst_dir = Path(tempfile.mkdtemp(prefix="resem_prev_"))
+    dst = dst_dir / (Path(src).stem + ".wav")
+    try:
+        if ff:
+            cmd = [ff, "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
+            if start is not None:
+                cmd += ["-ss", str(max(0.0, float(start)))]
+            if dur is not None:
+                cmd += ["-t", str(max(0.1, float(dur)))]
+            cmd += ["-i", str(src), "-c:a", "pcm_s16le", str(dst)]
+            import subprocess as sp
+
+            sp.run(cmd, check=True, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+        else:
+            wav, sr = torchaudio.load(str(src))
+            if wav.dim() == 2 and wav.size(0) > 1:
+                wav = wav.mean(0)
+            else:
+                wav = wav.squeeze(0)
+            a = int(max(0, (start or 0) * sr))
+            b = int(a + max(0.1, (dur or 5.0)) * sr)
+            b = min(b, wav.shape[-1])
+            seg = wav[a:b]
+            torchaudio.save(str(dst), seg.unsqueeze(0), sr)
+        if dst.exists() and dst.stat().st_size > 44:
+            return str(dst)
+    except Exception:
+        pass
+    return src
+
+
+def _preview_one(
+    use_upload: bool,
+    file_sel: gr.File | None,
+    start: float,
+    dur: float,
+    device: str,
+    seam_safe: bool,
+    chunk_seconds: float,
+    overlap_seconds: float,
+    wet: float,
+    pretranscode: bool,
+) -> tuple[tuple[int, np.ndarray] | None, str]:
+    path: str | None = None
+    if use_upload and file_sel is not None:
+        try:
+            path = file_sel.name
+        except Exception:
+            path = None
+    if not path:
+        return None, "Please upload a file."
+
+    try:
+        src = _safe_pretranscode(path, start, dur) if pretranscode else path
+        wav, sr = torchaudio.load(str(src))
+        if wav.dim() == 2 and wav.size(0) > 1:
+            wav = wav.mean(0)
+        else:
+            wav = wav.squeeze(0)
+        # If we didn't pre-slice, slice here safely
+        if not pretranscode:
+            total = int(wav.shape[-1])
+            a = int(max(0, start * sr))
+            b = min(total, a + int(max(0.1, dur) * sr))
+            if b <= a:
+                b = min(total, a + 1)
+            wav = wav[a:b]
+        if wav.numel() <= 0:
+            return None, "Empty segment after slicing."
+
+        kwargs = dict(
+            chunk_seconds=float(max(1.0, chunk_seconds)),
+            overlap_seconds=float(max(0.0, min(overlap_seconds, chunk_seconds / 4.0))),
+            align_max_shift_ratio=0.05 if seam_safe else 0.25,
+            align_disable=not seam_safe,
+        )
+        try:
+            hwav, model_sr = denoise(dwav=wav, sr=sr, device=device, run_dir=None, **kwargs)
+        except Exception:
+            hwav, model_sr = denoise(dwav=wav, sr=sr, device="cpu", run_dir=None, **kwargs)
+
+        # Wet/dry and peak ceiling
+        wet = float(max(0.0, min(1.0, wet)))
+        base = wav
+        if model_sr != sr:
+            base = ta_resample(base, orig_freq=sr, new_freq=model_sr)
+        if wet < 1.0:
+            hwav = wet * hwav + (1.0 - wet) * base
+        hwav = _apply_peak_ceiling(hwav, ceiling_db=-1.0)
+
+        y = hwav.detach().cpu().numpy().astype(np.float32)
+        return (int(model_sr), y), "OK"
+    except Exception as e:  # noqa: BLE001
+        return None, f"Error: {e}"
+
+
+def _export_batch(
+    files: list[gr.File] | None,
+    device: str,
+    seam_safe: bool,
+    chunk_seconds: float,
+    overlap_seconds: float,
+    wet: float,
+    pretranscode: bool,
+) -> tuple[list[str], str]:
+    if not files:
+        return [], "Upload one or more files to export."
+    out_paths: list[str] = []
+    msgs: list[str] = []
+    for f in files:
+        try:
+            src = f.name
+            if pretranscode:
+                src = _safe_pretranscode(src, None, None)
+            wav, sr = torchaudio.load(str(src))
+            if wav.dim() == 2 and wav.size(0) > 1:
+                wav = wav.mean(0)
+            else:
+                wav = wav.squeeze(0)
+            kwargs = dict(
+                chunk_seconds=float(max(1.0, chunk_seconds)),
+                overlap_seconds=float(max(0.0, min(overlap_seconds, chunk_seconds / 4.0))),
+                align_max_shift_ratio=0.05 if seam_safe else 0.25,
+                align_disable=not seam_safe,
+            )
+            try:
+                hwav, model_sr = denoise(dwav=wav, sr=sr, device=device, run_dir=None, **kwargs)
+            except Exception:
+                hwav, model_sr = denoise(dwav=wav, sr=sr, device="cpu", run_dir=None, **kwargs)
+            wet = float(max(0.0, min(1.0, wet)))
+            base = wav
+            if model_sr != sr:
+                base = ta_resample(base, orig_freq=sr, new_freq=model_sr)
+            if wet < 1.0:
+                hwav = wet * hwav + (1.0 - wet) * base
+            hwav = _apply_peak_ceiling(hwav, ceiling_db=-1.0)
+            # Save to temp and add to list
+            tmpd = Path(tempfile.mkdtemp(prefix="resem_out_"))
+            outp = tmpd / (Path(f.name).stem + "_ENH.wav")
+            torchaudio.save(str(outp), hwav.unsqueeze(0), int(model_sr))
+            out_paths.append(str(outp))
+            msgs.append(f"OK: {Path(f.name).name}")
+        except Exception as e:  # noqa: BLE001
+            msgs.append(f"Error: {Path(getattr(f, 'name', 'file')).name} -> {e}")
+    return out_paths, "\n".join(msgs)
+
+
+# ----- UI -----
+
+with gr.Blocks(title="Resemble Enhance – Web", css=".gradio-container {max-width: 1280px !important}") as demo:
+    gr.Markdown("## Resemble Enhance – Web")
+    files_state = gr.State([])
+    with gr.Tabs():
+        with gr.TabItem("Preview"):
+            with gr.Row():
+                with gr.Column(scale=2, min_width=380):
+                    gr.Markdown("Drag & drop or browse to upload one or more audio files.")
+                    up = gr.File(label="Upload audio (wav/mp3)", file_count="multiple", file_types=["audio"], interactive=True)
+                    upload_msg = gr.Markdown()
+                    file_pick = gr.Radio(choices=[], label="Choose uploaded file", interactive=True)
+                    gr.Markdown("### Settings")
+                    device = gr.Radio(["cuda", "cpu"], value="cuda", label="Device", interactive=True)
+                    with gr.Row():
+                        seam = gr.Checkbox(value=True, label="Seam-safe joins", interactive=True)
+                        pretx = gr.Checkbox(value=False, label="Pre-transcode (ffmpeg)", interactive=True)
+                    chunk = gr.Slider(7, 3600, value=60, step=1, label="Chunk size (s)", interactive=True)
+                    overlap = gr.Slider(0, 8, value=4, step=0.5, label="Overlap (s)", interactive=True)
+                    wet = gr.Slider(0, 1, value=1.0, step=0.05, label="Denoise mix (0..1)", interactive=True)
+                with gr.Column(scale=3, min_width=480):
+                    start = gr.Slider(0, 600, value=0, step=0.1, label="Start (s)", interactive=True)
+                    dur = gr.Slider(0.5, 180, value=5, step=0.1, label="Duration (s)", interactive=True)
+                    prev_btn = gr.Button("Render Preview", variant="primary")
+                    audio = gr.Audio(label="Preview Audio", interactive=False)
+                    prev_msg = gr.Markdown()
+
+        with gr.TabItem("Export"):
+            gr.Markdown("Process all uploaded files with the same settings as Preview.")
+            with gr.Row():
+                with gr.Column(scale=2, min_width=380):
+                    gr.Markdown("Uses the same uploaded files and settings from Preview.")
+                    exp_btn = gr.Button("Export All (Preview Pipeline)", variant="primary")
+                with gr.Column(scale=3, min_width=480):
+                    out_files = gr.File(label="Downloads", file_count="multiple")
+                    out_msg = gr.Markdown()
+
+    # Ingest uploads with per-file progress and populate file picker
+    def _ingest_files(files, progress=gr.Progress(track_tqdm=True)):
+        if not files:
+            yield [], gr.update(choices=[], value=None), "No files uploaded."
+            return
+        acc = []
+        names = []
+        n = len(files)
+        for i, f in enumerate(files, start=1):
+            acc.append(f)
+            names.append(Path(f.name).name)
+            progress(i / max(1, n), desc=f"Adding {names[-1]}")
+            yield acc, gr.update(choices=names, value=names[0] if names else None), f"Added {i}/{n}: {names[-1]}"
+
+    up.change(_ingest_files, inputs=up, outputs=[files_state, file_pick, upload_msg])
+
+    # Wire preview
+    def _preview_entry(files, pick_name, start, dur, device, seam, chunk, overlap, wet, pretx):
+        # Choose the file object by matching base name
+        sel = None
+        try:
+            if files:
+                for f in files:
+                    if Path(f.name).name == pick_name:
+                        sel = f
+                        break
+                if sel is None:
+                    sel = files[0]
+        except Exception:
+            sel = None
+        return _preview_one(True, sel, start, dur, device, seam, chunk, overlap, wet, pretx)
+
+    prev_btn.click(
+        _preview_entry,
+        inputs=[files_state, file_pick, start, dur, device, seam, chunk, overlap, wet, pretx],
+        outputs=[audio, prev_msg],
+    )
+
+    # Wire export (export tab)
+    exp_btn.click(
+        _export_batch,
+        inputs=[files_state, device, seam, chunk, overlap, wet, pretx],
+        outputs=[out_files, out_msg],
+    )
+
+
+if __name__ == "__main__":
+    # Local launch; avoid queue and allow browser open without blocking the script
+    demo.launch(share=False, inbrowser=True, prevent_thread_lock=True)

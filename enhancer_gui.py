@@ -33,6 +33,71 @@ BASE = Path.cwd()
 INPUT_TMP_ROOT = BASE / ".enhancer_runs_gui"
 OUTPUT_ROOT = BASE / "output_audio"
 
+def _prune_staging_dirs(max_age_hours: float = 24.0) -> int:
+    """Delete old temp staging subfolders under .enhancer_runs_gui.
+
+    Returns number of folders removed.
+    """
+    try:
+        root = INPUT_TMP_ROOT
+        if not root.exists():
+            return 0
+        now = time.time()
+        removed = 0
+        for p in list(root.iterdir()):
+            try:
+                if not p.is_dir():
+                    continue
+                age_h = (now - p.stat().st_mtime) / 3600.0
+                if age_h >= float(max_age_hours):
+                    shutil.rmtree(p, ignore_errors=True)
+                    removed += 1
+            except Exception:
+                # ignore errors on per-entry basis
+                pass
+        return removed
+    except Exception:
+        return 0
+
+def _find_free_port(host: str = "127.0.0.1") -> int:
+    import socket as _sock
+    s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    s.bind((host, 0))
+    addr, port = s.getsockname()
+    try:
+        s.close()
+    except Exception:
+        pass
+    return int(port)
+
+
+def _load_env_files() -> None:
+    """Load dotenv-style variables from 'env' or '.env' at repo root.
+    Only sets keys not already present in os.environ.
+    """
+    paths = [BASE / "env", BASE / ".env"]
+    for p in paths:
+        try:
+            if not p.exists():
+                continue
+            for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                if "=" not in s:
+                    continue
+                k, v = s.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if k and (k not in os.environ):
+                    os.environ[k] = v
+        except Exception:
+            pass
+
+
+# Load env overrides at import time so subprocess inherits them too
+_load_env_files()
+
 
 def _apply_peak_ceiling(wav_t, ceiling_db: float = -1.0):
     """Return a version of wav_t scaled so its absolute peak <= ceiling.
@@ -49,6 +114,110 @@ def _apply_peak_ceiling(wav_t, ceiling_db: float = -1.0):
     except Exception:
         pass
     return wav_t
+
+
+def _adaptive_transient_blend(proc, orig, sr: int, strength: float = 0.5):
+    """Mix some original back during sharp, loud mismatches to avoid choppy artifacts.
+    - proc, orig: 1D torch tensors at same sample rate and length
+    - strength: 0..1 fraction of how much of the computed mask to apply
+    Returns tensor same shape as inputs.
+    """
+    try:
+        import torch
+        if not (isinstance(proc, torch.Tensor) and isinstance(orig, torch.Tensor)):
+            return proc
+        if proc.dim() != 1:
+            proc = proc.view(-1)
+        if orig.dim() != 1:
+            orig = orig.view(-1)
+        n = min(proc.numel(), orig.numel())
+        x = proc[:n]
+        y = orig[:n]
+        # Mismatch measure smoothed over ~5 ms
+        k = max(8, int(sr * 0.005))
+        pad = k // 2
+        d = (x - y).abs().unsqueeze(0).unsqueeze(0)
+        w = torch.ones(1, 1, k, dtype=d.dtype, device=d.device) / float(k)
+        d_s = torch.nn.functional.conv1d(d, w, padding=pad).squeeze()
+        # Threshold relative to robust median
+        med = torch.quantile(d_s, 0.5)
+        thr = med * 6.0
+        # Soft mask where mismatch is above threshold and level is loud
+        lvl = torch.maximum(x.abs(), y.abs())
+        lvl_thr = 10 ** (-12.0 / 20.0)  # -12 dBFS
+        m1 = torch.clamp((d_s - thr) / (thr + 1e-8), 0.0, 1.0)
+        m2 = (lvl > lvl_thr).to(m1.dtype)
+        mask = (m1 * m2)  # 0..1
+        # Smooth mask over ~20 ms to avoid flutter
+        k2 = max(16, int(sr * 0.02))
+        pad2 = k2 // 2
+        w2 = torch.ones(1, 1, k2, dtype=d.dtype, device=d.device) / float(k2)
+        mask_s = torch.nn.functional.conv1d(mask.unsqueeze(0).unsqueeze(0), w2, padding=pad2).squeeze()
+        mask_s = torch.clamp(mask_s, 0.0, 1.0) * float(max(0.0, min(1.0, strength)))
+        out = x * (1.0 - mask_s) + y * mask_s
+        if out.numel() < proc.numel():
+            # pad tail unchanged if needed
+            tail = proc[out.numel():]
+            out = torch.cat([out, tail], dim=0)
+        return out
+    except Exception:
+        return proc
+
+
+def _parse_bypass_env() -> list[tuple[float, float]]:
+    """Parse RESEMBLE_BYPASS env as comma-separated start:dur seconds, e.g. "40.0:0.3,12.5:0.2""" 
+    raw = os.environ.get("RESEMBLE_BYPASS", "").strip()
+    if not raw:
+        return []
+    out: list[tuple[float, float]] = []
+    for part in raw.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if ':' in part:
+            a, b = part.split(':', 1)
+        else:
+            a, b = part, '0.2'
+        try:
+            start = float(a)
+            dur = float(b)
+            if start >= 0 and dur > 0:
+                out.append((start, dur))
+        except Exception:
+            continue
+    return out
+
+
+def _bypass_time_windows(proc, orig, sr: int, windows: list[tuple[float, float]]):
+    """Crossfade to original for specified time windows (seconds).
+    proc, orig: 1D tensors at same sr; windows: list of (start_s, dur_s)
+    """
+    try:
+        import torch
+        if not windows:
+            return proc
+        x = proc.clone()
+        y = orig
+        n = min(x.numel(), y.numel())
+        x = x[:n]
+        y = y[:n]
+        for (start_s, dur_s) in windows:
+            a = int(max(0, start_s * sr))
+            b = int(min(n, (start_s + dur_s) * sr))
+            if b <= a + 8:
+                continue
+            # 10 ms easing on both sides
+            ease = max(16, int(sr * 0.01))
+            a0 = max(0, a - ease)
+            b0 = min(n, b + ease)
+            mlen = b0 - a0
+            w = torch.linspace(0, 1, steps=mlen, dtype=x.dtype, device=x.device)
+            # 0..1 fade-in to original across [a0,b0]
+            mask = w.clone()
+            x[a0:b0] = x[a0:b0] * (1 - mask) + y[a0:b0] * mask
+        return x
+    except Exception:
+        return proc
 
 
 def _get_console_python() -> str:
@@ -74,8 +243,8 @@ class _Control:
         self.cancel_now = _th.Event()   # immediate cancel request (treated same at chunk boundary)
 
 
-def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, seam_safe: bool = True, control: _Control | None = None):
-    from resemble_enhance.enhancer.inference import denoise
+def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, seam_safe: bool = True, control: _Control | None = None, denoise_only: bool = True):
+    from resemble_enhance.enhancer.inference import denoise, enhance
     import torchaudio
     from torchaudio.functional import resample as ta_resample
 
@@ -103,6 +272,10 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
         dest_dir.mkdir(parents=True, exist_ok=True)
         out_dirs.add(dest_dir)
         name = p.name
+        try:
+            os.environ["RESEMBLE_FILE"] = str(p)
+        except Exception:
+            pass
         if control is not None and (control.cancel_now.is_set() or control.stop_after_chunk.is_set()):
             break
         wav, sr = torchaudio.load(str(p))
@@ -111,15 +284,94 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
             kwargs = dict(chunk_seconds=60.0, overlap_seconds=4.0, align_max_shift_ratio=0.05, align_disable=False)
         else:
             kwargs = dict(chunk_seconds=31.0, overlap_seconds=1.0, align_max_shift_ratio=0.25, align_disable=True)
+        # Allow env overrides for chunk sizing (set by GUI controls)
         try:
-            hwav, model_sr = denoise(
-                dwav=wav,
-                sr=sr,
-                device=device,
-                run_dir=None,
-                progress_cb=lambda evt, nm, i, n, p=p: on_chunk(evt, str(p), i, n),
-                **kwargs,
-            )
+            cs = float(os.environ.get('RESEMBLE_CHUNK_SECONDS', '') or 0) or None
+            ov = float(os.environ.get('RESEMBLE_OVERLAP_SECONDS', '') or 0) or None
+            if cs is not None and cs > 0:
+                kwargs['chunk_seconds'] = float(cs)
+            if ov is not None and ov >= 0:
+                # clamp overlap to quarter of chunk for safety
+                max_ov = max(0.0, float(kwargs.get('chunk_seconds', 31.0)) / 4.0)
+                kwargs['overlap_seconds'] = float(min(ov, max_ov))
+        except Exception:
+            pass
+        # Force single-chunk mode via env for diagnostics
+        try:
+            if os.environ.get("RESEMBLE_FORCE_SINGLE_CHUNK", "0") == "1":
+                dur = float(wav.shape[-1]) / float(sr)
+                kwargs.update(chunk_seconds=max(1.0, dur + 1.0), overlap_seconds=0.0, align_disable=True)
+        except Exception:
+            pass
+        try:
+            # OOM-resilient loop: progressively shrink chunk size; fallback to CPU if needed
+            max_retries = 4
+            attempt = 0
+            cur_kwargs = dict(**kwargs)
+            cur_device = device
+            while True:
+                try:
+                    if denoise_only:
+                        hwav, model_sr = denoise(
+                            dwav=wav,
+                            sr=sr,
+                            device=cur_device,
+                            run_dir=None,
+                            progress_cb=lambda evt, nm, i, n, p=p: on_chunk(evt, str(p), i, n),
+                            **cur_kwargs,
+                        )
+                    else:
+                        extra = {}
+                        try:
+                            fast = os.environ.get('RESEMBLE_FAST_ENHANCE','0') == '1'
+                        except Exception:
+                            fast = False
+                        if fast or str(cur_device).lower() == "cpu":
+                            # Prefer a faster configuration to avoid stalls in diagnostics or on CPU
+                            if str(cur_device).lower() == "cuda":
+                                extra.update(nfe=16, solver="midpoint")
+                            else:
+                                extra.update(nfe=8, solver="euler")
+                        hwav, model_sr = enhance(
+                            dwav=wav,
+                            sr=sr,
+                            device=cur_device,
+                            run_dir=None,
+                            progress_cb=lambda evt, nm, i, n, p=p: on_chunk(evt, str(p), i, n),
+                            **cur_kwargs,
+                            **extra,
+                        )
+                    break
+                except _Cancelled:
+                    raise
+                except Exception as e:
+                    # Detect CUDA OOM
+                    if "CUDA out of memory" in str(e) or getattr(type(e), "__name__", "").lower().startswith("outofmemory"):
+                        attempt += 1
+                        # Shrink chunk size, keep overlap reasonable
+                        cs = float(cur_kwargs.get("chunk_seconds", 31.0))
+                        ov = float(cur_kwargs.get("overlap_seconds", 1.0))
+                        new_cs = max(7.0, cs / 2.0)
+                        new_ov = min(ov, new_cs / 4.0)
+                        cur_kwargs.update(chunk_seconds=new_cs, overlap_seconds=new_ov)
+                        try:
+                            import torch as _t
+                            if _t.cuda.is_available():
+                                _t.cuda.empty_cache()
+                        except Exception:
+                            pass
+                        if attempt >= max_retries and cur_device == "cuda":
+                            # Final fallback to CPU
+                            cur_device = "cpu"
+                            attempt = 0
+                        if attempt > max_retries and cur_device == "cpu":
+                            raise
+                        # optional user feedback
+                        if progress_cb:
+                            progress_cb(done, expected)
+                        continue
+                    else:
+                        raise
         except _Cancelled:
             break
         dest_sr = 48000 if profile else sr
@@ -131,8 +383,83 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
         elif hwav.shape[-1] < exp_len:
             import torch
             hwav = torch.nn.functional.pad(hwav, (0, exp_len - hwav.shape[-1]))
+        # Transient-safe blend: add a little original back where mismatch is sharp and loud
+        try:
+            base = wav
+            if dest_sr != sr:
+                base = ta_resample(base, orig_freq=sr, new_freq=dest_sr)
+            if base.shape[-1] > exp_len:
+                base = base[:exp_len]
+            elif base.shape[-1] < exp_len:
+                import torch as _t
+                base = _t.nn.functional.pad(base, (0, exp_len - base.shape[-1]))
+            # Optional debug dump before post-processing (RAW model output at model_sr)
+            if os.environ.get("RESEMBLE_DEBUG_DUMP", "0") == "1":
+                try:
+                    raw_dbg = dest_dir / (Path(name).stem + "_RAW.wav")
+                    torchaudio.save(str(raw_dbg), hwav[None], model_sr)
+                except Exception:
+                    pass
+            if os.environ.get('RESEMBLE_DISABLE_TRANSIENT_BLEND', '0') != '1':
+                hwav = _adaptive_transient_blend(hwav, base, dest_sr, strength=0.9)
+            # Optional explicit bypass windows via env var (e.g., RESEMBLE_BYPASS="40.0:0.3")
+            wins = _parse_bypass_env()
+            if wins:
+                hwav = _bypass_time_windows(hwav, base, dest_sr, wins)
+            # Leading transient guard: protect the first pronounced onset by easing to original
+            if os.environ.get('RESEMBLE_LEAD_GUARD', '1') == '1':
+                try:
+                    import torch as _t
+                    x = hwav; y = base
+                    n = min(x.numel(), y.numel())
+                    if n > dest_sr // 2:
+                        x = x[:n]; y = y[:n]
+                        k_env = max(8, int(dest_sr * 0.005))  # ~5 ms smoothing
+                        pad = k_env // 2
+                        w = _t.ones(1, 1, k_env, dtype=x.dtype, device=x.device) / float(k_env)
+                        # mismatch and level envelopes
+                        d = (x - y).abs().unsqueeze(0).unsqueeze(0)
+                        d_s = _t.nn.functional.conv1d(d, w, padding=pad).squeeze()
+                        l = _t.maximum(x.abs(), y.abs()).unsqueeze(0).unsqueeze(0)
+                        l_s = _t.nn.functional.conv1d(l, w, padding=pad).squeeze()
+                        # thresholds
+                        d_med = _t.quantile(d_s, 0.5)
+                        d_thr = d_med * 4.0
+                        lvl_thr = 10 ** (-18.0 / 20.0)
+                        cand = ((d_s > d_thr) & (l_s > lvl_thr)).nonzero(as_tuple=False)
+                        if cand.numel() > 0:
+                            a = int(cand[0].item())
+                            # build ~150 ms guard around first onset
+                            dur = int(dest_sr * 0.15)
+                            ease = max(16, int(dest_sr * 0.01))
+                            a0 = max(0, a - ease)
+                            b0 = min(n, a + dur + ease)
+                            mlen = b0 - a0
+                            wlin = _t.linspace(0, 1, steps=mlen, dtype=x.dtype, device=x.device)
+                            xm = x.clone()
+                            xm[a0:b0] = x[a0:b0] * (1 - wlin) + y[a0:b0] * wlin
+                            hwav = xm
+                except Exception:
+                    pass
+            # Wet/dry mix: allow dialing down denoise strength
+            try:
+                wet = float(os.environ.get('RESEMBLE_WET', '1.0'))
+            except Exception:
+                wet = 1.0
+            wet = max(0.0, min(1.0, wet))
+            if wet < 1.0:
+                hwav = wet * hwav + (1.0 - wet) * base
+        except Exception:
+            pass
         out_path = dest_dir / name
         hwav = _apply_peak_ceiling(hwav, ceiling_db=-1.0)
+        # Optional debug dump after processing (POST)
+        if os.environ.get("RESEMBLE_DEBUG_DUMP", "0") == "1":
+            try:
+                post_dbg = dest_dir / (Path(name).stem + "_POST.wav")
+                torchaudio.save(str(post_dbg), hwav[None], dest_sr)
+            except Exception:
+                pass
         torchaudio.save(str(out_path), hwav[None], dest_sr)
         done += 1
         if progress_cb:
@@ -142,10 +469,10 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
     return results
 
 
-def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk_progress_cb=None, seam_safe: bool = True, control: _Control | None = None):
+def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk_progress_cb=None, seam_safe: bool = True, control: _Control | None = None, denoise_only: bool = True, prefer_cli: bool = False):
     # When frozen into an EXE, run in-process for full portability
-    if getattr(sys, 'frozen', False) or control is not None:
-        return _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, seam_safe=seam_safe, control=control)
+    if (getattr(sys, 'frozen', False) or control is not None) and not prefer_cli:
+        return _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, seam_safe=seam_safe, control=control, denoise_only=denoise_only)
 
     run_id = uuid.uuid4().hex[:8]
     in_dir = INPUT_TMP_ROOT / run_id / "input_audio"
@@ -154,10 +481,32 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
     in_dir.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Copy files into temp input dir
+    # Copy or transcode files into temp input dir; prefer WAV for CLI reliability
     for f in files:
-        dst = in_dir / Path(f).name
-        shutil.copy2(f, dst)
+        srcp = Path(f)
+        if srcp.suffix.lower() != ".wav":
+            # Transcode to WAV (mono, preserve rate) for CLI default suffix handling
+            try:
+                ff = shutil.which('ffmpeg') or shutil.which('ffmpeg.exe')
+                dst = in_dir / (srcp.stem + ".wav")
+                if ff:
+                    cmd_tx = [ff, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(srcp), '-ac', '1', str(dst)]
+                    subprocess.run(cmd_tx, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                else:
+                    import torchaudio as _ta
+                    wav, sr = _ta.load(str(srcp))
+                    if wav.dim() == 2 and wav.size(0) > 1:
+                        wav = wav.mean(0)
+                    else:
+                        wav = wav.squeeze(0)
+                    _ta.save(str(dst), wav.unsqueeze(0), sr)
+            except Exception:
+                # Fallback: copy source if transcode fails
+                dst = in_dir / srcp.name
+                shutil.copy2(f, dst)
+        else:
+            dst = in_dir / srcp.name
+            shutil.copy2(f, dst)
 
     py = _get_console_python()
     cmd = [
@@ -166,21 +515,34 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
         "resemble_enhance.enhancer",
         str(in_dir),
         str(out_dir),
-        "--denoise_only",
         "--device",
         device,
     ]
-    if profile:
+    if denoise_only:
+        cmd.insert(len(cmd)-2, "--denoise_only")
+    # In diagnostics/CLI mode, avoid profile overrides so our small chunk/overlap apply immediately
+    if profile and not prefer_cli:
         cmd += ["--profile", "camera_sync"]
+    # If enhance on CPU, force fast settings to avoid long stalls
+    try:
+        if (not denoise_only) and (str(device).lower() == 'cpu'):
+            cmd += ["--nfe", "8", "--solver", "euler"]
+    except Exception:
+        pass
     # Seam handling
     if seam_safe:
+        # Allow env overrides from GUI controls
+        cs = os.environ.get('RESEMBLE_CHUNK_SECONDS', '60.0') or '60.0'
+        ov = os.environ.get('RESEMBLE_OVERLAP_SECONDS', '4.0') or '4.0'
         cmd += [
-            "--chunk_seconds", "60.0",
-            "--overlap_seconds", "4.0",
+            "--chunk_seconds", str(cs),
+            "--overlap_seconds", str(ov),
             "--align_max_shift_ratio", "0.05",
         ]
     else:
-        cmd += ["--align_disable"]
+        cs = os.environ.get('RESEMBLE_CHUNK_SECONDS', '31.0') or '31.0'
+        ov = os.environ.get('RESEMBLE_OVERLAP_SECONDS', '1.0') or '1.0'
+        cmd += ["--align_disable", "--chunk_seconds", str(cs), "--overlap_seconds", str(ov)]
 
     # Launch process
     creationflags = 0
@@ -245,7 +607,13 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
     completed = 0
     # Poll for outputs while the process runs
     while proc.poll() is None:
-        completed = sum(1 for f in files if (out_dir / Path(f).name).exists())
+        def _has_out(fpath: str) -> bool:
+            p = Path(fpath)
+            cand1 = out_dir / p.name
+            cand2 = out_dir / (p.stem + ".wav")
+            cand3 = out_dir / (p.stem + ".mov")
+            return any(c.exists() and c.stat().st_size > 44 for c in (cand1, cand2, cand3))
+        completed = sum(1 for f in files if _has_out(f))
         if progress_cb:
             progress_cb(completed, expected)
         time.sleep(0.5)
@@ -265,8 +633,17 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
     for f in files:
         name = Path(f).name
         tmp_out = out_dir / name
-        if not tmp_out.exists() or tmp_out.stat().st_size <= 44:
-            continue
+        if not (tmp_out.exists() and tmp_out.stat().st_size > 44):
+            # Try common alternate container/extension
+            alt = out_dir / (Path(f).stem + ".wav")
+            if alt.exists() and alt.stat().st_size > 44:
+                tmp_out = alt
+            else:
+                alt2 = out_dir / (Path(f).stem + ".mov")
+                if alt2.exists() and alt2.stat().st_size > 44:
+                    tmp_out = alt2
+                else:
+                    continue
         dest_dir = Path(f).parent / f"Enhanced_{stamp}"
         dest_dir.mkdir(parents=True, exist_ok=True)
         final_out = dest_dir / name
@@ -277,6 +654,14 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
             shutil.copy2(str(tmp_out), str(final_out))
             tmp_out.unlink(missing_ok=True)
         results.append((str(Path(f)), str(final_out)))
+
+    # Cleanup temporary input dir for this run to avoid accumulating past runs
+    try:
+        run_root = in_dir.parent  # .../.enhancer_runs_gui/<run_id>
+        import shutil as _sh
+        _sh.rmtree(run_root, ignore_errors=True)
+    except Exception:
+        pass
 
     # Do not modify or delete original files or folders
     return results
@@ -493,7 +878,29 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self.var_skip_fine = tk.BooleanVar(value=True)
         self.var_bw64 = tk.BooleanVar(value=True)
         self.var_seam_safe = tk.BooleanVar(value=True)
+        # Optional post seam smoothing (disabled by default; web preview does not apply this)
+        self.var_seam_smooth = tk.BooleanVar(value=False)
         self.var_batch_folders = tk.BooleanVar(value=True)
+        self.var_pre_transcode = tk.BooleanVar(value=False)
+        # Chunking controls
+        self.var_chunk_sec = tk.DoubleVar(value=60.0)
+        self.var_overlap_sec = tk.DoubleVar(value=4.0)
+        # Wet/dry mix for denoise strength (0..1)
+        self.var_wet = tk.DoubleVar(value=1.0)
+        # Transient controls
+        self.var_auto_bypass = tk.BooleanVar(value=(os.environ.get('RESEMBLE_AUTO_BYPASS','0') == '1'))
+        self.var_bypass = tk.StringVar(value=os.environ.get('RESEMBLE_BYPASS',''))
+        self.var_bp_start = tk.IntVar(value=0)
+        self.var_bp_end = tk.IntVar(value=0)
+        self.var_force_single = tk.BooleanVar(value=(os.environ.get('RESEMBLE_FORCE_SINGLE_CHUNK','0') == '1'))
+        # Protect the first strong transient by blending a short window back to original
+        self.var_lead_guard = tk.BooleanVar(value=True)
+        # Processing mode: Denoise only vs Enhance
+        self.var_denoise_only = tk.BooleanVar(value=True)
+        # Diagnostics: disable all post FX except enhance and alignment
+        self.var_diag_minimal = tk.BooleanVar(value=True)
+        # Device selection for diagnostics/stability (default to CUDA)
+        self.var_device = tk.StringVar(value='cuda')
 
         adv_hdr = ttk.Frame(left)
         adv_hdr.pack(fill='x', pady=(4, 2))
@@ -501,7 +908,39 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self._adv_btn = ttk.Button(adv_hdr, text='Advanced Options [+]', command=self._toggle_advanced)
         self._adv_btn.pack(anchor='w')
 
-        self._adv_opts = ttk.Frame(left, style='TFrame')
+        # Scrollable Advanced Options container
+        self._adv_wrap = ttk.Frame(left)
+        self._adv_canvas = tk.Canvas(self._adv_wrap, highlightthickness=0, bg=self._bg, height=220)
+        self._adv_scroll = ttk.Scrollbar(self._adv_wrap, orient='vertical', command=self._adv_canvas.yview)
+        self._adv_canvas.configure(yscrollcommand=self._adv_scroll.set)
+        self._adv_canvas.pack(side='left', fill='both', expand=True)
+        self._adv_scroll.pack(side='right', fill='y')
+        # Inner frame that actually holds the options
+        self._adv_opts = ttk.Frame(self._adv_canvas, style='TFrame')
+        self._adv_win = self._adv_canvas.create_window((0, 0), window=self._adv_opts, anchor='nw')
+
+        def _adv_on_config(event=None):
+            try:
+                self._adv_canvas.configure(scrollregion=self._adv_canvas.bbox('all'))
+                # Keep inner frame width in sync with the canvas width
+                cw = self._adv_canvas.winfo_width()
+                self._adv_canvas.itemconfigure(self._adv_win, width=max(0, cw))
+            except Exception:
+                pass
+        self._adv_opts.bind('<Configure>', _adv_on_config)
+        self._adv_canvas.bind('<Configure>', _adv_on_config)
+
+        # Mouse wheel scroll
+        def _bind_wheel(widget, on=True):
+            try:
+                if on:
+                    widget.bind_all('<MouseWheel>', lambda e: self._adv_canvas.yview_scroll(-1 * int(e.delta/120), 'units'))
+                else:
+                    widget.unbind_all('<MouseWheel>')
+            except Exception:
+                pass
+        self._adv_canvas.bind('<Enter>', lambda e: _bind_wheel(self._adv_canvas, True))
+        self._adv_canvas.bind('<Leave>', lambda e: _bind_wheel(self._adv_canvas, False))
         # build options into the advanced frame (initially hidden)
         ttk.Checkbutton(self._adv_opts, text='Camera Sync (48 kHz)', style='Opt.TCheckbutton', variable=self.var_profile).pack(anchor='w', fill='x', pady=1)
         ttk.Checkbutton(self._adv_opts, text='Sync + Multichannel', style='Opt.TCheckbutton', variable=self.var_sync_export).pack(anchor='w', fill='x', pady=1)
@@ -510,7 +949,100 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         ttk.Checkbutton(self._adv_opts, text='Skip fine align', style='Opt.TCheckbutton', variable=self.var_skip_fine).pack(anchor='w', fill='x', pady=1)
         ttk.Checkbutton(self._adv_opts, text='Export BW64 (ADM dual-mono)', style='Opt.TCheckbutton', variable=self.var_bw64).pack(anchor='w', fill='x', pady=1)
         ttk.Checkbutton(self._adv_opts, text='Seam-safe joins (longer overlap + micro-align)', style='Opt.TCheckbutton', variable=self.var_seam_safe).pack(anchor='w', fill='x', pady=1)
+        ttk.Checkbutton(self._adv_opts, text='Post seam smoothing pass', style='Opt.TCheckbutton', variable=self.var_seam_smooth).pack(anchor='w', fill='x', pady=1)
         ttk.Checkbutton(self._adv_opts, text='Batch by folder (group files per folder)', style='Opt.TCheckbutton', variable=self.var_batch_folders).pack(anchor='w', fill='x', pady=1)
+        ttk.Checkbutton(self._adv_opts, text='Pre-transcode inputs to PCM WAV (ffmpeg)', style='Opt.TCheckbutton', variable=self.var_pre_transcode).pack(anchor='w', fill='x', pady=1)
+        # Chunk size + overlap controls
+        chunk_row = ttk.Frame(self._adv_opts)
+        chunk_row.pack(fill='x', pady=(6, 2))
+        ttk.Label(chunk_row, text='Chunk size (s):').pack(side='left')
+        self.sb_chunk = ttk.Spinbox(chunk_row, from_=7.0, to=7200.0, increment=1.0, width=8, textvariable=self.var_chunk_sec)
+        self.sb_chunk.pack(side='left', padx=(6, 12))
+        ttk.Label(chunk_row, text='Overlap (s):').pack(side='left')
+        self.sb_overlap = ttk.Spinbox(chunk_row, from_=0.0, to=60.0, increment=0.5, width=8, textvariable=self.var_overlap_sec)
+        self.sb_overlap.pack(side='left', padx=(6, 0))
+        # Denoise mix control
+        wet_row = ttk.Frame(self._adv_opts)
+        wet_row.pack(fill='x', pady=(6, 2))
+        ttk.Label(wet_row, text='Denoise mix (%):').pack(side='left')
+        self.sb_wet = ttk.Spinbox(wet_row, from_=0, to=100, increment=5, width=6)
+        self.sb_wet.pack(side='left', padx=(6, 0))
+        try:
+            self.sb_wet.configure(textvariable=tk.StringVar(value=str(int(self.var_wet.get()*100))))
+        except Exception:
+            pass
+        # Keep var_wet in sync with spinbox
+        def _wet_from_spin(*_):
+            try:
+                v = float(self.sb_wet.get())
+                self.var_wet.set(max(0.0, min(1.0, v/100.0)))
+            except Exception:
+                pass
+        def _spin_from_wet(*_):
+            try:
+                self.sb_wet.delete(0, 'end')
+                self.sb_wet.insert(0, str(int(self.var_wet.get()*100)))
+            except Exception:
+                pass
+        try:
+            self.sb_wet.bind('<FocusOut>', lambda e: _wet_from_spin())
+            self.sb_wet.bind('<Return>', lambda e: _wet_from_spin())
+        except Exception:
+            pass
+        # Transient mitigation controls
+        trans_row = ttk.Frame(self._adv_opts)
+        trans_row.pack(fill='x', pady=(6, 2))
+        ttk.Checkbutton(trans_row, text='Auto transient bypass', style='Opt.TCheckbutton', variable=self.var_auto_bypass).pack(side='left')
+        ttk.Checkbutton(trans_row, text='Protect first loud transient', style='Opt.TCheckbutton', variable=self.var_lead_guard).pack(side='left', padx=(12,0))
+        ttk.Checkbutton(trans_row, text='Force single chunk', style='Opt.TCheckbutton', variable=self.var_force_single).pack(side='left', padx=(12,0))
+        # Processing mode row
+        mode_row = ttk.Frame(self._adv_opts)
+        mode_row.pack(fill='x', pady=(6, 2))
+        ttk.Label(mode_row, text='Processing mode:').pack(side='left')
+        ttk.Radiobutton(mode_row, text='Denoise only', value=True, variable=self.var_denoise_only).pack(side='left', padx=(6, 0))
+        ttk.Radiobutton(mode_row, text='Enhance', value=False, variable=self.var_denoise_only).pack(side='left', padx=(12, 0))
+        # Diagnostics
+        ttk.Checkbutton(self._adv_opts, text='Diagnostics: enhance-only (disable post FX, keep alignment)', style='Opt.TCheckbutton', variable=self.var_diag_minimal).pack(anchor='w', fill='x', pady=1)
+        # Sync option (place directly below diagnostics for quick access)
+        ttk.Checkbutton(self._adv_opts, text='Sync inputs into multichannel file', style='Opt.TCheckbutton', variable=self.var_sync_export).pack(anchor='w', fill='x', pady=1)
+        # Device select (primarily for diagnostics)
+        dev_row = ttk.Frame(self._adv_opts)
+        dev_row.pack(fill='x', pady=(4, 2))
+        ttk.Label(dev_row, text='Device:').pack(side='left')
+        ttk.Combobox(dev_row, values=['cuda', 'cpu'], textvariable=self.var_device, state='readonly', width=8).pack(side='left', padx=(6,0))
+        bp_row = ttk.Frame(self._adv_opts)
+        bp_row.pack(fill='x', pady=(4, 4))
+        ttk.Label(bp_row, text='Bypass windows (start:dur, comma-separated):').pack(side='left')
+        self.bypass_entry = ttk.Entry(bp_row, textvariable=self.var_bypass, width=36)
+        self.bypass_entry.pack(side='left', padx=(6, 0))
+
+        # Simple range helper: Start/End seconds, converted to start:dur on run
+        range_row = ttk.Frame(self._adv_opts)
+        range_row.pack(fill='x', pady=(0, 6))
+        ttk.Label(range_row, text='Bypass range (s):').pack(side='left')
+        ttk.Label(range_row, text='Start').pack(side='left', padx=(6,2))
+        ttk.Spinbox(range_row, from_=0, to=86400, increment=1, width=6, textvariable=self.var_bp_start).pack(side='left')
+        ttk.Label(range_row, text='End').pack(side='left', padx=(6,2))
+        ttk.Spinbox(range_row, from_=0, to=86400, increment=1, width=6, textvariable=self.var_bp_end).pack(side='left')
+        # Keep defaults in sync when toggling seam-safe
+        def _on_seam_toggle(*_):
+            try:
+                if self.var_seam_safe.get():
+                    if self.var_chunk_sec.get() in (31.0, 0.0):
+                        self.var_chunk_sec.set(60.0)
+                    if self.var_overlap_sec.get() in (1.0, 0.0):
+                        self.var_overlap_sec.set(4.0)
+                else:
+                    if self.var_chunk_sec.get() in (60.0, 0.0):
+                        self.var_chunk_sec.set(31.0)
+                    if self.var_overlap_sec.get() in (4.0, 0.0):
+                        self.var_overlap_sec.set(1.0)
+            except Exception:
+                pass
+        try:
+            self.var_seam_safe.trace_add('write', lambda *_: _on_seam_toggle())
+        except Exception:
+            pass
 
         # Queue controls: filter + actions
         ctl = ttk.Frame(left)
@@ -818,9 +1350,22 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         btn_open = ttk.Button(btnhist, text='Open Selected Output', command=self._open_selected_output)
         btn_open.pack(side='left')
         self._bind_hover(btn_open)
+        btn_gr = ttk.Button(btnhist, text='Open Preview (Browser)', command=self._open_gradio_preview)
+        btn_gr.pack(side='left', padx=(8,0))
+        self._bind_hover(btn_gr)
+
+        # Preview handled via Gradio in a browser; no inline preview widgets
 
     def add_files(self):
-        paths = filedialog.askopenfilenames(title="Select audio files", filetypes=[("WAV files", ".wav .WAV"), ("All files", "*.*")])
+        paths = filedialog.askopenfilenames(
+            title="Select audio files",
+            filetypes=[
+                ("Audio files", ".wav .WAV .mp3 .MP3"),
+                ("WAV files", ".wav .WAV"),
+                ("MP3 files", ".mp3 .MP3"),
+                ("All files", "*.*"),
+            ],
+        )
         if not paths:
             return
         self._add_paths(paths)
@@ -848,10 +1393,230 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self._log_clear()
         self._refresh_queue_tree()
 
+    # Removed the old modal preview dialog in favor of inline media preview
+
+    def _render_preview_segment(self, src_path: str, start_s: float, dur_s: float) -> str:
+        """Process a short segment with current settings and write a temp WAV; returns path."""
+        import torchaudio
+        from torchaudio.functional import resample as ta_resample
+        # Export current env knobs
+        try:
+            cs = max(1.0, float(self.var_chunk_sec.get()))
+            ov = max(0.0, float(self.var_overlap_sec.get()))
+            os.environ['RESEMBLE_CHUNK_SECONDS'] = str(cs)
+            os.environ['RESEMBLE_OVERLAP_SECONDS'] = str(ov)
+            os.environ['RESEMBLE_AUTO_BYPASS'] = '1' if self.var_auto_bypass.get() else '0'
+            os.environ['RESEMBLE_DISABLE_TRANSIENT_BLEND'] = '1' if (getattr(self, 'var_disable_blend', None) and self.var_disable_blend.get()) else '0'
+            try:
+                os.environ['RESEMBLE_WET'] = str(max(0.0, min(1.0, float(self.var_wet.get()))))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # Optional pre-transcode
+        use_src = src_path
+        if self.var_pre_transcode.get():
+            try:
+                ff = shutil.which('ffmpeg') or shutil.which('ffmpeg.exe')
+                pre_dir = INPUT_TMP_ROOT / ('preview_' + uuid.uuid4().hex[:6])
+                pre_dir.mkdir(parents=True, exist_ok=True)
+                dst = pre_dir / (Path(src_path).stem + '.wav')
+                if ff:
+                    cmd = [ff, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-ss', str(start_s), '-t', str(dur_s), '-i', str(src_path), '-c:a', 'pcm_s16le', str(dst)]
+                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                    use_src = str(dst)
+                else:
+                    wav, sr = torchaudio.load(str(src_path))
+                    a = int(max(0, start_s * sr)); b = int(min(wav.shape[-1], a + int(dur_s * sr)))
+                    if wav.dim() == 2 and wav.size(0) > 1:
+                        wav = wav.mean(0)
+                    seg = wav[a:b]
+                    torchaudio.save(str(dst), seg.unsqueeze(0), sr)
+                    use_src = str(dst)
+            except Exception:
+                use_src = src_path
+
+        # Load source (or pre-transcoded) and slice segment if needed
+        wav, sr = torchaudio.load(str(use_src))
+        if wav.dim() == 2 and wav.size(0) > 1:
+            wav = wav.mean(0)
+        else:
+            wav = wav.squeeze(0)
+        total_len = int(wav.shape[-1]) if wav.ndim == 1 else int(wav.size(-1))
+        if total_len <= 0:
+            raise RuntimeError('Empty audio file or failed decode')
+        # Compute safe segment indices
+        seg_start = int(round(max(0.0, float(start_s)) * float(sr)))
+        seg_len = int(round(max(0.0, float(dur_s)) * float(sr)))
+        if seg_start >= total_len:
+            seg_start = max(0, total_len - min(int(sr), total_len))
+        if seg_len <= 0:
+            seg_len = min(int(5 * sr), total_len - seg_start)
+        seg_end = min(total_len, seg_start + seg_len)
+        if seg_end <= seg_start:
+            seg_end = min(total_len, seg_start + 1)
+        if not self.var_pre_transcode.get():
+            wav = wav[seg_start:seg_end]
+        # Final guard: ensure non-empty segment
+        if wav.numel() <= 0:
+            import torch as _t
+            wav = _t.zeros(256, dtype=_t.float32)
+
+        # Denoise with current seam settings
+        from resemble_enhance.enhancer.inference import denoise
+        if self.var_seam_safe.get():
+            kwargs = dict(chunk_seconds=float(os.environ.get('RESEMBLE_CHUNK_SECONDS', '60.0') or 60.0), overlap_seconds=float(os.environ.get('RESEMBLE_OVERLAP_SECONDS', '4.0') or 4.0), align_max_shift_ratio=0.05, align_disable=False)
+        else:
+            kwargs = dict(chunk_seconds=float(os.environ.get('RESEMBLE_CHUNK_SECONDS', '31.0') or 31.0), overlap_seconds=float(os.environ.get('RESEMBLE_OVERLAP_SECONDS', '1.0') or 1.0), align_max_shift_ratio=0.25, align_disable=True)
+        device = 'cuda'
+        try:
+            hwav, model_sr = denoise(dwav=wav, sr=sr, device=device, run_dir=None, **kwargs)
+        except Exception:
+            # Fallback to CPU or bypass if device fails
+            try:
+                hwav, model_sr = denoise(dwav=wav, sr=sr, device='cpu', run_dir=None, **kwargs)
+            except Exception:
+                hwav = wav
+                model_sr = sr
+
+        # Resample for profile (48k) if on
+        dest_sr = 48000 if self.var_profile.get() else sr
+        base = wav
+        if model_sr != dest_sr:
+            hwav = ta_resample(hwav, orig_freq=model_sr, new_freq=dest_sr)
+        if dest_sr != sr:
+            base = ta_resample(base, orig_freq=sr, new_freq=dest_sr)
+
+        # Wet/dry mix
+        try:
+            wet = float(os.environ.get('RESEMBLE_WET', '')) if os.environ.get('RESEMBLE_WET') else float(self.var_wet.get())
+        except Exception:
+            wet = 1.0
+        wet = max(0.0, min(1.0, wet))
+        if wet < 1.0:
+            hwav = wet * hwav + (1.0 - wet) * base
+
+        # Peak ceiling
+        hwav = _apply_peak_ceiling(hwav, ceiling_db=-1.0)
+
+        # Save to preview file and return path
+        out_dir = INPUT_TMP_ROOT / 'preview_out'
+        out_dir.mkdir(parents=True, exist_ok=True)
+        outp = out_dir / (Path(src_path).stem + f'_PREVIEW_{int(start_s)}s_{int(dur_s)}s.wav')
+        # Ensure non-empty on save
+        if hwav.numel() <= 0:
+            import torch as _t
+            hwav = _t.zeros(256, dtype=_t.float32)
+        torchaudio.save(str(outp), hwav.unsqueeze(0), dest_sr)
+        return str(outp)
+
+    def _get_selected_or_first(self) -> str | None:
+        try:
+            sel = self.queue_tree.selection()
+            if sel:
+                iid = sel[0]
+                p = self._iid_to_path.get(iid)
+                if p:
+                    return p
+            if self.files:
+                return self.files[0]
+        except Exception:
+            pass
+        return None
+
+    def _open_gradio_preview(self):
+        try:
+            if getattr(self, '_gradio_running', False):
+                self._log('Gradio preview already running.')
+                return
+            import gradio as gr
+            import numpy as np
+            import soundfile as sf
+            self._gradio_running = True
+
+            def _proc(use_selection: bool, upload, start: float, dur: float):
+                path = None
+                if use_selection:
+                    path = self._get_selected_or_first()
+                if not path and upload is not None:
+                    try:
+                        path = upload.name
+                    except Exception:
+                        path = None
+                if not path:
+                    return None, 'Select a file in the queue or upload one.'
+                try:
+                    outp = self._render_preview_segment(str(path), float(start), float(dur))
+                    y, sr = sf.read(outp, dtype='float32', always_2d=False)
+                    if isinstance(y, np.ndarray) and y.ndim > 1:
+                        y = y.mean(axis=1)
+                    return (int(sr), y), f'Rendered preview: {Path(outp).name}'
+                except Exception as e:
+                    return None, f'Error: {e}'
+
+            def _export_full(use_selection: bool, upload):
+                path = None
+                if use_selection:
+                    path = self._get_selected_or_first()
+                if not path and upload is not None:
+                    try:
+                        path = upload.name
+                    except Exception:
+                        path = None
+                if not path:
+                    return None, 'Select a file in the queue or upload one.'
+                # Compute full duration
+                dur = 0.0
+                try:
+                    info = sf.info(path)
+                    dur = float(info.frames) / float(info.samplerate or 1)
+                except Exception:
+                    dur = 0.0
+                if dur <= 0:
+                    dur = 99999.0
+                try:
+                    outp = self._render_preview_segment(str(path), 0.0, float(dur))
+                    return outp, f'Exported (Preview Mode): {Path(outp).name}'
+                except Exception as e:
+                    return None, f'Error: {e}'
+
+            with gr.Blocks(title='Resemble Enhance Preview') as demo:
+                gr.Markdown('## Preview')
+                with gr.Row():
+                    use_sel = gr.Checkbox(label='Use current selection', value=True)
+                    upload = gr.File(label='Or upload audio (wav/mp3)')
+                with gr.Row():
+                    start = gr.Slider(0, 600, value=0, step=0.1, label='Start (s)')
+                    dur = gr.Slider(0.5, 180, value=5, step=0.1, label='Duration (s)')
+                btn = gr.Button('Render')
+                audio = gr.Audio(label='Preview Audio')
+                msg = gr.Markdown()
+                btn.click(_proc, [use_sel, upload, start, dur], [audio, msg])
+                gr.Markdown('---')
+                with gr.Row():
+                    btn_exp = gr.Button('Export Full (Preview Mode)')
+                    dl = gr.File(label='Download', interactive=False)
+                msg2 = gr.Markdown()
+                btn_exp.click(_export_full, [use_sel, upload], [dl, msg2])
+
+            # Launch from UI thread without blocking; let gradio open the browser
+            # Launch without queue to avoid version-specific queue errors
+            demo.launch(share=False, inbrowser=True, prevent_thread_lock=True)
+            self._log('Gradio preview launched.')
+        except Exception as e:
+            try:
+                self._log(f'Preview failed: {e}')
+            except Exception:
+                pass
+        finally:
+            self._gradio_running = False
+
+    # Removed inline preview playback and export; using Gradio-based preview instead
     def _add_paths(self, paths):
         def _is_audio(path: str) -> bool:
             suf = Path(path).suffix.lower()
-            return suf in {'.wav', '.wave'}
+            return suf in {'.wav', '.wave', '.mp3'}
         for p in paths:
             p = str(p)
             try:
@@ -872,7 +1637,8 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self._refresh_queue_tree()
 
     def _enable_run(self):
-        self.run_btn["state"] = "normal" if self.files else "disabled"
+        enabled = "normal" if self.files else "disabled"
+        self.run_btn["state"] = enabled
         # Keep status filter useful
         if not self.files:
             self.status_filter_var.set('All')
@@ -981,14 +1747,14 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
     def _toggle_advanced(self):
         try:
             if self._adv_open:
-                self._adv_opts.pack_forget()
+                self._adv_wrap.pack_forget()
                 self._adv_open = False
                 try:
                     self._adv_btn.configure(text='Advanced Options [+]')
                 except Exception:
                     pass
             else:
-                self._adv_opts.pack(fill='x', pady=(2, 8))
+                self._adv_wrap.pack(fill='x', pady=(2, 8))
                 self._adv_open = True
                 try:
                     self._adv_btn.configure(text='Advanced Options [-]')
@@ -1193,6 +1959,58 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 # Reset status
                 self.after(0, lambda: self._set_status('Ready'))
                 self.after(0, lambda: self._log("Launching enhancer..."))
+                # Export run-time env so processing respects GUI settings
+                try:
+                    cs = max(1.0, float(self.var_chunk_sec.get()))
+                    ov = max(0.0, float(self.var_overlap_sec.get()))
+                    # In diagnostics mode, force small, fast chunks for quick feedback
+                    if self.var_diag_minimal.get():
+                        cs = 7.0
+                        ov = 0.5
+                    os.environ['RESEMBLE_CHUNK_SECONDS'] = str(cs)
+                    os.environ['RESEMBLE_OVERLAP_SECONDS'] = str(ov)
+                    try:
+                        os.environ['RESEMBLE_WET'] = str(max(0.0, min(1.0, float(self.var_wet.get()))))
+                    except Exception:
+                        pass
+                    os.environ['RESEMBLE_AUTO_BYPASS'] = '1' if self.var_auto_bypass.get() else '0'
+                    os.environ['RESEMBLE_LEAD_GUARD'] = '1' if self.var_lead_guard.get() else '0'
+                    # Prefer fast enhance config when Enhance mode is selected
+                    if not self.var_denoise_only.get():
+                        os.environ['RESEMBLE_FAST_ENHANCE'] = '1'
+                    # Diagnostics: disable all post FX besides enhance + alignment
+                    if self.var_diag_minimal.get():
+                        os.environ['RESEMBLE_DISABLE_TRANSIENT_BLEND'] = '1'
+                        os.environ['RESEMBLE_AUTO_BYPASS'] = '0'
+                        os.environ['RESEMBLE_LEAD_GUARD'] = '0'
+                        os.environ['RESEMBLE_WET'] = '1.0'
+                        os.environ.pop('RESEMBLE_BYPASS', None)
+                        try:
+                            self.var_postproc.set(False)
+                            self.var_seam_smooth.set(False)
+                        except Exception:
+                            pass
+                    # Combine manual windows with optional start/end range; only if enabled
+                    parts = []
+                    if getattr(self, 'var_enable_bypass', None) and self.var_enable_bypass.get():
+                        bp = (self.var_bypass.get() or '').strip()
+                        if bp:
+                            parts.append(bp)
+                        try:
+                            s = int(self.var_bp_start.get() or 0)
+                            e = int(self.var_bp_end.get() or 0)
+                            if e > s and s >= 0:
+                                parts.append(f"{s}:{e - s}")
+                        except Exception:
+                            pass
+                    if parts:
+                        os.environ['RESEMBLE_BYPASS'] = ",".join(parts)
+                    else:
+                        os.environ.pop('RESEMBLE_BYPASS', None)
+                    os.environ['RESEMBLE_DISABLE_TRANSIENT_BLEND'] = '1' if (getattr(self, 'var_disable_blend', None) and self.var_disable_blend.get()) else '0'
+                    os.environ['RESEMBLE_FORCE_SINGLE_CHUNK'] = '1' if self.var_force_single.get() else '0'
+                except Exception:
+                    pass
                 # Build groups: batch by folder or single group
                 files_all = list(self.files)
                 groups: list[tuple[str, list[str]]] = []
@@ -1223,16 +2041,63 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         self._group_total = total
                         self.overall_label["text"] = f"Group {gi}/{total_groups}: {done} of {total} files ({pct}%)"
 
+                    # Optional pre-transcode inputs to clean PCM WAV to avoid container/decoder glitches
+                    use_files = list(gfiles)
+                    tx_map = {}
+                    if self.var_pre_transcode.get():
+                        try:
+                            ff = shutil.which('ffmpeg') or shutil.which('ffmpeg.exe')
+                        except Exception:
+                            ff = None
+                        try:
+                            pre_dir = INPUT_TMP_ROOT / ("prewav_" + uuid.uuid4().hex[:6])
+                            pre_dir.mkdir(parents=True, exist_ok=True)
+                        except Exception:
+                            pre_dir = None
+                        new_files = []
+                        for src in gfiles:
+                            dst = None
+                            try:
+                                p = Path(src)
+                                if pre_dir is not None:
+                                    dst = pre_dir / (p.stem + ".wav")
+                                else:
+                                    dst = p.with_suffix('.wav')
+                                if ff:
+                                    cmd = [ff, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(src), '-c:a', 'pcm_s16le', str(dst)]
+                                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                                else:
+                                    import torchaudio as _ta
+                                    wav, sr = _ta.load(str(src))
+                                    _ta.save(str(dst), wav, sr)
+                                if dst.exists() and dst.stat().st_size > 44:
+                                    new_files.append(str(dst))
+                                    tx_map[str(dst)] = str(src)
+                                else:
+                                    new_files.append(src)
+                            except Exception:
+                                new_files.append(src)
+                        if new_files:
+                            use_files = new_files
+
                     # Enhance this group
                     results = run_enhancer_for(
-                        gfiles,
-                        device="cuda",
+                        use_files,
+                        device=self.var_device.get(),
                         profile=self.var_profile.get(),
                         progress_cb=lambda d, t: self.after(0, update_prog_group, d, t),
                         chunk_progress_cb=lambda name, i, n: self.after(0, update_chunk, name, i, n),
                         seam_safe=self.var_seam_safe.get(),
-                        control=self._control,
+                        control=(None if self.var_diag_minimal.get() else self._control),
+                        denoise_only=self.var_denoise_only.get(),
+                        prefer_cli=(self.var_diag_minimal.get() or (not self.var_denoise_only.get())),
                     )
+                    # Map results back to original source paths if pre-transcoded
+                    if tx_map:
+                        try:
+                            results = [(tx_map.get(src, src), out) for (src, out) in results]
+                        except Exception:
+                            pass
                     self.after(0, lambda gi=gi: self._log(f"Group {gi}: enhanced {len(results)} file(s)."))
                     # Mark final statuses for this group
                     try:
@@ -1270,8 +2135,8 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         if self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set():
                             break
 
-                    # Seam smoothing per group
-                    if self.var_seam_safe.get() and results:
+                    # Seam smoothing per group (optional; disabled by default to match Web Preview behavior)
+                    if self.var_seam_safe.get() and self.var_seam_smooth.get() and results:
                         try:
                             self.after(0, lambda: self._set_status('Scanning seams'))
                             outs = [out for _, out in results]
@@ -1340,6 +2205,13 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                 self.after(0, lambda e=e: self._log(f"Sync/export error: {e}"))
                 # Clear the queue after successful enhance
                 self.after(0, self._clear_queue)
+                # Auto-prune old staging after a successful run
+                try:
+                    pruned = _prune_staging_dirs(max_age_hours=24.0)
+                    if pruned > 0:
+                        self.after(0, lambda p=pruned: self._log(f"Pruned {p} old staging folder(s)."))
+                except Exception:
+                    pass
             except Exception as e:  # noqa: BLE001
                 self.after(0, lambda e=e: self._log(f"Error: {e}"))
             finally:
@@ -1746,8 +2618,17 @@ def _estimate_drift_ratio(ref_path: str, other_path: str, sr: int, win_s: float 
         lags.append(lag)
     if len(ts) < 2:
         return 1.0
-    # Fit lag(samples) = a * t(sec) + b
-    a, b = np.polyfit(np.asarray(ts), np.asarray(lags), 1)
+    # Fit lag(samples) = a * t(sec) + b, guard invalids
+    try:
+        xt = np.asarray(ts, dtype=float)
+        yl = np.asarray(lags, dtype=float)
+        if not np.isfinite(xt).all() or not np.isfinite(yl).all() or np.unique(xt).size < 2:
+            return 1.0
+        a, b = np.polyfit(xt, yl, 1)
+        if not np.isfinite(a):
+            return 1.0
+    except Exception:
+        return 1.0
     # Drift ratio: resample other by (1 - a/sr)
     ratio = 1.0 - (a / float(sr))
     return float(ratio)
@@ -1755,7 +2636,16 @@ def _estimate_drift_ratio(ref_path: str, other_path: str, sr: int, win_s: float 
 
 def _gcc_phat_lag(x, y) -> int:
     import numpy as np
-    n = int(2 ** np.ceil(np.log2(len(x) + len(y))))
+    lx = int(len(x) or 0)
+    ly = int(len(y) or 0)
+    nsum = lx + ly
+    if nsum <= 0:
+        return 0
+    try:
+        n = int(2 ** np.ceil(np.log2(nsum)))
+        n = max(n, 2)
+    except Exception:
+        n = max(2, nsum)
     X = np.fft.rfft(x, n=n)
     Y = np.fft.rfft(y, n=n)
     R = X * np.conj(Y)
@@ -1920,6 +2810,8 @@ def _seam_smooth_files(paths: list[str], progress_cb=None) -> None:
         win = max(256, int(sr * (win_ms / 1000.0)))
         cross = min(1024, win // 2)
         lag_max = max(1, int(sr * 0.01))  # 10 ms
+        guard_start_s = 1.0  # never modify within the first second to protect initial loud onsets
+        guard_start = int(sr * guard_start_s)
         for c in range(C):
             x = out[c]
             diff = torch.abs(x[1:] - x[:-1])
@@ -1933,6 +2825,8 @@ def _seam_smooth_files(paths: list[str], progress_cb=None) -> None:
             filtered = []
             last = -10**9
             for i in idxs:
+                if i < guard_start:
+                    continue
                 if i - last >= win:
                     filtered.append(i)
                     last = i
