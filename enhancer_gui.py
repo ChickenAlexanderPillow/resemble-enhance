@@ -2166,13 +2166,16 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                 self._set_status(f"{msg} - {pct}%")
                                 if self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set():
                                     raise _Cancelled()
+                            skip_fine_align = self.var_skip_fine.get()
+                            if self.var_diag_minimal.get():
+                                skip_fine_align = False  # Diagnostics require fine alignment to verify sync.
                             out_path = _sync_and_export_multichannel(
                                 outs,
                                 prefer_48k=self.var_profile.get(),
                                 log=lambda m: self.after(0, self._log, m),
                                 progress_cb=lambda i, n, m: self.after(0, stage_prog, i, n, m),
                                 wav_only=self.var_fast_wav.get(),
-                                skip_fine_align=self.var_skip_fine.get(),
+                                skip_fine_align=skip_fine_align,
                                 use_bw64=self.var_bw64.get(),
                                 out_base_dir=gname,
                             )
