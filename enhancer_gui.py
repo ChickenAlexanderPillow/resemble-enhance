@@ -205,6 +205,11 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
         import torch
     except Exception:
         return monos
+    try:
+        from torchaudio.functional import highpass_biquad, lowpass_biquad
+    except Exception:
+        highpass_biquad = None
+        lowpass_biquad = None
     if len(monos) < 2:
         return monos
     lengths = [int(m.size(-1)) for m in monos if isinstance(m, torch.Tensor)]
@@ -216,10 +221,10 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
 
     win_ms = 25.0
     hop_ms = 10.0
-    silence_db = -55.0
-    start_db = 6.0
-    full_db = 18.0
-    max_att_db = 18.0
+    silence_db = -60.0
+    start_db = 4.0
+    full_db = 12.0
+    max_att_db = 28.0
 
     padded: list[torch.Tensor] = []
     for mono in monos:
@@ -229,8 +234,23 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
             mono = torch.nn.functional.pad(mono, (0, T - mono.size(-1)))
         padded.append(mono)
 
+    def _voice_env(m: torch.Tensor) -> torch.Tensor:
+        if highpass_biquad is None or lowpass_biquad is None:
+            return _compute_rms_envelope(m, sr, win_ms=win_ms, hop_ms=hop_ms)
+        try:
+            sig = m.unsqueeze(0)
+            sig = highpass_biquad(sig, sr, cutoff_freq=180.0, Q=0.707)
+            sig = lowpass_biquad(sig, sr, cutoff_freq=4200.0, Q=0.707)
+            sig = sig.squeeze(0)
+            return _compute_rms_envelope(sig, sr, win_ms=win_ms, hop_ms=hop_ms)
+        except Exception:
+            return _compute_rms_envelope(m, sr, win_ms=win_ms, hop_ms=hop_ms)
+
     envs = [_compute_rms_envelope(m, sr, win_ms=win_ms, hop_ms=hop_ms) for m in padded]
+    voice_envs = [_voice_env(m) for m in padded]
     env = torch.stack(envs, dim=0) + 1e-9
+    venv = torch.stack(voice_envs, dim=0) + 1e-9
+    env = (0.35 * env) + (0.65 * venv)
     env_db = 20.0 * torch.log10(env)
     max_env_db, _ = env_db.max(dim=0)
     silence_mask = (max_env_db < silence_db)
@@ -2280,9 +2300,17 @@ def _sync_and_export_multichannel_simple(
         except Exception:
             return None
         try:
-            return rec_cls()
+            rec = rec_cls()
         except Exception:
             return None
+        try:
+            cfg = getattr(rec, 'config', None)
+            if cfg is not None:
+                setattr(cfg, 'multiprocessing', False)
+                setattr(cfg, 'num_processors', 1)
+        except Exception:
+            pass
+        return rec
 
     primary_rec = _make_recognizer('FingerprintRecognizer')
     fallback_rec = _make_recognizer('CorrelationSpectrogramRecognizer') or _make_recognizer('CorrelationRecognizer')
