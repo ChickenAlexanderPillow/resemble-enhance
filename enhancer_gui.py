@@ -165,6 +165,112 @@ def _adaptive_transient_blend(proc, orig, sr: int, strength: float = 0.5):
         return proc
 
 
+def _compute_rms_envelope(mono, sr: int, win_ms: float = 25.0, hop_ms: float = 10.0):
+    """Return RMS envelope sampled every hop_ms milliseconds."""
+    import torch
+    win = max(1, int(sr * win_ms / 1000.0))
+    hop = max(1, int(sr * hop_ms / 1000.0))
+    if mono.numel() < win:
+        return torch.sqrt(torch.mean(mono * mono) + 1e-12).unsqueeze(0)
+    kernel = torch.ones(1, 1, win, dtype=mono.dtype, device=mono.device) / float(win)
+    x = mono.unsqueeze(0).unsqueeze(0)  # [1,1,T]
+    rms = torch.nn.functional.conv1d(x * x, kernel, stride=hop)
+    return torch.sqrt(rms.squeeze(0).squeeze(0) + 1e-12)
+
+
+def _smooth_gain_envelope(env, attack_ms: float, release_ms: float, sr: int, hop_ms: float):
+    """Apply separate attack/release smoothing to a per-frame envelope."""
+    import math
+    import torch
+
+    hop = max(1, int(sr * hop_ms / 1000.0))
+    attack_tc = max(1e-3, attack_ms / 1000.0)
+    release_tc = max(1e-3, release_ms / 1000.0)
+    # Convert time constants to smoothing coefficients
+    alpha_a = math.exp(-hop / (sr * attack_tc))
+    alpha_r = math.exp(-hop / (sr * release_tc))
+    out = torch.empty_like(env)
+    prev = float(env[0]) if env.numel() else 0.0
+    for i in range(env.numel()):
+        v = float(env[i])
+        coeff = alpha_a if v > prev else alpha_r
+        prev = coeff * prev + (1.0 - coeff) * v
+        out[i] = prev
+    return out
+
+
+def _apply_bleed_gate(monos: list, sr: int) -> list:
+    """Attenuate bleed by gating quieter tracks relative to the loudest channel."""
+    try:
+        import torch
+    except Exception:
+        return monos
+    if len(monos) < 2:
+        return monos
+    lengths = [int(m.size(-1)) for m in monos if isinstance(m, torch.Tensor)]
+    if not lengths:
+        return monos
+    T = max(lengths)
+    if T <= 0:
+        return monos
+
+    win_ms = 25.0
+    hop_ms = 10.0
+    silence_db = -55.0
+    start_db = 6.0
+    full_db = 18.0
+    max_att_db = 18.0
+
+    padded: list[torch.Tensor] = []
+    for mono in monos:
+        if not isinstance(mono, torch.Tensor):
+            return monos
+        if mono.size(-1) < T:
+            mono = torch.nn.functional.pad(mono, (0, T - mono.size(-1)))
+        padded.append(mono)
+
+    envs = [_compute_rms_envelope(m, sr, win_ms=win_ms, hop_ms=hop_ms) for m in padded]
+    env = torch.stack(envs, dim=0) + 1e-9
+    env_db = 20.0 * torch.log10(env)
+    max_env_db, _ = env_db.max(dim=0)
+    silence_mask = (max_env_db < silence_db)
+
+    gains_db = torch.zeros_like(env_db)
+    for idx in range(env_db.size(0)):
+        delta = max_env_db - env_db[idx]
+        delta = torch.where(silence_mask, torch.zeros_like(delta), delta)
+        att = torch.zeros_like(delta)
+        mid = (delta > start_db) & (delta < full_db)
+        if (full_db - start_db) > 1e-6:
+            att[mid] = (delta[mid] - start_db) / (full_db - start_db) * max_att_db
+        att[delta >= full_db] = max_att_db
+        gains_db[idx] = -att
+
+    gains_lin: list[torch.Tensor] = []
+    for idx in range(env_db.size(0)):
+        g = 10.0 ** (gains_db[idx] / 20.0)
+        g = _smooth_gain_envelope(g, attack_ms=15.0, release_ms=80.0, sr=sr, hop_ms=hop_ms)
+        gains_lin.append(g)
+
+    hop = max(1, int(sr * hop_ms / 1000.0))
+    gated: list[torch.Tensor] = []
+    for mono, g in zip(padded, gains_lin):
+        if g.numel() == 0:
+            gated.append(mono)
+            continue
+        g_up = torch.repeat_interleave(g, hop)
+        last = float(g[-1])
+        if g_up.size(-1) < T:
+            g_up = torch.nn.functional.pad(g_up, (0, T - g_up.size(-1)), value=last)
+        g_up = g_up[:T]
+        gated.append(mono * g_up)
+
+    out: list[torch.Tensor] = []
+    for orig, ga in zip(monos, gated):
+        out.append(ga[..., :orig.size(-1)])
+    return out
+
+
 def _parse_bypass_env() -> list[tuple[float, float]]:
     """Parse RESEMBLE_BYPASS env as comma-separated start:dur seconds, e.g. "40.0:0.3,12.5:0.2""" 
     raw = os.environ.get("RESEMBLE_BYPASS", "").strip()
@@ -888,11 +994,20 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self.var_diag_minimal = tk.BooleanVar(value=True)
         self.var_device = tk.StringVar(value='cuda')
         self.var_disable_blend = tk.BooleanVar(value=False)
+        self.var_bleed_gate = tk.BooleanVar(value=False)
 
         # Diagnostics mode notice (advanced controls disabled)
         diag_box = ttk.Frame(left)
         diag_box.pack(fill='x', pady=(4, 6))
         ttk.Label(diag_box, text='Diagnostics alignment mode is locked. Advanced options are temporarily removed.', wraplength=260, justify='left').pack(fill='x')
+        bleed_box = ttk.Frame(left)
+        bleed_box.pack(fill='x', pady=(0, 6))
+        ttk.Checkbutton(
+            bleed_box,
+            text='Reduce mic bleed (experimental)',
+            variable=self.var_bleed_gate,
+            style='Opt.TCheckbutton'
+        ).pack(anchor='w')
         self._adv_open = False
         self._adv_wrap = None
         self._adv_btn = None
@@ -2008,6 +2123,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                 wav_only=False,
                                 use_bw64=self.var_bw64.get(),
                                 out_base_dir=gname,
+                                enable_bleed_gate=self.var_bleed_gate.get(),
                             )
                             if out_path:
                                 ch = 0
@@ -2086,6 +2202,7 @@ def _sync_and_export_multichannel_simple(
     wav_only: bool = False,
     use_bw64: bool = True,
     out_base_dir: str | None = None,
+    enable_bleed_gate: bool = False,
 ) -> str | None:
     """Simplified Audalign-based alignment and multichannel export.
 
@@ -2240,12 +2357,21 @@ def _sync_and_export_multichannel_simple(
     from torchaudio.functional import resample as ta_resample
 
     monos: list[torch.Tensor] = []
-    max_len = 0
     for wav, sr in resampled:
         mono = wav[0]
         if sr != target_sr:
             mono = ta_resample(mono, orig_freq=sr, new_freq=target_sr)
         monos.append(mono)
+
+    if enable_bleed_gate:
+        _emit('Applying bleed gate to reduce cross-mic bleed...')
+        try:
+            monos = _apply_bleed_gate(monos, target_sr)
+        except Exception as exc:
+            _emit(f'Bleed gate failed: {exc}', force_console=True)
+
+    max_len = 0
+    for mono in monos:
         if mono.size(-1) > max_len:
             max_len = int(mono.size(-1))
 
@@ -2334,7 +2460,7 @@ def _sync_and_export_multichannel_simple(
     return str(out_wav)
 
 
-def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True, log=None, progress_cb=None, wav_only: bool = False, skip_fine_align: bool = False, force_fine_align: bool = False, force_drift_correction: bool = False, use_bw64: bool = True, out_base_dir: str | None = None) -> str | None:
+def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True, log=None, progress_cb=None, wav_only: bool = False, skip_fine_align: bool = False, force_fine_align: bool = False, force_drift_correction: bool = False, use_bw64: bool = True, out_base_dir: str | None = None, enable_bleed_gate: bool = False) -> str | None:
     """Legacy alignment function retained for backwards compatibility.
 
     Currently unused by the GUI; kept so older scripts can still import it.
@@ -2347,6 +2473,7 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
         wav_only=wav_only,
         use_bw64=use_bw64,
         out_base_dir=out_base_dir,
+        enable_bleed_gate=enable_bleed_gate,
     )
 
 
