@@ -2229,7 +2229,7 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
             wav = wav.squeeze(0)
         if sr != proxy_sr:
             wav = ta_resample(wav, orig_freq=sr, new_freq=proxy_sr)
-        outp = proxy_dir / f"{idx:02d}_{Path(p).name}"
+        outp = proxy_dir / Path(p).name
         wav = _apply_peak_ceiling(wav, ceiling_db=-1.0)
         torchaudio.save(str(outp), wav.unsqueeze(0), proxy_sr)
         proxies.append(outp)
