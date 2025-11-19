@@ -2000,15 +2000,12 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                             force_drift = force_fine_align
                             if force_fine_align:
                                 skip_fine_align = False  # Diagnostics require fine alignment to verify sync.
-                            out_path = _sync_and_export_multichannel(
+                            out_path = _sync_and_export_multichannel_simple(
                                 outs,
                                 prefer_48k=self.var_profile.get(),
                                 log=lambda m: self.after(0, self._log, m),
                                 progress_cb=lambda i, n, m: self.after(0, stage_prog, i, n, m),
                                 wav_only=False,
-                                skip_fine_align=skip_fine_align,
-                                force_fine_align=force_fine_align,
-                                force_drift_correction=force_drift,
                                 use_bw64=self.var_bw64.get(),
                                 out_base_dir=gname,
                             )
@@ -2081,10 +2078,19 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
 
 # --- Alignment and multichannel export helpers (Audalign-based) ---
 
-def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True, log=None, progress_cb=None, wav_only: bool = False, skip_fine_align: bool = False, force_fine_align: bool = False, force_drift_correction: bool = False, use_bw64: bool = True, out_base_dir: str | None = None) -> str | None:
-    """Align given enhanced files using audalign and export a single multichannel WAV.
+def _sync_and_export_multichannel_simple(
+    file_paths: list[str],
+    prefer_48k: bool = True,
+    log=None,
+    progress_cb=None,
+    wav_only: bool = False,
+    use_bw64: bool = True,
+    out_base_dir: str | None = None,
+) -> str | None:
+    """Simplified Audalign-based alignment and multichannel export.
 
-    Returns the output multichannel wav path or None on failure.
+    Uses Audalign directly on the input files and then assembles a multichannel
+    WAV/MOV without extra proxy generation, drift correction, or manual offsets.
     """
     import importlib
     from datetime import datetime
@@ -2092,37 +2098,37 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
     import torch
 
     def _emit(message: str, force_console: bool = False) -> None:
-        """Send sync logs to both the GUI callback and stdout."""
         if log:
             try:
                 log(message)
             except Exception:
                 pass
         try:
-            if force_console:
-                print(f"[sync] {message}")
-            else:
-                print(f"[sync] {message}")
+            print(f"[sync] {message}")
         except Exception:
+            # Best-effort logging only
             pass
 
     if not file_paths:
         _emit('No files provided for sync; skipping multichannel export.', force_console=True)
         return None
 
-    # Import audalign lazily
-    ad = importlib.import_module('audalign')
-    # Silence tqdm in audalign to prevent blocking on subsequent runs
+    try:
+        ad = importlib.import_module('audalign')
+    except Exception as exc:
+        _emit(f'Audalign is not available: {exc}', force_console=True)
+        return None
+
     os.environ.setdefault('TQDM_DISABLE', '1')
-    _emit('Building proxies for alignment...')
 
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     first_parent = Path(file_paths[0]).parent
-    # Intermediate working dir to avoid leaving per-file outputs
+
+    # Temporary working dir for Audalign output
     tmp_dir = (Path.cwd() / ".enhancer_runs_gui" / "tmp_sync" / stamp)
     tmp_dir.mkdir(parents=True, exist_ok=True)
+
     # Final folder should contain ONLY the combined multichannel file.
-    # Place it in specified base dir or alongside originals (not inside Enhanced_*), so cleanup won't remove it.
     if out_base_dir:
         base_dir = Path(out_base_dir)
     else:
@@ -2136,6 +2142,20 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
             shutil.rmtree(final_dir, ignore_errors=True)
         except Exception:
             pass
+        return None
+
+    # Simple progress helper: alignment, assemble, container/metadata, cleanup
+    total_units = 4
+    completed_units = 0
+
+    def step(i_inc: int = 1, msg: str = '') -> None:
+        nonlocal completed_units
+        completed_units = min(total_units, completed_units + i_inc)
+        if progress_cb:
+            try:
+                progress_cb(completed_units, total_units, msg)
+            except Exception:
+                pass
 
     def _make_recognizer(name: str):
         try:
@@ -2143,278 +2163,83 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
         except Exception:
             return None
         try:
-            rec = rec_cls()
+            return rec_cls()
         except Exception:
             return None
-        try:
-            cfg = getattr(rec, 'config', None)
-            if cfg is not None:
-                setattr(cfg, 'multiprocessing', False)
-                setattr(cfg, 'num_processors', 1)
-        except Exception:
-            pass
-        return rec
 
-    fingerprint_rec = _make_recognizer('FingerprintRecognizer')
-    fine_rec = _make_recognizer('CorrelationSpectrogramRecognizer') or _make_recognizer('CorrelationRecognizer')
+    primary_rec = _make_recognizer('FingerprintRecognizer')
+    fallback_rec = _make_recognizer('CorrelationSpectrogramRecognizer') or _make_recognizer('CorrelationRecognizer')
 
-    # Build low-sample-rate proxies for faster alignment
-    proxy_sr = 16000
-    proxy_dir = tmp_dir / "proxies"
-    proxy_dir.mkdir(parents=True, exist_ok=True)
-
-    from torchaudio.functional import resample as ta_resample
-
-    manual_offsets: list[float] | None = None
-
-    def _calc_manual_offsets(paths: list[str]) -> list[float] | None:
-        try:
-            offsets: list[float] = [0.0]
-            ref_wav, ref_sr = torchaudio.load(str(paths[0]))
-            if ref_wav.dim() == 2 and ref_wav.size(0) > 1:
-                ref = ref_wav.mean(0)
-            else:
-                ref = ref_wav.squeeze(0)
-            if ref_sr != proxy_sr:
-                ref = ta_resample(ref, orig_freq=ref_sr, new_freq=proxy_sr)
-            ref_np = ref.numpy()
-        except Exception as exc:
-            _emit(f"Manual alignment fallback unavailable: {exc}", force_console=True)
-            return None
-        for path in paths[1:]:
-            try:
-                cur_wav, cur_sr = torchaudio.load(str(path))
-                if cur_wav.dim() == 2 and cur_wav.size(0) > 1:
-                    cur = cur_wav.mean(0)
-                else:
-                    cur = cur_wav.squeeze(0)
-                if cur_sr != proxy_sr:
-                    cur = ta_resample(cur, orig_freq=cur_sr, new_freq=proxy_sr)
-                cur_np = cur.numpy()
-                length = min(len(ref_np), len(cur_np))
-                if length < proxy_sr // 2:
-                    offsets.append(0.0)
-                    continue
-                lag = _gcc_phat_lag(ref_np[:length], cur_np[:length])
-                offsets.append(-float(lag) / float(proxy_sr))
-            except Exception:
-                offsets.append(0.0)
-        return offsets
-
-    def _apply_time_shift_tensor(mono: torch.Tensor, sr: int, offset_sec: float) -> torch.Tensor:
-        if not mono.numel() or abs(offset_sec) < 1e-6:
-            return mono
-        import torch.nn.functional as _F
-
-        shift = int(round(offset_sec * sr))
-        length = mono.shape[-1]
-        if shift > 0:
-            if shift >= length:
-                return mono.new_zeros(length)
-            mono = mono[shift:]
-            mono = _F.pad(mono, (0, shift))
-        elif shift < 0:
-            shift = abs(shift)
-            mono = _F.pad(mono, (shift, 0))
-        return mono[:length]
-
-    proxies: list[Path] = []
-    total_units = 0
-    # Proxies count as len(files)
-    total_units += len(file_paths)
-    completed_units = 0
-    def step(i_inc=1, msg=''):
-        nonlocal completed_units
-        completed_units += i_inc
-        if progress_cb:
-            progress_cb(completed_units, total_units, msg)
-
-    for idx, p in enumerate(file_paths, start=1):
-        wav, sr = torchaudio.load(str(p))
-        # downmix to mono for alignment
-        if wav.dim() == 2 and wav.size(0) > 1:
-            wav = wav.mean(0)
-        else:
-            wav = wav.squeeze(0)
-        if sr != proxy_sr:
-            wav = ta_resample(wav, orig_freq=sr, new_freq=proxy_sr)
-        outp = proxy_dir / Path(p).name
-        wav = _apply_peak_ceiling(wav, ceiling_db=-1.0)
-        torchaudio.save(str(outp), wav.unsqueeze(0), proxy_sr)
-        proxies.append(outp)
-        step(1, f'Proxy {idx}/{len(file_paths)}')
-
-    # 1) Coarse alignment (prefer fast correlation) using proxies
-    results = None
-    # Coarse align + fine align + write shifts + assemble + convert + cleanup = +6 units (approx)
-    total_units += 6
-    try:
-        align_files = getattr(ad, 'align_files')
-        with _suppress_stdout_stderr():
-            corr_rec = _make_recognizer('CorrelationRecognizer')
-            if corr_rec is not None:
-                results = align_files(*[str(p) for p in proxies], recognizer=corr_rec)
-            if not results and fingerprint_rec:
-                results = align_files(*[str(p) for p in proxies], recognizer=fingerprint_rec)
-    except Exception:
-        results = None
-    _emit('Coarse alignment complete.' if results else 'Coarse alignment failed, attempting fallback...', force_console=not results)
-    step(1, 'Coarse alignment')
-
-    # Fallback: correlation-only alignment when fingerprinting doesn't match
-    try:
-        if not results:
-            corr_rec = _make_recognizer('CorrelationRecognizer')
-            if corr_rec is not None:
-                results = align_files(*file_paths, recognizer=corr_rec)
-    except Exception:
-        pass
-
-    # 2) Fine align if available
-    try:
-        if results is not None and fine_rec is not None and hasattr(ad, 'fine_align'):
-            if skip_fine_align and not force_fine_align:
-                _emit('Skipping fine alignment (user option).')
-                step(1, 'Fine alignment (skipped)')
-            else:
-                # Only fine-align for long content (> 5 min) or many files
-                proxy_info = torchaudio.info(str(proxies[0]))
-                dur_sec = float(getattr(proxy_info, 'num_frames', 0)) / float(getattr(proxy_info, 'sample_rate', proxy_sr) or proxy_sr)
-                need_fine = force_fine_align or len(file_paths) > 2 or dur_sec > 300
-                if need_fine:
-                    _emit('Running fine alignment...')
-                    with _suppress_stdout_stderr():
-                        results = ad.fine_align(results, recognizer=fine_rec)
-                    _emit('Fine alignment complete.')
-                    step(1, 'Fine alignment')
-                else:
-                    step(1, 'Fine alignment (skipped: short content)')
-    except Exception:
-        pass
-
-    # 2.5) Estimate and correct drift on originals using windowed correlation (proxies)
-    try:
-        if len(file_paths) >= 2:
-            ref_proxy = proxies[0]
-            drift_dir = tmp_dir / "driftcorr"
-            drift_dir.mkdir(parents=True, exist_ok=True)
-            corrected_files: list[str] = [file_paths[0]]
-            for i in range(1, len(file_paths)):
-                ratio = _estimate_drift_ratio(str(ref_proxy), str(proxies[i]), proxy_sr)
-                # Correct if outside tiny tolerance (> 50 ppm)
-                tol = 0.0 if force_drift_correction else 5e-5
-                if abs(1.0 - ratio) > tol:
-                    src = Path(file_paths[i])
-                    dst = drift_dir / src.name
-                    _resample_with_ratio(str(src), str(dst), ratio)
-                    corrected_files.append(str(dst))
-                    _emit(f'Drift corrected channel {i+1} (ratio {ratio:.8f}).')
-                else:
-                    corrected_files.append(file_paths[i])
-            # Use corrected list for writing shifts/export
-            file_paths = corrected_files
-    except Exception:
-        pass
-
-    # 3) Write aligned, padded mono files to out_dir
-    wrote_aligned = False
-    # Preferred: write shifts from results
-    try:
-        if results is not None and hasattr(ad, 'write_shifts_from_results'):
-            _emit('Writing aligned files (temp)...')
-            with _suppress_stdout_stderr():
-                ad.write_shifts_from_results(results, str(tmp_dir), file_paths)
-            wrote_aligned = True
-            step(1, 'Write aligned files')
-    except Exception:
-        wrote_aligned = False
-    # Fallback: directly call align_files with destination_path
-    if not wrote_aligned:
+    def _run_align(rec) -> object | None:
         try:
             align_files = getattr(ad, 'align_files')
-            with _suppress_stdout_stderr():
-                if fingerprint_rec:
-                    align_files(*file_paths, destination_path=str(tmp_dir), recognizer=fingerprint_rec)
-                else:
-                    align_files(*file_paths, destination_path=str(tmp_dir))
-            wrote_aligned = True
-            step(1, 'Write aligned files (fallback)')
         except Exception:
-            wrote_aligned = False
-
-        if not wrote_aligned:
-            manual_offsets = _calc_manual_offsets(file_paths)
-            if not manual_offsets:
-                return _abort('Audalign produced no matches and fallback offsets were unavailable.')
-            _emit('Audalign provided no matches; using internal correlation-based alignment.', force_console=True)
-            try:
-                pretty = ", ".join(f"{off:.4f}s" for off in manual_offsets)
-            except Exception:
-                pretty = ""
-            if pretty:
-                _emit(f'Estimated offsets: {pretty}', force_console=True)
-            step(1, 'Manual alignment fallback')
-
-    # 4) Load aligned files from tmp_dir and build multichannel tensor
-    _emit('Assembling multichannel file...')
-    step(1, 'Assemble multichannel')
-    produced = sorted(tmp_dir.rglob("*.wav"))
-    if manual_offsets is None:
-        basenames = [Path(p).name for p in file_paths]
-        aligned_paths: list[Path] = []
-
-        def _consume_match(match_fn):
-            for idx, cand in enumerate(produced):
-                if match_fn(cand):
-                    return produced.pop(idx)
             return None
+        kwargs = {}
+        if rec is not None:
+            kwargs['recognizer'] = rec
+        with _suppress_stdout_stderr():
+            return align_files(*file_paths, destination_path=str(tmp_dir), **kwargs)
 
-        for base in basenames:
-            stem = Path(base).stem.lower()
-            picked = _consume_match(lambda p, b=base: p.name.lower() == b.lower())
-            if picked is None:
-                picked = _consume_match(lambda p, s=stem: Path(p).stem.lower() == s)
-            if picked is None:
-                picked = _consume_match(lambda p, s=stem: s in Path(p).stem.lower())
-            if picked is None and produced:
-                picked = produced.pop(0)
-            if picked is not None:
-                aligned_paths.append(picked)
+    _emit('Running Audalign alignment...')
+    results = None
+    for rec in (primary_rec, fallback_rec, None):
+        try:
+            results = _run_align(rec)
+        except Exception:
+            results = None
+        if results:
+            break
 
-        if not aligned_paths:
-            return _abort('Audalign did not produce any aligned files.')
-    else:
-        aligned_paths = []
-        for src in file_paths:
-            p = Path(src)
-            if p.exists():
-                aligned_paths.append(p)
-            else:
-                _emit(f"Manual alignment fallback missing file: {src}", force_console=True)
-        if not aligned_paths:
-            return _abort('Manual alignment fallback could not locate any source files.')
+    step(1, 'Audalign alignment')
+
+    if not results:
+        return _abort('Audalign could not align the provided files.')
+
+    # 2) Load aligned files from tmp_dir and build multichannel tensor
+    _emit('Assembling multichannel file...')
+    produced = sorted(tmp_dir.rglob("*.wav"))
+    basenames = [Path(p).name for p in file_paths]
+    aligned_paths: list[Path] = []
+
+    def _consume_match(match_fn):
+        for idx, cand in enumerate(produced):
+            if match_fn(cand):
+                return produced.pop(idx)
+        return None
+
+    for base in basenames:
+        stem = Path(base).stem.lower()
+        picked = _consume_match(lambda p, b=base: p.name.lower() == b.lower())
+        if picked is None:
+            picked = _consume_match(lambda p, s=stem: Path(p).stem.lower() == s)
+        if picked is None:
+            picked = _consume_match(lambda p, s=stem: s in Path(p).stem.lower())
+        if picked is None and produced:
+            picked = produced.pop(0)
+        if picked is not None:
+            aligned_paths.append(picked)
+
+    if not aligned_paths:
+        step(1, 'Assemble multichannel')
+        return _abort('Audalign did not produce any aligned files.')
 
     # Load, resample to target SR first, then compute max length to avoid truncation
-    resampled = []
-    srs = []
-    for idx, p in enumerate(aligned_paths):
+    resampled: list[tuple[torch.Tensor, int]] = []
+    srs: list[int] = []
+    for p in aligned_paths:
         wav, sr = torchaudio.load(str(p))
         if wav.dim() == 2 and wav.size(0) > 1:
             wav = wav.mean(0, keepdim=True)  # downmix to mono
         elif wav.dim() == 1:
             wav = wav.unsqueeze(0)
-        if manual_offsets is not None:
-            shift = manual_offsets[min(idx, len(manual_offsets) - 1)]
-            wav = _apply_time_shift_tensor(wav.squeeze(0), int(sr), shift).unsqueeze(0)
         srs.append(int(sr))
         resampled.append((wav, int(sr)))
 
-    # Choose target SR
     target_sr = 48000 if prefer_48k else (srs[0] if srs else 48000)
     from torchaudio.functional import resample as ta_resample
 
-    # Resample and determine max length in target domain
-    monos = []
+    monos: list[torch.Tensor] = []
     max_len = 0
     for wav, sr in resampled:
         mono = wav[0]
@@ -2424,8 +2249,7 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
         if mono.size(-1) > max_len:
             max_len = int(mono.size(-1))
 
-    # Pad all to max_len (no truncation)
-    chan_tensors = []
+    chan_tensors: list[torch.Tensor] = []
     for mono in monos:
         cur_len = mono.size(-1)
         if cur_len < max_len:
@@ -2433,7 +2257,7 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
         chan_tensors.append(mono.unsqueeze(0))
 
     if not chan_tensors:
-        return None
+        return _abort('No aligned audio could be assembled.')
 
     multich = torch.cat(chan_tensors, dim=0)
     n_ch = int(multich.size(0))
@@ -2441,12 +2265,12 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
     multich = _apply_peak_ceiling(multich, ceiling_db=-1.0)
     torchaudio.save(str(out_wav), multich, target_sr)
 
-    # Optional: clear channel mask and encode as PCM 24-bit for Premiere dual-mono import behavior
-    # Removed redundant python subprocess check to prevent potential stalls
+    step(1, 'Assemble multichannel')
+
+    # Optional container / metadata tweaks (reuse existing helpers)
     try:
         ff = shutil.which('ffmpeg') or shutil.which('ffmpeg.exe')
         if ff and not wav_only:
-            # Build a MOV with N mono audio streams (dual-/multi-mono), best for Premiere
             out_mov = final_dir / f"Synced_Multichannel_{stamp}.mov"
             if n_ch == 2:
                 filt = "[0:a]channelsplit=channel_layout=stereo[L][R]"
@@ -2456,10 +2280,9 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
                     '-filter_complex', filt,
                     '-map', '[L]', '-c:a:0', 'pcm_s24le', '-ac:a:0', '1',
                     '-map', '[R]', '-c:a:1', 'pcm_s24le', '-ac:a:1', '1',
-                    str(out_mov)
+                    str(out_mov),
                 ]
             else:
-                # General case: split each input channel to its own mono stream
                 parts = [f"[0:a]pan=mono|c0=c{idx}[ch{idx}]" for idx in range(n_ch)]
                 filt = ";".join(parts)
                 cmd = [ff, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(out_wav), '-filter_complex', filt]
@@ -2470,7 +2293,6 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
             try:
                 subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
             except subprocess.TimeoutExpired:
-                # Fallback: keep WAV
                 out_mov = None
             if out_mov and out_mov.exists() and out_mov.stat().st_size > 44:
                 try:
@@ -2482,7 +2304,6 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
         else:
             if wav_only:
                 _emit('WAV-only export selected; finalizing WAV metadata...')
-            # Prefer BW64 with ADM if requested
             bw_ok = False
             if use_bw64:
                 _emit('Attempting BW64 (ADM) export...')
@@ -2494,17 +2315,15 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
                     bw_ok = False
                     _emit(f'BW64 export failed, falling back to BWF iXML: {_e}', force_console=True)
             if not bw_ok:
-                # Ensure dual-mono behavior by clearing channel mask and embedding iXML names
                 try:
                     _finalize_wav_dual_mono(str(out_wav), [Path(p).stem for p in aligned_paths], target_sr)
                 except Exception:
                     pass
             step(1, 'Finalize WAV metadata')
     except Exception:
-        # Keep WAV if ffmpeg conversion fails
+        # Keep WAV if conversion/finalization fails
         pass
 
-    # Cleanup tmp_dir completely so only the combined file remains
     try:
         import shutil as _sh
         _sh.rmtree(tmp_dir, ignore_errors=True)
@@ -2513,6 +2332,22 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
     step(1, 'Cleanup')
 
     return str(out_wav)
+
+
+def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True, log=None, progress_cb=None, wav_only: bool = False, skip_fine_align: bool = False, force_fine_align: bool = False, force_drift_correction: bool = False, use_bw64: bool = True, out_base_dir: str | None = None) -> str | None:
+    """Legacy alignment function retained for backwards compatibility.
+
+    Currently unused by the GUI; kept so older scripts can still import it.
+    """
+    return _sync_and_export_multichannel_simple(
+        file_paths=file_paths,
+        prefer_48k=prefer_48k,
+        log=log,
+        progress_cb=progress_cb,
+        wav_only=wav_only,
+        use_bw64=use_bw64,
+        out_base_dir=out_base_dir,
+    )
 
 
 def _estimate_drift_ratio(ref_path: str, other_path: str, sr: int, win_s: float = 20.0) -> float:
