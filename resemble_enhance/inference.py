@@ -168,6 +168,31 @@ def merge_chunks(
     return signal
 
 
+def _apply_aggressive_ambience_gate(wav: torch.Tensor, sr: int, window_s: float = 0.08, floor_rel: float = 0.12, depth_db: float = 12.0) -> torch.Tensor:
+    """Suppress residual ambience by attenuating sections far below the local peak envelope."""
+    try:
+        if wav.dim() != 1 or wav.numel() < max(32, int(sr * 0.02)):
+            return wav
+        win = max(16, int(sr * max(window_s, 0.02)))
+        pad = win // 2
+        kernel = torch.ones(1, 1, win, dtype=wav.dtype, device=wav.device) / float(win)
+        env = torch.nn.functional.conv1d(wav.abs().unsqueeze(0).unsqueeze(0), kernel, padding=pad).squeeze()
+        peak = env.max().clamp(min=1e-6)
+        rel = env / peak
+        thr = max(1e-3, float(floor_rel))
+        ratio = torch.clamp((thr - rel) / thr, min=0.0, max=1.0)
+        if ratio.max().item() <= 1e-4:
+            return wav
+        ratio = torch.nn.functional.conv1d(ratio.unsqueeze(0).unsqueeze(0), kernel, padding=pad).squeeze()
+        depth = max(0.0, float(depth_db))
+        if depth <= 0:
+            return wav
+        gain = torch.exp((-math.log(10.0) / 20.0) * ratio * depth)
+        return wav * gain
+    except Exception:
+        return wav
+
+
 def remove_weight_norm_recursively(module):
     for _, module in module.named_modules():
         try:
@@ -357,6 +382,12 @@ def inference(
             auto_wins = _auto_detect_transients(hwav, sr)
             if auto_wins:
                 hwav = _bypass_windows(hwav, dwav, sr, auto_wins)
+    except Exception:
+        pass
+
+    try:
+        if os.environ.get("RESEMBLE_DENOISE_AGGRESSIVE", "0") == "1":
+            hwav = _apply_aggressive_ambience_gate(hwav, sr)
     except Exception:
         pass
 

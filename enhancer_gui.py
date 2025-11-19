@@ -1,4 +1,5 @@
 ﻿import os
+import json
 import shutil
 import subprocess
 import sys
@@ -870,179 +871,31 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         btn_clear.pack(side='left', padx=6)
         self._bind_hover(btn_clear)
 
-        # Advanced Options [+]
+        # Diagnostics configuration (advanced controls hidden, but vars remain for logic)
         self.var_profile = tk.BooleanVar(value=True)
         self.var_sync_export = tk.BooleanVar(value=True)
         self.var_postproc = tk.BooleanVar(value=True)
-        self.var_fast_wav = tk.BooleanVar(value=False)
-        self.var_skip_fine = tk.BooleanVar(value=True)
+        self.var_skip_fine = tk.BooleanVar(value=False)
         self.var_bw64 = tk.BooleanVar(value=True)
         self.var_seam_safe = tk.BooleanVar(value=True)
-        # Optional post seam smoothing (disabled by default; web preview does not apply this)
-        self.var_seam_smooth = tk.BooleanVar(value=False)
         self.var_batch_folders = tk.BooleanVar(value=True)
-        self.var_pre_transcode = tk.BooleanVar(value=False)
-        # Chunking controls
-        self.var_chunk_sec = tk.DoubleVar(value=60.0)
-        self.var_overlap_sec = tk.DoubleVar(value=4.0)
-        # Wet/dry mix for denoise strength (0..1)
+        self.var_aggressive_denoise = tk.BooleanVar(value=True)
+        self.var_chunk_sec = tk.DoubleVar(value=7.0)
+        self.var_overlap_sec = tk.DoubleVar(value=0.5)
         self.var_wet = tk.DoubleVar(value=1.0)
-        # Transient controls
-        self.var_auto_bypass = tk.BooleanVar(value=(os.environ.get('RESEMBLE_AUTO_BYPASS','0') == '1'))
-        self.var_bypass = tk.StringVar(value=os.environ.get('RESEMBLE_BYPASS',''))
-        self.var_bp_start = tk.IntVar(value=0)
-        self.var_bp_end = tk.IntVar(value=0)
-        self.var_force_single = tk.BooleanVar(value=(os.environ.get('RESEMBLE_FORCE_SINGLE_CHUNK','0') == '1'))
-        # Protect the first strong transient by blending a short window back to original
-        self.var_lead_guard = tk.BooleanVar(value=True)
-        # Processing mode: Denoise only vs Enhance
+        self.var_lead_guard = tk.BooleanVar(value=False)
         self.var_denoise_only = tk.BooleanVar(value=True)
-        # Diagnostics: disable all post FX except enhance and alignment
         self.var_diag_minimal = tk.BooleanVar(value=True)
-        # Device selection for diagnostics/stability (default to CUDA)
         self.var_device = tk.StringVar(value='cuda')
+        self.var_disable_blend = tk.BooleanVar(value=False)
 
-        adv_hdr = ttk.Frame(left)
-        adv_hdr.pack(fill='x', pady=(4, 2))
+        # Diagnostics mode notice (advanced controls disabled)
+        diag_box = ttk.Frame(left)
+        diag_box.pack(fill='x', pady=(4, 6))
+        ttk.Label(diag_box, text='Diagnostics alignment mode is locked. Advanced options are temporarily removed.', wraplength=260, justify='left').pack(fill='x')
         self._adv_open = False
-        self._adv_btn = ttk.Button(adv_hdr, text='Advanced Options [+]', command=self._toggle_advanced)
-        self._adv_btn.pack(anchor='w')
-
-        # Scrollable Advanced Options container
-        self._adv_wrap = ttk.Frame(left)
-        self._adv_canvas = tk.Canvas(self._adv_wrap, highlightthickness=0, bg=self._bg, height=220)
-        self._adv_scroll = ttk.Scrollbar(self._adv_wrap, orient='vertical', command=self._adv_canvas.yview)
-        self._adv_canvas.configure(yscrollcommand=self._adv_scroll.set)
-        self._adv_canvas.pack(side='left', fill='both', expand=True)
-        self._adv_scroll.pack(side='right', fill='y')
-        # Inner frame that actually holds the options
-        self._adv_opts = ttk.Frame(self._adv_canvas, style='TFrame')
-        self._adv_win = self._adv_canvas.create_window((0, 0), window=self._adv_opts, anchor='nw')
-
-        def _adv_on_config(event=None):
-            try:
-                self._adv_canvas.configure(scrollregion=self._adv_canvas.bbox('all'))
-                # Keep inner frame width in sync with the canvas width
-                cw = self._adv_canvas.winfo_width()
-                self._adv_canvas.itemconfigure(self._adv_win, width=max(0, cw))
-            except Exception:
-                pass
-        self._adv_opts.bind('<Configure>', _adv_on_config)
-        self._adv_canvas.bind('<Configure>', _adv_on_config)
-
-        # Mouse wheel scroll
-        def _bind_wheel(widget, on=True):
-            try:
-                if on:
-                    widget.bind_all('<MouseWheel>', lambda e: self._adv_canvas.yview_scroll(-1 * int(e.delta/120), 'units'))
-                else:
-                    widget.unbind_all('<MouseWheel>')
-            except Exception:
-                pass
-        self._adv_canvas.bind('<Enter>', lambda e: _bind_wheel(self._adv_canvas, True))
-        self._adv_canvas.bind('<Leave>', lambda e: _bind_wheel(self._adv_canvas, False))
-        # build options into the advanced frame (initially hidden)
-        ttk.Checkbutton(self._adv_opts, text='Camera Sync (48 kHz)', style='Opt.TCheckbutton', variable=self.var_profile).pack(anchor='w', fill='x', pady=1)
-        ttk.Checkbutton(self._adv_opts, text='Sync + Multichannel', style='Opt.TCheckbutton', variable=self.var_sync_export).pack(anchor='w', fill='x', pady=1)
-        ttk.Checkbutton(self._adv_opts, text='Level + Brighten', style='Opt.TCheckbutton', variable=self.var_postproc).pack(anchor='w', fill='x', pady=1)
-        ttk.Checkbutton(self._adv_opts, text='Fast export (WAV only)', style='Opt.TCheckbutton', variable=self.var_fast_wav).pack(anchor='w', fill='x', pady=1)
-        ttk.Checkbutton(self._adv_opts, text='Skip fine align', style='Opt.TCheckbutton', variable=self.var_skip_fine).pack(anchor='w', fill='x', pady=1)
-        ttk.Checkbutton(self._adv_opts, text='Export BW64 (ADM dual-mono)', style='Opt.TCheckbutton', variable=self.var_bw64).pack(anchor='w', fill='x', pady=1)
-        ttk.Checkbutton(self._adv_opts, text='Seam-safe joins (longer overlap + micro-align)', style='Opt.TCheckbutton', variable=self.var_seam_safe).pack(anchor='w', fill='x', pady=1)
-        ttk.Checkbutton(self._adv_opts, text='Post seam smoothing pass', style='Opt.TCheckbutton', variable=self.var_seam_smooth).pack(anchor='w', fill='x', pady=1)
-        ttk.Checkbutton(self._adv_opts, text='Batch by folder (group files per folder)', style='Opt.TCheckbutton', variable=self.var_batch_folders).pack(anchor='w', fill='x', pady=1)
-        ttk.Checkbutton(self._adv_opts, text='Pre-transcode inputs to PCM WAV (ffmpeg)', style='Opt.TCheckbutton', variable=self.var_pre_transcode).pack(anchor='w', fill='x', pady=1)
-        # Chunk size + overlap controls
-        chunk_row = ttk.Frame(self._adv_opts)
-        chunk_row.pack(fill='x', pady=(6, 2))
-        ttk.Label(chunk_row, text='Chunk size (s):').pack(side='left')
-        self.sb_chunk = ttk.Spinbox(chunk_row, from_=7.0, to=7200.0, increment=1.0, width=8, textvariable=self.var_chunk_sec)
-        self.sb_chunk.pack(side='left', padx=(6, 12))
-        ttk.Label(chunk_row, text='Overlap (s):').pack(side='left')
-        self.sb_overlap = ttk.Spinbox(chunk_row, from_=0.0, to=60.0, increment=0.5, width=8, textvariable=self.var_overlap_sec)
-        self.sb_overlap.pack(side='left', padx=(6, 0))
-        # Denoise mix control
-        wet_row = ttk.Frame(self._adv_opts)
-        wet_row.pack(fill='x', pady=(6, 2))
-        ttk.Label(wet_row, text='Denoise mix (%):').pack(side='left')
-        self.sb_wet = ttk.Spinbox(wet_row, from_=0, to=100, increment=5, width=6)
-        self.sb_wet.pack(side='left', padx=(6, 0))
-        try:
-            self.sb_wet.configure(textvariable=tk.StringVar(value=str(int(self.var_wet.get()*100))))
-        except Exception:
-            pass
-        # Keep var_wet in sync with spinbox
-        def _wet_from_spin(*_):
-            try:
-                v = float(self.sb_wet.get())
-                self.var_wet.set(max(0.0, min(1.0, v/100.0)))
-            except Exception:
-                pass
-        def _spin_from_wet(*_):
-            try:
-                self.sb_wet.delete(0, 'end')
-                self.sb_wet.insert(0, str(int(self.var_wet.get()*100)))
-            except Exception:
-                pass
-        try:
-            self.sb_wet.bind('<FocusOut>', lambda e: _wet_from_spin())
-            self.sb_wet.bind('<Return>', lambda e: _wet_from_spin())
-        except Exception:
-            pass
-        # Transient mitigation controls
-        trans_row = ttk.Frame(self._adv_opts)
-        trans_row.pack(fill='x', pady=(6, 2))
-        ttk.Checkbutton(trans_row, text='Auto transient bypass', style='Opt.TCheckbutton', variable=self.var_auto_bypass).pack(side='left')
-        ttk.Checkbutton(trans_row, text='Protect first loud transient', style='Opt.TCheckbutton', variable=self.var_lead_guard).pack(side='left', padx=(12,0))
-        ttk.Checkbutton(trans_row, text='Force single chunk', style='Opt.TCheckbutton', variable=self.var_force_single).pack(side='left', padx=(12,0))
-        # Processing mode row
-        mode_row = ttk.Frame(self._adv_opts)
-        mode_row.pack(fill='x', pady=(6, 2))
-        ttk.Label(mode_row, text='Processing mode:').pack(side='left')
-        ttk.Radiobutton(mode_row, text='Denoise only', value=True, variable=self.var_denoise_only).pack(side='left', padx=(6, 0))
-        ttk.Radiobutton(mode_row, text='Enhance', value=False, variable=self.var_denoise_only).pack(side='left', padx=(12, 0))
-        # Diagnostics
-        ttk.Checkbutton(self._adv_opts, text='Diagnostics: enhance-only (disable post FX, keep alignment)', style='Opt.TCheckbutton', variable=self.var_diag_minimal).pack(anchor='w', fill='x', pady=1)
-        # Sync option (place directly below diagnostics for quick access)
-        ttk.Checkbutton(self._adv_opts, text='Sync inputs into multichannel file', style='Opt.TCheckbutton', variable=self.var_sync_export).pack(anchor='w', fill='x', pady=1)
-        # Device select (primarily for diagnostics)
-        dev_row = ttk.Frame(self._adv_opts)
-        dev_row.pack(fill='x', pady=(4, 2))
-        ttk.Label(dev_row, text='Device:').pack(side='left')
-        ttk.Combobox(dev_row, values=['cuda', 'cpu'], textvariable=self.var_device, state='readonly', width=8).pack(side='left', padx=(6,0))
-        bp_row = ttk.Frame(self._adv_opts)
-        bp_row.pack(fill='x', pady=(4, 4))
-        ttk.Label(bp_row, text='Bypass windows (start:dur, comma-separated):').pack(side='left')
-        self.bypass_entry = ttk.Entry(bp_row, textvariable=self.var_bypass, width=36)
-        self.bypass_entry.pack(side='left', padx=(6, 0))
-
-        # Simple range helper: Start/End seconds, converted to start:dur on run
-        range_row = ttk.Frame(self._adv_opts)
-        range_row.pack(fill='x', pady=(0, 6))
-        ttk.Label(range_row, text='Bypass range (s):').pack(side='left')
-        ttk.Label(range_row, text='Start').pack(side='left', padx=(6,2))
-        ttk.Spinbox(range_row, from_=0, to=86400, increment=1, width=6, textvariable=self.var_bp_start).pack(side='left')
-        ttk.Label(range_row, text='End').pack(side='left', padx=(6,2))
-        ttk.Spinbox(range_row, from_=0, to=86400, increment=1, width=6, textvariable=self.var_bp_end).pack(side='left')
-        # Keep defaults in sync when toggling seam-safe
-        def _on_seam_toggle(*_):
-            try:
-                if self.var_seam_safe.get():
-                    if self.var_chunk_sec.get() in (31.0, 0.0):
-                        self.var_chunk_sec.set(60.0)
-                    if self.var_overlap_sec.get() in (1.0, 0.0):
-                        self.var_overlap_sec.set(4.0)
-                else:
-                    if self.var_chunk_sec.get() in (60.0, 0.0):
-                        self.var_chunk_sec.set(31.0)
-                    if self.var_overlap_sec.get() in (4.0, 0.0):
-                        self.var_overlap_sec.set(1.0)
-            except Exception:
-                pass
-        try:
-            self.var_seam_safe.trace_add('write', lambda *_: _on_seam_toggle())
-        except Exception:
-            pass
+        self._adv_wrap = None
+        self._adv_btn = None
 
         # Queue controls: filter + actions
         ctl = ttk.Frame(left)
@@ -1405,40 +1258,18 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             ov = max(0.0, float(self.var_overlap_sec.get()))
             os.environ['RESEMBLE_CHUNK_SECONDS'] = str(cs)
             os.environ['RESEMBLE_OVERLAP_SECONDS'] = str(ov)
-            os.environ['RESEMBLE_AUTO_BYPASS'] = '1' if self.var_auto_bypass.get() else '0'
             os.environ['RESEMBLE_DISABLE_TRANSIENT_BLEND'] = '1' if (getattr(self, 'var_disable_blend', None) and self.var_disable_blend.get()) else '0'
             try:
                 os.environ['RESEMBLE_WET'] = str(max(0.0, min(1.0, float(self.var_wet.get()))))
             except Exception:
                 pass
+            aggr = self.var_aggressive_denoise.get() or self.var_diag_minimal.get()
+            os.environ['RESEMBLE_DENOISE_AGGRESSIVE'] = '1' if aggr else '0'
         except Exception:
             pass
 
-        # Optional pre-transcode
-        use_src = src_path
-        if self.var_pre_transcode.get():
-            try:
-                ff = shutil.which('ffmpeg') or shutil.which('ffmpeg.exe')
-                pre_dir = INPUT_TMP_ROOT / ('preview_' + uuid.uuid4().hex[:6])
-                pre_dir.mkdir(parents=True, exist_ok=True)
-                dst = pre_dir / (Path(src_path).stem + '.wav')
-                if ff:
-                    cmd = [ff, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-ss', str(start_s), '-t', str(dur_s), '-i', str(src_path), '-c:a', 'pcm_s16le', str(dst)]
-                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                    use_src = str(dst)
-                else:
-                    wav, sr = torchaudio.load(str(src_path))
-                    a = int(max(0, start_s * sr)); b = int(min(wav.shape[-1], a + int(dur_s * sr)))
-                    if wav.dim() == 2 and wav.size(0) > 1:
-                        wav = wav.mean(0)
-                    seg = wav[a:b]
-                    torchaudio.save(str(dst), seg.unsqueeze(0), sr)
-                    use_src = str(dst)
-            except Exception:
-                use_src = src_path
-
-        # Load source (or pre-transcoded) and slice segment if needed
-        wav, sr = torchaudio.load(str(use_src))
+        # Load source and slice segment
+        wav, sr = torchaudio.load(str(src_path))
         if wav.dim() == 2 and wav.size(0) > 1:
             wav = wav.mean(0)
         else:
@@ -1456,8 +1287,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         seg_end = min(total_len, seg_start + seg_len)
         if seg_end <= seg_start:
             seg_end = min(total_len, seg_start + 1)
-        if not self.var_pre_transcode.get():
-            wav = wav[seg_start:seg_end]
+        wav = wav[seg_start:seg_end]
         # Final guard: ensure non-empty segment
         if wav.numel() <= 0:
             import torch as _t
@@ -1745,19 +1575,23 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self._enable_run()
 
     def _toggle_advanced(self):
+        if not getattr(self, '_adv_wrap', None):
+            return
         try:
             if self._adv_open:
                 self._adv_wrap.pack_forget()
                 self._adv_open = False
                 try:
-                    self._adv_btn.configure(text='Advanced Options [+]')
+                    if self._adv_btn:
+                        self._adv_btn.configure(text='Advanced Options [+]')
                 except Exception:
                     pass
             else:
                 self._adv_wrap.pack(fill='x', pady=(2, 8))
                 self._adv_open = True
                 try:
-                    self._adv_btn.configure(text='Advanced Options [-]')
+                    if self._adv_btn:
+                        self._adv_btn.configure(text='Advanced Options [-]')
                 except Exception:
                     pass
         except Exception:
@@ -1774,6 +1608,74 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             self.status_label["text"] = ''
         except Exception:
             pass
+
+    def _snapshot_run_config(self, chunk_seconds: float, overlap_seconds: float) -> dict:
+        try:
+            files = [str(p) for p in getattr(self, 'files', [])]
+        except Exception:
+            files = []
+        diag = bool(self.var_diag_minimal.get())
+        aggressive_req = bool(self.var_aggressive_denoise.get())
+        aggressive_effective = bool(aggressive_req or diag)
+        skip_req = bool(self.var_skip_fine.get())
+        snapshot = {
+            "diagnostics_mode": diag,
+            "denoise_only_mode": bool(self.var_denoise_only.get()),
+            "device": str(self.var_device.get()),
+            "profile_camera_sync": bool(self.var_profile.get()),
+            "sync_inputs": bool(self.var_sync_export.get()),
+            "seam_safe": bool(self.var_seam_safe.get()),
+            "post_process": bool(self.var_postproc.get()),
+            "bw64_export": bool(self.var_bw64.get()),
+            "batch_by_folder": bool(self.var_batch_folders.get()),
+            "lead_guard": bool(self.var_lead_guard.get()),
+            "skip_fine_requested": skip_req,
+            "skip_fine_effective": bool(skip_req and not diag),
+            "force_fine_align": bool(diag),
+            "force_drift_correction": bool(diag),
+            "aggressive_denoise_requested": aggressive_req,
+            "aggressive_denoise_effective": aggressive_effective,
+            "denoise_mix_wet": float(self.var_wet.get()),
+            "chunk_seconds_effective": float(chunk_seconds),
+            "overlap_seconds_effective": float(overlap_seconds),
+            "files_enqueued": files,
+            "file_count": len(files),
+            "ffmpeg_path": shutil.which('ffmpeg') or shutil.which('ffmpeg.exe') or '',
+            "run_status": "pending",
+        }
+        return snapshot
+
+    def _write_run_flag_log(self, snapshot: dict | None) -> None:
+        try:
+            log_dir = INPUT_TMP_ROOT / "run_logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            env_flags = {k: v for k, v in sorted(os.environ.items()) if k.startswith('RESEMBLE_')}
+            deps: dict[str, str] = {}
+            for name in ('torch', 'torchaudio', 'audalign', 'soundfile'):
+                try:
+                    module = sys.modules.get(name)
+                    if module is None:
+                        module = __import__(name)
+                    deps[name] = getattr(module, '__version__', 'unknown')
+                except Exception as exc:  # noqa: BLE001
+                    deps[name] = f"missing ({exc})"
+            ffmpeg = shutil.which('ffmpeg') or shutil.which('ffmpeg.exe')
+            deps['ffmpeg'] = ffmpeg or 'not found'
+            payload = {
+                "timestamp": datetime.now().isoformat(timespec='seconds'),
+                "settings": snapshot or {},
+                "env_flags": env_flags,
+                "dependencies": deps,
+            }
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = log_dir / f"run_flags_{stamp}.json"
+            log_path.write_text(json.dumps(payload, indent=2))
+            self.after(0, lambda p=log_path: self._log(f"Run diagnostics log saved: {p}"))
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.after(0, lambda exc=exc: self._log(f"Run log error: {exc}"))
+            except Exception:
+                pass
 
     def _set_status(self, text: str):
         try:
@@ -1955,6 +1857,8 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 pass
 
         def worker():
+            run_snapshot = None
+            processed_groups = 0
             try:
                 # Reset status
                 self.after(0, lambda: self._set_status('Ready'))
@@ -1973,42 +1877,19 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         os.environ['RESEMBLE_WET'] = str(max(0.0, min(1.0, float(self.var_wet.get()))))
                     except Exception:
                         pass
-                    os.environ['RESEMBLE_AUTO_BYPASS'] = '1' if self.var_auto_bypass.get() else '0'
                     os.environ['RESEMBLE_LEAD_GUARD'] = '1' if self.var_lead_guard.get() else '0'
+                    aggr = self.var_aggressive_denoise.get() or self.var_diag_minimal.get()
+                    os.environ['RESEMBLE_DENOISE_AGGRESSIVE'] = '1' if aggr else '0'
+                    run_snapshot = self._snapshot_run_config(cs, ov)
+                    run_snapshot["run_status"] = "running"
                     # Prefer fast enhance config when Enhance mode is selected
                     if not self.var_denoise_only.get():
                         os.environ['RESEMBLE_FAST_ENHANCE'] = '1'
                     # Diagnostics: disable all post FX besides enhance + alignment
                     if self.var_diag_minimal.get():
                         os.environ['RESEMBLE_DISABLE_TRANSIENT_BLEND'] = '1'
-                        os.environ['RESEMBLE_AUTO_BYPASS'] = '0'
                         os.environ['RESEMBLE_LEAD_GUARD'] = '0'
                         os.environ['RESEMBLE_WET'] = '1.0'
-                        os.environ.pop('RESEMBLE_BYPASS', None)
-                        try:
-                            self.var_postproc.set(False)
-                            self.var_seam_smooth.set(False)
-                        except Exception:
-                            pass
-                    # Combine manual windows with optional start/end range; only if enabled
-                    parts = []
-                    if getattr(self, 'var_enable_bypass', None) and self.var_enable_bypass.get():
-                        bp = (self.var_bypass.get() or '').strip()
-                        if bp:
-                            parts.append(bp)
-                        try:
-                            s = int(self.var_bp_start.get() or 0)
-                            e = int(self.var_bp_end.get() or 0)
-                            if e > s and s >= 0:
-                                parts.append(f"{s}:{e - s}")
-                        except Exception:
-                            pass
-                    if parts:
-                        os.environ['RESEMBLE_BYPASS'] = ",".join(parts)
-                    else:
-                        os.environ.pop('RESEMBLE_BYPASS', None)
-                    os.environ['RESEMBLE_DISABLE_TRANSIENT_BLEND'] = '1' if (getattr(self, 'var_disable_blend', None) and self.var_disable_blend.get()) else '0'
-                    os.environ['RESEMBLE_FORCE_SINGLE_CHUNK'] = '1' if self.var_force_single.get() else '0'
                 except Exception:
                     pass
                 # Build groups: batch by folder or single group
@@ -2041,44 +1922,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         self._group_total = total
                         self.overall_label["text"] = f"Group {gi}/{total_groups}: {done} of {total} files ({pct}%)"
 
-                    # Optional pre-transcode inputs to clean PCM WAV to avoid container/decoder glitches
                     use_files = list(gfiles)
-                    tx_map = {}
-                    if self.var_pre_transcode.get():
-                        try:
-                            ff = shutil.which('ffmpeg') or shutil.which('ffmpeg.exe')
-                        except Exception:
-                            ff = None
-                        try:
-                            pre_dir = INPUT_TMP_ROOT / ("prewav_" + uuid.uuid4().hex[:6])
-                            pre_dir.mkdir(parents=True, exist_ok=True)
-                        except Exception:
-                            pre_dir = None
-                        new_files = []
-                        for src in gfiles:
-                            dst = None
-                            try:
-                                p = Path(src)
-                                if pre_dir is not None:
-                                    dst = pre_dir / (p.stem + ".wav")
-                                else:
-                                    dst = p.with_suffix('.wav')
-                                if ff:
-                                    cmd = [ff, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(src), '-c:a', 'pcm_s16le', str(dst)]
-                                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                                else:
-                                    import torchaudio as _ta
-                                    wav, sr = _ta.load(str(src))
-                                    _ta.save(str(dst), wav, sr)
-                                if dst.exists() and dst.stat().st_size > 44:
-                                    new_files.append(str(dst))
-                                    tx_map[str(dst)] = str(src)
-                                else:
-                                    new_files.append(src)
-                            except Exception:
-                                new_files.append(src)
-                        if new_files:
-                            use_files = new_files
 
                     # Enhance this group
                     results = run_enhancer_for(
@@ -2092,12 +1936,6 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         denoise_only=self.var_denoise_only.get(),
                         prefer_cli=(self.var_diag_minimal.get() or (not self.var_denoise_only.get())),
                     )
-                    # Map results back to original source paths if pre-transcoded
-                    if tx_map:
-                        try:
-                            results = [(tx_map.get(src, src), out) for (src, out) in results]
-                        except Exception:
-                            pass
                     self.after(0, lambda gi=gi: self._log(f"Group {gi}: enhanced {len(results)} file(s)."))
                     # Mark final statuses for this group
                     try:
@@ -2110,6 +1948,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                 self.after(0, self._set_file_status, f, 'failed')
                     except Exception:
                         pass
+                    processed_groups = gi
                     if self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set():
                         break
                     if not self.var_sync_export.get():
@@ -2135,31 +1974,21 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         if self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set():
                             break
 
-                    # Seam smoothing per group (optional; disabled by default to match Web Preview behavior)
-                    if self.var_seam_safe.get() and self.var_seam_smooth.get() and results:
-                        try:
-                            self.after(0, lambda: self._set_status('Scanning seams'))
-                            outs = [out for _, out in results]
-                            def ss_prog(i, n, msg):
-                                n = max(1, n)
-                                pct = int(i * 100 / n)
-                                self._set_status(f"{msg} - {pct}%")
-                                if self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set():
-                                    raise _Cancelled()
-                            _seam_smooth_files(outs, progress_cb=lambda i, n, m: self.after(0, ss_prog, i, n, m))
-                            self.after(0, lambda: self._log("Seam smoothing complete."))
-                        except Exception as e:
-                            if not isinstance(e, _Cancelled):
-                                self.after(0, lambda e=e: self._log(f"Seam smoothing warning: {e}"))
-                        if self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set():
-                            break
-
                     # Sync + export per group
                     if self.var_sync_export.get() and results:
                         try:
                             self.after(0, lambda: self._set_status('Preparing sync'))
                             self.after(0, lambda: self._log("Syncing with Audalign and exporting multichannel..."))
                             outs = [out for _, out in results]
+                            # Deduplicate outputs in case an upstream retry produced duplicates
+                            seen_paths = set()
+                            unique_outs = []
+                            for out in outs:
+                                if out in seen_paths:
+                                    continue
+                                seen_paths.add(out)
+                                unique_outs.append(out)
+                            outs = unique_outs
                             def stage_prog(i, n, msg):
                                 n = max(1, n)
                                 pct = int(i * 100 / n)
@@ -2167,28 +1996,22 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                 if self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set():
                                     raise _Cancelled()
                             skip_fine_align = self.var_skip_fine.get()
-                            if self.var_diag_minimal.get():
+                            force_fine_align = self.var_diag_minimal.get()
+                            force_drift = force_fine_align
+                            if force_fine_align:
                                 skip_fine_align = False  # Diagnostics require fine alignment to verify sync.
                             out_path = _sync_and_export_multichannel(
                                 outs,
                                 prefer_48k=self.var_profile.get(),
                                 log=lambda m: self.after(0, self._log, m),
                                 progress_cb=lambda i, n, m: self.after(0, stage_prog, i, n, m),
-                                wav_only=self.var_fast_wav.get(),
+                                wav_only=False,
                                 skip_fine_align=skip_fine_align,
+                                force_fine_align=force_fine_align,
+                                force_drift_correction=force_drift,
                                 use_bw64=self.var_bw64.get(),
                                 out_base_dir=gname,
                             )
-                            # Cleanup per-file enhanced dirs for this group
-                            try:
-                                import shutil as _sh
-                                parents = {str(Path(p).parent) for p in outs}
-                                for d in parents:
-                                    if Path(d).name.startswith('Enhanced_'):
-                                        _sh.rmtree(d, ignore_errors=True)
-                                self.after(0, lambda: self._log("Cleaned per-file enhanced folders."))
-                            except Exception as _e:
-                                self.after(0, lambda _e=_e: self._log(f"Cleanup warning: {_e}"))
                             if out_path:
                                 ch = 0
                                 try:
@@ -2206,6 +2029,13 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         except Exception as e:
                             if not isinstance(e, _Cancelled):
                                 self.after(0, lambda e=e: self._log(f"Sync/export error: {e}"))
+                if run_snapshot is not None:
+                    run_snapshot["groups_total"] = total_groups
+                    run_snapshot["groups_completed"] = processed_groups
+                    status = 'completed'
+                    if self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set():
+                        status = 'cancelled'
+                    run_snapshot["run_status"] = status
                 # Clear the queue after successful enhance
                 self.after(0, self._clear_queue)
                 # Auto-prune old staging after a successful run
@@ -2216,8 +2046,11 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 except Exception:
                     pass
             except Exception as e:  # noqa: BLE001
+                if run_snapshot is not None:
+                    run_snapshot["run_status"] = f"error: {e}"
                 self.after(0, lambda e=e: self._log(f"Error: {e}"))
             finally:
+                self._write_run_flag_log(run_snapshot)
                 def _reset():
                     self.run_btn.config(state="normal")
                     self.pause_btn.config(state="disabled")
@@ -2248,7 +2081,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
 
 # --- Alignment and multichannel export helpers (Audalign-based) ---
 
-def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True, log=None, progress_cb=None, wav_only: bool = False, skip_fine_align: bool = False, use_bw64: bool = True, out_base_dir: str | None = None) -> str | None:
+def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True, log=None, progress_cb=None, wav_only: bool = False, skip_fine_align: bool = False, force_fine_align: bool = False, force_drift_correction: bool = False, use_bw64: bool = True, out_base_dir: str | None = None) -> str | None:
     """Align given enhanced files using audalign and export a single multichannel WAV.
 
     Returns the output multichannel wav path or None on failure.
@@ -2258,15 +2091,29 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
     import torchaudio
     import torch
 
+    def _emit(message: str, force_console: bool = False) -> None:
+        """Send sync logs to the provided callback and optionally to stdout."""
+        printed = False
+        if log:
+            try:
+                log(message)
+            except Exception:
+                printed = True
+        if force_console or not log or printed:
+            try:
+                print(f"[sync] {message}")
+            except Exception:
+                pass
+
     if not file_paths:
+        _emit('No files provided for sync; skipping multichannel export.', force_console=True)
         return None
 
     # Import audalign lazily
     ad = importlib.import_module('audalign')
     # Silence tqdm in audalign to prevent blocking on subsequent runs
     os.environ.setdefault('TQDM_DISABLE', '1')
-    if log:
-        log('Building proxies for alignment...')
+    _emit('Building proxies for alignment...')
 
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     first_parent = Path(file_paths[0]).parent
@@ -2281,6 +2128,13 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
         base_dir = first_parent.parent if first_parent.name.startswith('Enhanced_') else first_parent
     final_dir = base_dir / f"Synced_{stamp}"
     final_dir.mkdir(parents=True, exist_ok=True)
+
+    def _abort(reason: str) -> None:
+        _emit(reason, force_console=True)
+        try:
+            shutil.rmtree(final_dir, ignore_errors=True)
+        except Exception:
+            pass
 
     # Choose recognizers
     try:
@@ -2302,6 +2156,59 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
 
     from torchaudio.functional import resample as ta_resample
 
+    manual_offsets: list[float] | None = None
+
+    def _calc_manual_offsets(paths: list[str]) -> list[float] | None:
+        try:
+            offsets: list[float] = [0.0]
+            ref_wav, ref_sr = torchaudio.load(str(paths[0]))
+            if ref_wav.dim() == 2 and ref_wav.size(0) > 1:
+                ref = ref_wav.mean(0)
+            else:
+                ref = ref_wav.squeeze(0)
+            if ref_sr != proxy_sr:
+                ref = ta_resample(ref, orig_freq=ref_sr, new_freq=proxy_sr)
+            ref_np = ref.numpy()
+        except Exception as exc:
+            _emit(f"Manual alignment fallback unavailable: {exc}", force_console=True)
+            return None
+        for path in paths[1:]:
+            try:
+                cur_wav, cur_sr = torchaudio.load(str(path))
+                if cur_wav.dim() == 2 and cur_wav.size(0) > 1:
+                    cur = cur_wav.mean(0)
+                else:
+                    cur = cur_wav.squeeze(0)
+                if cur_sr != proxy_sr:
+                    cur = ta_resample(cur, orig_freq=cur_sr, new_freq=proxy_sr)
+                cur_np = cur.numpy()
+                length = min(len(ref_np), len(cur_np))
+                if length < proxy_sr // 2:
+                    offsets.append(0.0)
+                    continue
+                lag = _gcc_phat_lag(ref_np[:length], cur_np[:length])
+                offsets.append(-float(lag) / float(proxy_sr))
+            except Exception:
+                offsets.append(0.0)
+        return offsets
+
+    def _apply_time_shift_tensor(mono: torch.Tensor, sr: int, offset_sec: float) -> torch.Tensor:
+        if not mono.numel() or abs(offset_sec) < 1e-6:
+            return mono
+        import torch.nn.functional as _F
+
+        shift = int(round(offset_sec * sr))
+        length = mono.shape[-1]
+        if shift > 0:
+            if shift >= length:
+                return mono.new_zeros(length)
+            mono = mono[shift:]
+            mono = _F.pad(mono, (0, shift))
+        elif shift < 0:
+            shift = abs(shift)
+            mono = _F.pad(mono, (shift, 0))
+        return mono[:length]
+
     proxies: list[Path] = []
     total_units = 0
     # Proxies count as len(files)
@@ -2322,7 +2229,7 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
             wav = wav.squeeze(0)
         if sr != proxy_sr:
             wav = ta_resample(wav, orig_freq=sr, new_freq=proxy_sr)
-        outp = proxy_dir / Path(p).name
+        outp = proxy_dir / f"{idx:02d}_{Path(p).name}"
         wav = _apply_peak_ceiling(wav, ceiling_db=-1.0)
         torchaudio.save(str(outp), wav.unsqueeze(0), proxy_sr)
         proxies.append(outp)
@@ -2342,8 +2249,7 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
                 results = align_files(*[str(p) for p in proxies], recognizer=fingerprint_rec)
     except Exception:
         results = None
-    if log:
-        log('Coarse alignment complete.' if results else 'Coarse alignment failed, attempting fallback...')
+    _emit('Coarse alignment complete.' if results else 'Coarse alignment failed, attempting fallback...', force_console=not results)
     step(1, 'Coarse alignment')
 
     # Fallback: correlation-only alignment when fingerprinting doesn't match
@@ -2357,22 +2263,22 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
     # 2) Fine align if available
     try:
         if results is not None and fine_rec is not None and hasattr(ad, 'fine_align'):
-            if skip_fine_align:
-                if log:
-                    log('Skipping fine alignment (user option).')
+            if skip_fine_align and not force_fine_align:
+                _emit('Skipping fine alignment (user option).')
                 step(1, 'Fine alignment (skipped)')
             else:
                 # Only fine-align for long content (> 5 min) or many files
                 proxy_info = torchaudio.info(str(proxies[0]))
                 dur_sec = float(getattr(proxy_info, 'num_frames', 0)) / float(getattr(proxy_info, 'sample_rate', proxy_sr) or proxy_sr)
-                if len(file_paths) > 2 or dur_sec > 300:
-                    if log:
-                        log('Running fine alignment...')
+                need_fine = force_fine_align or len(file_paths) > 2 or dur_sec > 300
+                if need_fine:
+                    _emit('Running fine alignment...')
                     with _suppress_stdout_stderr():
                         results = ad.fine_align(results, recognizer=fine_rec)
-                    if log:
-                        log('Fine alignment complete.')
-                step(1, 'Fine alignment')
+                    _emit('Fine alignment complete.')
+                    step(1, 'Fine alignment')
+                else:
+                    step(1, 'Fine alignment (skipped: short content)')
     except Exception:
         pass
 
@@ -2386,11 +2292,13 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
             for i in range(1, len(file_paths)):
                 ratio = _estimate_drift_ratio(str(ref_proxy), str(proxies[i]), proxy_sr)
                 # Correct if outside tiny tolerance (> 50 ppm)
-                if abs(1.0 - ratio) > 5e-5:
+                tol = 0.0 if force_drift_correction else 5e-5
+                if abs(1.0 - ratio) > tol:
                     src = Path(file_paths[i])
                     dst = drift_dir / src.name
                     _resample_with_ratio(str(src), str(dst), ratio)
                     corrected_files.append(str(dst))
+                    _emit(f'Drift corrected channel {i+1} (ratio {ratio:.8f}).')
                 else:
                     corrected_files.append(file_paths[i])
             # Use corrected list for writing shifts/export
@@ -2403,8 +2311,7 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
     # Preferred: write shifts from results
     try:
         if results is not None and hasattr(ad, 'write_shifts_from_results'):
-            if log:
-                log('Writing aligned files (temp)...')
+            _emit('Writing aligned files (temp)...')
             with _suppress_stdout_stderr():
                 ad.write_shifts_from_results(results, str(tmp_dir), file_paths)
             wrote_aligned = True
@@ -2425,43 +2332,70 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
         except Exception:
             wrote_aligned = False
 
-    if not wrote_aligned:
-        return None
+        if not wrote_aligned:
+            manual_offsets = _calc_manual_offsets(file_paths)
+            if not manual_offsets:
+                return _abort('Audalign produced no matches and fallback offsets were unavailable.')
+            _emit('Audalign provided no matches; using internal correlation-based alignment.', force_console=True)
+            try:
+                pretty = ", ".join(f"{off:.4f}s" for off in manual_offsets)
+            except Exception:
+                pretty = ""
+            if pretty:
+                _emit(f'Estimated offsets: {pretty}', force_console=True)
+            step(1, 'Manual alignment fallback')
 
     # 4) Load aligned files from tmp_dir and build multichannel tensor
-    if log:
-        log('Assembling multichannel file...')
+    _emit('Assembling multichannel file...')
     step(1, 'Assemble multichannel')
-    # Try to keep channel order same as input list
-    basenames = [Path(p).name for p in file_paths]
-    aligned_paths: list[Path] = []
-    for base in basenames:
-        cand = tmp_dir / base
-        if cand.exists():
-            aligned_paths.append(cand)
-        else:
-            # Try to find by stem if audalign changed extension/casing
-            stem = Path(base).stem
-            matches = list(tmp_dir.glob(f"{stem}*"))
-            if matches:
-                aligned_paths.append(matches[0])
+    produced = sorted(tmp_dir.rglob("*.wav"))
+    if manual_offsets is None:
+        basenames = [Path(p).name for p in file_paths]
+        aligned_paths: list[Path] = []
 
-    if not aligned_paths:
-        # As a last resort, take all wavs in out_dir excluding an obvious sum file
-        aligned_paths = sorted([p for p in tmp_dir.glob("*.wav") if 'sum' not in p.stem.lower() and 'total' not in p.stem.lower()])
+        def _consume_match(match_fn):
+            for idx, cand in enumerate(produced):
+                if match_fn(cand):
+                    return produced.pop(idx)
+            return None
 
-    if not aligned_paths:
-        return None
+        for base in basenames:
+            stem = Path(base).stem.lower()
+            picked = _consume_match(lambda p, b=base: p.name.lower() == b.lower())
+            if picked is None:
+                picked = _consume_match(lambda p, s=stem: Path(p).stem.lower() == s)
+            if picked is None:
+                picked = _consume_match(lambda p, s=stem: s in Path(p).stem.lower())
+            if picked is None and produced:
+                picked = produced.pop(0)
+            if picked is not None:
+                aligned_paths.append(picked)
+
+        if not aligned_paths:
+            return _abort('Audalign did not produce any aligned files.')
+    else:
+        aligned_paths = []
+        for src in file_paths:
+            p = Path(src)
+            if p.exists():
+                aligned_paths.append(p)
+            else:
+                _emit(f"Manual alignment fallback missing file: {src}", force_console=True)
+        if not aligned_paths:
+            return _abort('Manual alignment fallback could not locate any source files.')
 
     # Load, resample to target SR first, then compute max length to avoid truncation
     resampled = []
     srs = []
-    for p in aligned_paths:
+    for idx, p in enumerate(aligned_paths):
         wav, sr = torchaudio.load(str(p))
         if wav.dim() == 2 and wav.size(0) > 1:
             wav = wav.mean(0, keepdim=True)  # downmix to mono
         elif wav.dim() == 1:
             wav = wav.unsqueeze(0)
+        if manual_offsets is not None:
+            shift = manual_offsets[min(idx, len(manual_offsets) - 1)]
+            wav = _apply_time_shift_tensor(wav.squeeze(0), int(sr), shift).unsqueeze(0)
         srs.append(int(sr))
         resampled.append((wav, int(sr)))
 
@@ -2522,8 +2456,7 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
                 for idx in range(n_ch):
                     cmd += ['-map', f'[ch{idx}]', f'-c:a:{idx}', 'pcm_s24le', f'-ac:a:{idx}', '1']
                 cmd += [str(out_mov)]
-            if log:
-                log('Converting to dual-/multi-mono MOV...')
+            _emit('Converting to dual-/multi-mono MOV...')
             try:
                 subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
             except subprocess.TimeoutExpired:
@@ -2537,22 +2470,19 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
                 out_wav = out_mov
             step(1, 'Convert container')
         else:
-            if wav_only and log:
-                log('WAV-only export selected; finalizing WAV metadata...')
+            if wav_only:
+                _emit('WAV-only export selected; finalizing WAV metadata...')
             # Prefer BW64 with ADM if requested
             bw_ok = False
             if use_bw64:
-                if log:
-                    log('Attempting BW64 (ADM) export...')
+                _emit('Attempting BW64 (ADM) export...')
                 try:
                     if _export_bw64_with_adm(str(out_wav), [Path(p).stem for p in aligned_paths], target_sr):
                         bw_ok = True
-                        if log:
-                            log('BW64 (ADM) export complete.')
+                        _emit('BW64 (ADM) export complete.')
                 except Exception as _e:
                     bw_ok = False
-                    if log:
-                        log(f'BW64 export failed, falling back to BWF iXML: {_e}')
+                    _emit(f'BW64 export failed, falling back to BWF iXML: {_e}', force_console=True)
             if not bw_ok:
                 # Ensure dual-mono behavior by clearing channel mask and embedding iXML names
                 try:
@@ -2708,7 +2638,6 @@ def _finalize_wav_dual_mono(wav_path: str, channel_names: list[str], sr: int) ->
     - Clears channel mask (if ffmpeg available) so it's not treated as interleaved stereo
     - Injects an iXML chunk with channel names
     """
-    import os
     import struct
     import shutil as _sh
     ff = shutil.which('ffmpeg') or shutil.which('ffmpeg.exe')

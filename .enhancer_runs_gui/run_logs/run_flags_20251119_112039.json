@@ -1,0 +1,12 @@
+{
+  "timestamp": "2025-11-19T11:20:39",
+  "settings": {},
+  "env_flags": {},
+  "dependencies": {
+    "torch": "2.1.1+cu121",
+    "torchaudio": "2.1.1+cu121",
+    "audalign": "unknown",
+    "soundfile": "0.12.1",
+    "ffmpeg": "C:\\ProgramData\\chocolatey\\bin\\ffmpeg.EXE"
+  }
+}

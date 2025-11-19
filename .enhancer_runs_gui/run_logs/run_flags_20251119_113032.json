@@ -1,0 +1,48 @@
+{
+  "timestamp": "2025-11-19T11:30:32",
+  "settings": {
+    "diagnostics_mode": true,
+    "denoise_only_mode": true,
+    "device": "cuda",
+    "profile_camera_sync": true,
+    "sync_inputs": true,
+    "seam_safe": true,
+    "post_process": true,
+    "bw64_export": true,
+    "batch_by_folder": true,
+    "lead_guard": false,
+    "skip_fine_requested": false,
+    "skip_fine_effective": false,
+    "force_fine_align": true,
+    "force_drift_correction": true,
+    "aggressive_denoise_requested": true,
+    "aggressive_denoise_effective": true,
+    "denoise_mix_wet": 1.0,
+    "chunk_seconds_effective": 7.0,
+    "overlap_seconds_effective": 0.5,
+    "files_enqueued": [
+      "H:\\NAS\\SGC 2025\\Nils\\Guest-Nils.WAV",
+      "H:\\NAS\\SGC 2025\\Nils\\Interviewer-Nils.WAV"
+    ],
+    "file_count": 2,
+    "ffmpeg_path": "C:\\ProgramData\\chocolatey\\bin\\ffmpeg.EXE",
+    "run_status": "completed",
+    "groups_total": 1,
+    "groups_completed": 1
+  },
+  "env_flags": {
+    "RESEMBLE_CHUNK_SECONDS": "7.0",
+    "RESEMBLE_DENOISE_AGGRESSIVE": "1",
+    "RESEMBLE_DISABLE_TRANSIENT_BLEND": "1",
+    "RESEMBLE_LEAD_GUARD": "0",
+    "RESEMBLE_OVERLAP_SECONDS": "0.5",
+    "RESEMBLE_WET": "1.0"
+  },
+  "dependencies": {
+    "torch": "2.1.1+cu121",
+    "torchaudio": "2.1.1+cu121",
+    "audalign": "unknown",
+    "soundfile": "0.12.1",
+    "ffmpeg": "C:\\ProgramData\\chocolatey\\bin\\ffmpeg.EXE"
+  }
+}

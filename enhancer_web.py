@@ -2,7 +2,10 @@ import os
 import shutil
 import tempfile
 import time
+import json
 import logging
+import sys
+from datetime import datetime
 from pathlib import Path
 
 import gradio as gr
@@ -20,11 +23,83 @@ _log = logging.getLogger("resemble_web")
 if not _log.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
+RUN_LOG_DIR = (Path.cwd() / ".enhancer_runs_gui" / "run_logs")
+RUN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
 
 # ----- Helpers -----
 
 def _which_ffmpeg() -> str | None:
     return shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+
+
+def _collect_dep_versions() -> dict[str, str]:
+    deps: dict[str, str] = {}
+    for name in ("torch", "torchaudio", "audalign", "soundfile"):
+        try:
+            module = sys.modules.get(name)
+            if module is None:
+                module = __import__(name)
+            deps[name] = getattr(module, "__version__", "unknown")
+        except Exception as exc:  # noqa: BLE001
+            deps[name] = f"missing ({exc})"
+    deps["ffmpeg"] = _which_ffmpeg() or "not found"
+    return deps
+
+
+def _write_web_run_log(snapshot: dict | None) -> None:
+    try:
+        env_flags = {k: v for k, v in sorted(os.environ.items()) if k.startswith("RESEMBLE_")}
+        payload = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "source": "web",
+            "settings": snapshot or {},
+            "env_flags": env_flags,
+            "dependencies": _collect_dep_versions(),
+        }
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = RUN_LOG_DIR / f"web_run_{stamp}.json"
+        path.write_text(json.dumps(payload, indent=2))
+        _log.info("Web run log saved to %s", path)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("Failed to write web run log: %s", exc)
+
+
+def _snapshot_web_run(
+    files: list[Any] | None,
+    device: str,
+    seam_safe: bool,
+    chunk_seconds: float,
+    overlap_seconds: float,
+    wet: float,
+    pretranscode: bool,
+    prefer_48k: bool,
+    skip_fine_align: bool,
+    gain_db: float,
+    batch_by_folder: bool,
+) -> dict:
+    paths: list[str] = []
+    if files:
+        for f in files:
+            try:
+                paths.append(str(getattr(f, "name", str(f))))
+            except Exception:
+                paths.append(str(f))
+    return {
+        "device": device,
+        "seam_safe": seam_safe,
+        "chunk_seconds": float(chunk_seconds),
+        "overlap_seconds": float(overlap_seconds),
+        "wet": float(wet),
+        "pretranscode": pretranscode,
+        "prefer_48k": prefer_48k,
+        "skip_fine_align": skip_fine_align,
+        "gain_db": float(gain_db),
+        "batch_by_folder": batch_by_folder,
+        "file_count": len(paths),
+        "files": paths,
+        "run_status": "pending",
+    }
 
 
 def _apply_peak_ceiling(wav_t: torch.Tensor, ceiling_db: float = -1.0) -> torch.Tensor:
@@ -261,6 +336,23 @@ def _export_and_combine(
         groups["ALL"] = list(files)
     all_outputs: list[str] = []
     msgs: list[str] = []
+    run_snapshot = _snapshot_web_run(
+        files,
+        device,
+        seam_safe,
+        chunk_seconds,
+        overlap_seconds,
+        wet,
+        pretranscode,
+        prefer_48k,
+        skip_fine_align,
+        gain_db,
+        batch_by_folder,
+    )
+    run_snapshot["run_status"] = "running"
+    run_snapshot["groups_total"] = len(groups)
+    run_snapshot["groups_completed"] = 0
+    processed_groups = 0
     # 1) Enhance and 2) Combine per group
     try:
         from enhancer_gui import _sync_and_export_multichannel  # reuse exact logic
@@ -310,12 +402,21 @@ def _export_and_combine(
                 all_outputs.append(str(mov))
             else:
                 all_outputs.append(str(comb_wav))
+            processed_groups += 1
+        run_snapshot["groups_completed"] = processed_groups
         if not all_outputs:
-            return [], ("\n".join(msgs) or "No outputs produced.")
+            run_snapshot["run_status"] = "failed"
+            msg = ("\n".join(msgs) or "No outputs produced.")
+            return [], msg
+        run_snapshot["run_status"] = "completed"
         return all_outputs, ("\n".join(msgs) or "OK")
     except Exception as e:  # noqa: BLE001
         _log.exception("Sync/Combine error")
+        run_snapshot["run_status"] = f"error: {e}"
         return [], f"Error during sync/combine: {e}"
+    finally:
+        run_snapshot["groups_completed"] = processed_groups
+        _write_web_run_log(run_snapshot)
 
 
 def _convert_wav_to_dualmono_mov(wav_path: str) -> str | None:
