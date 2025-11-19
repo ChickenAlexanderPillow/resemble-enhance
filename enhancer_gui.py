@@ -2092,18 +2092,19 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
     import torch
 
     def _emit(message: str, force_console: bool = False) -> None:
-        """Send sync logs to the provided callback and optionally to stdout."""
-        printed = False
+        """Send sync logs to both the GUI callback and stdout."""
         if log:
             try:
                 log(message)
             except Exception:
-                printed = True
-        if force_console or not log or printed:
-            try:
-                print(f"[sync] {message}")
-            except Exception:
                 pass
+        try:
+            if force_console:
+                print(f"[sync] {message}")
+            else:
+                print(f"[sync] {message}")
+        except Exception:
+            pass
 
     if not file_paths:
         _emit('No files provided for sync; skipping multichannel export.', force_console=True)
@@ -2136,18 +2137,26 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
         except Exception:
             pass
 
-    # Choose recognizers
-    try:
-        fingerprint_rec = getattr(ad, 'FingerprintRecognizer')()
-    except Exception:
-        fingerprint_rec = None
-    try:
-        fine_rec = getattr(ad, 'CorrelationSpectrogramRecognizer')()
-    except Exception:
+    def _make_recognizer(name: str):
         try:
-            fine_rec = getattr(ad, 'CorrelationRecognizer')()
+            rec_cls = getattr(ad, name)
         except Exception:
-            fine_rec = None
+            return None
+        try:
+            rec = rec_cls()
+        except Exception:
+            return None
+        try:
+            cfg = getattr(rec, 'config', None)
+            if cfg is not None:
+                setattr(cfg, 'multiprocessing', False)
+                setattr(cfg, 'num_processors', 1)
+        except Exception:
+            pass
+        return rec
+
+    fingerprint_rec = _make_recognizer('FingerprintRecognizer')
+    fine_rec = _make_recognizer('CorrelationSpectrogramRecognizer') or _make_recognizer('CorrelationRecognizer')
 
     # Build low-sample-rate proxies for faster alignment
     proxy_sr = 16000
@@ -2242,8 +2251,8 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
     try:
         align_files = getattr(ad, 'align_files')
         with _suppress_stdout_stderr():
-            if hasattr(ad, 'CorrelationRecognizer'):
-                corr_rec = getattr(ad, 'CorrelationRecognizer')()
+            corr_rec = _make_recognizer('CorrelationRecognizer')
+            if corr_rec is not None:
                 results = align_files(*[str(p) for p in proxies], recognizer=corr_rec)
             if not results and fingerprint_rec:
                 results = align_files(*[str(p) for p in proxies], recognizer=fingerprint_rec)
@@ -2254,9 +2263,10 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
 
     # Fallback: correlation-only alignment when fingerprinting doesn't match
     try:
-        if (not results) and 'CorrelationRecognizer' in dir(ad):
-            corr_rec = getattr(ad, 'CorrelationRecognizer')()
-            results = align_files(*file_paths, recognizer=corr_rec)
+        if not results:
+            corr_rec = _make_recognizer('CorrelationRecognizer')
+            if corr_rec is not None:
+                results = align_files(*file_paths, recognizer=corr_rec)
     except Exception:
         pass
 
