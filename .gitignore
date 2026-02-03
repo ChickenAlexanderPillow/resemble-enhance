@@ -18,6 +18,7 @@ model_repo
 input_audio/
 output_audio/
 Shoot/
+.enhancer_runs_gui/
 .pp_test_in/
 .pp_test_out_cli/
 .pp_test_out_global/
@@ -33,3 +34,11 @@ Thumbs.db
 
 # Accidental stray file
 ' 
+*.wav
+*.mp3
+*.WAV
+*.MP3
+*.flac
+*.FLAC
+*.aiff
+*.AIFF
