@@ -379,6 +379,13 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(name, "")).strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "yes", "on"}
+
+
 @dataclass
 class _BleedGateConfig:
     win_ms: float = 25.0
@@ -402,6 +409,10 @@ class _BleedGateConfig:
     spectral_sim_low: float = 0.55
     spectral_sim_high: float = 0.86
     spectral_bleed_sim: float = 0.90
+    hard_isolation: bool = True
+    hard_att_db: float = 42.0
+    hard_doubletalk_sim_max: float = 0.72
+    hard_mute: bool = True
 
     @classmethod
     def from_env(cls) -> "_BleedGateConfig":
@@ -422,6 +433,10 @@ class _BleedGateConfig:
         cfg.spectral_sim_low = min(0.99, max(0.0, _env_float("RESEMBLE_BLEED_SPECTRAL_SIM_LOW", cfg.spectral_sim_low)))
         cfg.spectral_sim_high = min(0.999, max(cfg.spectral_sim_low + 1e-3, _env_float("RESEMBLE_BLEED_SPECTRAL_SIM_HIGH", cfg.spectral_sim_high)))
         cfg.spectral_bleed_sim = min(0.999, max(cfg.spectral_sim_low, _env_float("RESEMBLE_BLEED_SPECTRAL_BLEED_SIM", cfg.spectral_bleed_sim)))
+        cfg.hard_isolation = _env_bool("RESEMBLE_BLEED_HARD_ISOLATION", cfg.hard_isolation)
+        cfg.hard_att_db = max(6.0, _env_float("RESEMBLE_BLEED_HARD_ATT_DB", cfg.hard_att_db))
+        cfg.hard_doubletalk_sim_max = min(0.99, max(0.0, _env_float("RESEMBLE_BLEED_HARD_DOUBLETALK_SIM_MAX", cfg.hard_doubletalk_sim_max)))
+        cfg.hard_mute = _env_bool("RESEMBLE_BLEED_HARD_MUTE", cfg.hard_mute)
         return cfg
 
 
@@ -573,7 +588,15 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
     if spec_sim12 is None:
         spec_sim12 = torch.zeros_like(margin_db)
 
-    uncertain_overlap = multi_active & (margin_db_look < cfg.overlap_margin_db) & (spec_sim12 < cfg.spectral_bleed_sim)
+    base_uncertain_overlap = multi_active & (margin_db_look < cfg.overlap_margin_db)
+    uncertain_overlap = base_uncertain_overlap
+    # In hard isolation, only preserve overlaps that look like true double-talk
+    # (spectrally dissimilar voices). Spectrally similar overlaps are treated as bleed.
+    if cfg.hard_isolation:
+        if spec is not None:
+            uncertain_overlap = base_uncertain_overlap & (spec_sim12 <= cfg.hard_doubletalk_sim_max)
+        else:
+            uncertain_overlap = multi_active & (margin_db_look < max(0.5, cfg.overlap_margin_db * 0.35))
 
     conf = (margin_db_look - cfg.start_db) / max(1e-6, (cfg.full_db - cfg.start_db))
     conf = torch.clamp(conf, 0.0, 1.0)
@@ -644,17 +667,24 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
                 hold_left -= 1
 
     gains_db = torch.zeros_like(env_db)
+    hard_loser_masks: list[torch.Tensor] = []
     for idx in range(n_ch):
         loser_mask = (winner_idx != idx) & (~uncertain_overlap) & (~near_silence)
+        hard_loser_masks.append(loser_mask)
         base_att = cfg.max_att_db * conf
         floor_mask = conf >= cfg.min_att_conf
         eff_att = torch.where(floor_mask, torch.maximum(base_att, torch.full_like(base_att, cfg.min_att_db)), base_att)
+        if cfg.hard_isolation:
+            eff_att = torch.maximum(eff_att, torch.full_like(eff_att, cfg.hard_att_db))
         gains_db[idx] = torch.where(loser_mask, -eff_att, torch.zeros_like(conf))
 
     gains_lin: list[torch.Tensor] = []
     for idx in range(env_db.size(0)):
-        g = 10.0 ** (gains_db[idx] / 20.0)
-        g = _smooth_gain_envelope(g, attack_ms=cfg.attack_ms, release_ms=cfg.release_ms, sr=sr, hop_ms=hop_ms)
+        if cfg.hard_isolation and cfg.hard_mute:
+            g = torch.where(hard_loser_masks[idx], torch.zeros_like(conf), torch.ones_like(conf))
+        else:
+            g = 10.0 ** (gains_db[idx] / 20.0)
+            g = _smooth_gain_envelope(g, attack_ms=cfg.attack_ms, release_ms=cfg.release_ms, sr=sr, hop_ms=hop_ms)
         gains_lin.append(g)
 
     hop = max(1, int(sr * hop_ms / 1000.0))
@@ -694,7 +724,9 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
             f"[bleed] confident={confident_ratio*100.0:.1f}% "
             f"uncertain_overlap={uncertain_ratio*100.0:.1f}% "
             f"switches_per_min={switch_per_min:.2f} "
-            f"mean_loser_att_db={mean_att:.2f}"
+            f"mean_loser_att_db={mean_att:.2f} "
+            f"hard_iso={1 if cfg.hard_isolation else 0} "
+            f"hard_mute={1 if (cfg.hard_isolation and cfg.hard_mute) else 0}"
         )
         diag_mode = str(os.environ.get("RESEMBLE_DIAG_MINIMAL", "0")).strip().lower() in {"1", "true", "yes", "on"}
         if diag_mode:

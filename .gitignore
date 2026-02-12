@@ -21,6 +21,9 @@ Shoot/
 .pp_test_in/
 .pp_test_out_cli/
 .pp_test_out_global/
+.enhancer_runs_gui/
+tmp_audalign_test/
+tmp_audalign_test2/
 # Downloaded model weights and checkpoints (nested locations)
 resemble_enhance/model_repo/
 **/model_repo/
@@ -33,3 +36,17 @@ Thumbs.db
 
 # Accidental stray file
 ' 
+*.wav
+*.WAV
+*.aif
+*.aiff
+*.flac
+*.mp3
+*.m4a
+*.aac
+*.ogg
+*.mov
+*.mp4
+*.mkv
+*.avi
+*.webm

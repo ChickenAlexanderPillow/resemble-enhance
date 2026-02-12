@@ -212,7 +212,13 @@ def inference(
     disable_align: bool = False,
     progress_cb=None,
 ):
-    remove_weight_norm_recursively(model)
+    # Strip weight norm once per loaded model instance; repeated calls are costly.
+    if not bool(getattr(model, "_resemble_wn_removed", False)):
+        remove_weight_norm_recursively(model)
+        try:
+            setattr(model, "_resemble_wn_removed", True)
+        except Exception:
+            pass
 
     hp: HParams = model.hp
 
