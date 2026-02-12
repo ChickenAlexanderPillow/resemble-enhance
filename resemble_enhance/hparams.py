@@ -54,7 +54,7 @@ class HParams:
 
     # Training
     nj: int = 64
-    training_seconds: float = 2.0
+    training_seconds: float = 2.5
     batch_size_per_gpu: int = 16
     min_lr: float = 1e-5
     max_lr: float = 1e-4

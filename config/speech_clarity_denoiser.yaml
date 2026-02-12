@@ -1,0 +1,9 @@
+batch_size_per_gpu: 32
+training_seconds: 2.5
+denoiser_l1_weight: 0.8
+denoiser_mrstft_sc_weight: 0.7
+denoiser_mrstft_mag_weight: 0.9
+denoiser_sisdr_weight: 0.25
+denoiser_sisdr_target_db: 20.0
+denoiser_vad_margin_db: 8.0
+denoiser_vad_speech_boost: 2.0

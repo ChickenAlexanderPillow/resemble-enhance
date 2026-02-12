@@ -416,7 +416,7 @@ class _BleedGateConfig:
     hard_mute_attack_ms: float = 8.0
     hard_mute_release_ms: float = 45.0
     hard_open_pad_ms: float = 12.0
-    hard_open_hold_ms: float = 95.0
+    hard_open_hold_ms: float = 45.0
 
     @classmethod
     def from_env(cls) -> "_BleedGateConfig":
@@ -702,16 +702,20 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
                 open_mask = dil > 0.0
             hold_frames = max(0, int(round(cfg.hard_open_hold_ms / max(1e-3, hop_ms))))
             if hold_frames > 0 and open_mask.numel() > 1:
-                # Keep a channel open briefly after it wins to avoid choppy reaction words.
+                # Keep a channel open briefly only around speech-active frames
+                # to avoid choppy reactions without extending wrong-winner leakage.
+                ch_speech = active[idx] if idx < active.size(0) else open_mask
                 held = open_mask.clone()
                 hold_left = 0
                 for t in range(int(open_mask.numel())):
-                    if bool(open_mask[t].item()):
+                    if bool(open_mask[t].item()) and bool(ch_speech[t].item()):
                         hold_left = hold_frames
                         held[t] = True
-                    elif hold_left > 0:
+                    elif hold_left > 0 and bool(ch_speech[t].item()):
                         held[t] = True
                         hold_left -= 1
+                    else:
+                        hold_left = 0
                 open_mask = held
             g = torch.where(open_mask, torch.ones_like(conf), torch.zeros_like(conf))
             # De-click hard transitions without re-opening bleed materially.
@@ -847,6 +851,20 @@ def _get_console_python() -> str:
     return exe
 
 
+def _get_enhancer_run_dir() -> Path | None:
+    """Optional override for GUI inference weights via env.
+
+    Set RESEMBLE_ENHANCER_RUN_DIR to a trained run folder.
+    """
+    raw = str(os.environ.get("RESEMBLE_ENHANCER_RUN_DIR", "")).strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    if p.exists() and p.is_dir():
+        return p
+    return None
+
+
 class _Cancelled(Exception):
     pass
 
@@ -863,6 +881,7 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
     from resemble_enhance.enhancer.inference import denoise, enhance
     import torchaudio
     from torchaudio.functional import resample as ta_resample
+    run_dir = _get_enhancer_run_dir()
 
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     expected = len(files)
@@ -940,7 +959,7 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
                             dwav=wav,
                             sr=sr,
                             device=cur_device,
-                            run_dir=None,
+                            run_dir=run_dir,
                             progress_cb=lambda evt, nm, i, n, p=p: on_chunk(evt, str(p), i, n),
                             **cur_kwargs,
                         )
@@ -960,7 +979,7 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
                             dwav=wav,
                             sr=sr,
                             device=cur_device,
-                            run_dir=None,
+                            run_dir=run_dir,
                             progress_cb=lambda evt, nm, i, n, p=p: on_chunk(evt, str(p), i, n),
                             **cur_kwargs,
                             **extra,
@@ -1181,6 +1200,9 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
         "--device",
         device,
     ]
+    run_dir = _get_enhancer_run_dir()
+    if run_dir is not None:
+        cmd += ["--run_dir", str(run_dir)]
     if denoise_only:
         cmd.insert(len(cmd)-2, "--denoise_only")
     # In diagnostics/CLI mode, avoid profile overrides so our small chunk/overlap apply immediately
@@ -2141,17 +2163,18 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
 
         # Denoise with current seam settings
         from resemble_enhance.enhancer.inference import denoise
+        run_dir = _get_enhancer_run_dir()
         if self.var_seam_safe.get():
             kwargs = dict(chunk_seconds=float(os.environ.get('RESEMBLE_CHUNK_SECONDS', '60.0') or 60.0), overlap_seconds=float(os.environ.get('RESEMBLE_OVERLAP_SECONDS', '4.0') or 4.0), align_max_shift_ratio=0.05, align_disable=False)
         else:
             kwargs = dict(chunk_seconds=float(os.environ.get('RESEMBLE_CHUNK_SECONDS', '31.0') or 31.0), overlap_seconds=float(os.environ.get('RESEMBLE_OVERLAP_SECONDS', '1.0') or 1.0), align_max_shift_ratio=0.25, align_disable=True)
         device = 'cuda'
         try:
-            hwav, model_sr = denoise(dwav=wav, sr=sr, device=device, run_dir=None, **kwargs)
+            hwav, model_sr = denoise(dwav=wav, sr=sr, device=device, run_dir=run_dir, **kwargs)
         except Exception:
             # Fallback to CPU or bypass if device fails
             try:
-                hwav, model_sr = denoise(dwav=wav, sr=sr, device='cpu', run_dir=None, **kwargs)
+                hwav, model_sr = denoise(dwav=wav, sr=sr, device='cpu', run_dir=run_dir, **kwargs)
             except Exception:
                 hwav = wav
                 model_sr = sr
@@ -2567,6 +2590,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             "files_enqueued": files,
             "file_count": len(files),
             "ffmpeg_path": shutil.which('ffmpeg') or shutil.which('ffmpeg.exe') or '',
+            "enhancer_run_dir_override": str(_get_enhancer_run_dir() or ""),
             "run_status": "pending",
         }
         return snapshot
