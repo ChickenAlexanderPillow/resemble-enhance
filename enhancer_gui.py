@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -33,6 +34,133 @@ except Exception:  # noqa: BLE001
 BASE = Path.cwd()
 INPUT_TMP_ROOT = BASE / ".enhancer_runs_gui"
 OUTPUT_ROOT = BASE / "output_audio"
+MIN_AUDIO_SAMPLES = 2048
+OUTPUT_MEDIA_CLEAN_ENV = "RESEMBLE_OUTPUT_MEDIA_CLEAN"
+MEDIA_ROOT_FOLDER = "01_MEDIA"
+MEDIA_CLEAN_FOLDER = "030_AUDIO_CLEAN"
+
+def _find_media_clean_dir(src_path: Path) -> Path | None:
+    try:
+        # First, look for an ancestor named 01_MEDIA
+        for parent in src_path.parents:
+            if parent.name.lower() == MEDIA_ROOT_FOLDER.lower():
+                preferred = parent / MEDIA_CLEAN_FOLDER
+                if preferred.exists() or preferred.parent.exists():
+                    return preferred
+                # Fallback: any folder containing "audio_clean" under 01_MEDIA
+                try:
+                    for child in parent.iterdir():
+                        if child.is_dir() and "audio_clean" in child.name.lower():
+                            return child
+                except Exception:
+                    return preferred
+                return preferred
+        # If no 01_MEDIA ancestor, try sibling 01_MEDIA at each parent level
+        for parent in src_path.parents:
+            sib = parent / MEDIA_ROOT_FOLDER
+            if sib.exists() and sib.is_dir():
+                preferred = sib / MEDIA_CLEAN_FOLDER
+                if preferred.exists() or preferred.parent.exists():
+                    return preferred
+                try:
+                    for child in sib.iterdir():
+                        if child.is_dir() and "audio_clean" in child.name.lower():
+                            return child
+                except Exception:
+                    return preferred
+                return preferred
+    except Exception:
+        return None
+    return None
+
+def _build_output_dest_dir(src_path: Path, output_base: Path | None, stamp: str) -> Path:
+    if output_base is not None:
+        return output_base
+    try:
+        if os.environ.get(OUTPUT_MEDIA_CLEAN_ENV, "0") == "1":
+            media_dir = _find_media_clean_dir(src_path)
+            if media_dir is not None:
+                return media_dir
+    except Exception:
+        pass
+    return src_path.parent / f"Enhanced_{stamp}"
+
+def _has_clean_output_in_media(src_path: Path) -> bool:
+    try:
+        # If source is already a CLEAN file or lives in the clean folder, skip
+        if src_path.name.upper().startswith("CLEAN_"):
+            return True
+        try:
+            if src_path.parent.name.lower() == MEDIA_CLEAN_FOLDER.lower():
+                return True
+            if "audio_clean" in src_path.parent.name.lower():
+                return True
+        except Exception:
+            pass
+        media_dir = _find_media_clean_dir(src_path)
+        if media_dir is None or not media_dir.exists():
+            return False
+        # If a synced multichannel clean already exists for this folder, skip all
+        try:
+            for cand in media_dir.glob("CLEAN_Synced_Multichannel*"):
+                if cand.is_file():
+                    return True
+        except Exception:
+            pass
+        stem = src_path.stem
+        pat = f"CLEAN_{stem}*"
+        for cand in media_dir.glob(pat):
+            try:
+                if cand.is_file():
+                    return True
+            except Exception:
+                continue
+        return False
+    except Exception:
+        return False
+
+def _build_output_name(src_path: Path, stamp: str) -> str:
+    stem = src_path.stem
+    suf = src_path.suffix
+    return f"CLEAN_{stem}_{stamp}{suf}"
+
+def _pad_audio_tensor_min_samples(wav, min_samples: int) -> tuple:
+    try:
+        import torch
+        if not isinstance(wav, torch.Tensor):
+            return wav, 0
+        n = int(wav.numel())
+        if n >= int(min_samples):
+            return wav, n
+        pad = int(min_samples) - n
+        wav = torch.nn.functional.pad(wav, (0, pad))
+        return wav, n
+    except Exception:
+        return wav, 0
+
+def _pad_wav_on_disk(path: Path, min_samples: int) -> tuple[int, int] | None:
+    try:
+        import torchaudio
+        info = torchaudio.info(str(path))
+        orig_len = int(getattr(info, "num_frames", 0) or 0)
+        sr = int(getattr(info, "sample_rate", 0) or 0)
+        if orig_len <= 0 or sr <= 0:
+            return None
+        if orig_len >= int(min_samples):
+            return (orig_len, sr)
+        wav, sr2 = torchaudio.load(str(path))
+        if sr2:
+            sr = int(sr2)
+        if wav.dim() == 1:
+            wav = wav.unsqueeze(0)
+        pad = int(min_samples) - int(wav.size(-1))
+        if pad > 0:
+            import torch as _t
+            wav = _t.nn.functional.pad(wav, (0, pad))
+            torchaudio.save(str(path), wav, sr)
+        return (orig_len, sr)
+    except Exception:
+        return None
 
 def _prune_staging_dirs(max_age_hours: float = 24.0) -> int:
     """Delete old temp staging subfolders under .enhancer_runs_gui.
@@ -59,6 +187,36 @@ def _prune_staging_dirs(max_age_hours: float = 24.0) -> int:
         return removed
     except Exception:
         return 0
+
+def _cleanup_run_artifacts(remove_logs: bool = True) -> None:
+    """Remove temp audio/log artifacts under .enhancer_runs_gui."""
+    try:
+        root = INPUT_TMP_ROOT
+        if not root.exists():
+            return
+        # Known temp subfolders
+        for name in ("staging", "tmp_sync", "preview_out"):
+            try:
+                shutil.rmtree(root / name, ignore_errors=True)
+            except Exception:
+                pass
+        if remove_logs:
+            try:
+                shutil.rmtree(root / "run_logs", ignore_errors=True)
+            except Exception:
+                pass
+        # Remove any leftover run_* folders or stray run ids
+        try:
+            for p in list(root.iterdir()):
+                if not p.is_dir():
+                    continue
+                if p.name in {"staging", "tmp_sync", "preview_out", "run_logs"}:
+                    continue
+                shutil.rmtree(p, ignore_errors=True)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 def _find_free_port(host: str = "127.0.0.1") -> int:
     import socket as _sock
@@ -219,12 +377,12 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
     if T <= 0:
         return monos
 
-    win_ms = 25.0
-    hop_ms = 10.0
+    win_ms = 30.0
+    hop_ms = 12.0
     silence_db = -60.0
+    # Winner-takes-all: if a mic is sufficiently quieter, attenuate it.
     start_db = 4.0
-    full_db = 12.0
-    max_att_db = 28.0
+    max_att_db = 18.0
 
     padded: list[torch.Tensor] = []
     for mono in monos:
@@ -256,20 +414,22 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
     silence_mask = (max_env_db < silence_db)
 
     gains_db = torch.zeros_like(env_db)
+    hard_gates: list[torch.Tensor] = []
+    max_idx = env_db.argmax(dim=0)
     for idx in range(env_db.size(0)):
         delta = max_env_db - env_db[idx]
         delta = torch.where(silence_mask, torch.zeros_like(delta), delta)
-        att = torch.zeros_like(delta)
-        mid = (delta > start_db) & (delta < full_db)
-        if (full_db - start_db) > 1e-6:
-            att[mid] = (delta[mid] - start_db) / (full_db - start_db) * max_att_db
-        att[delta >= full_db] = max_att_db
-        gains_db[idx] = -att
+        is_winner = (max_idx == idx)
+        # Per-frame gating: attenuate only when this channel loses by enough margin.
+        hard_gate = (~is_winner) & (delta >= start_db) & (~silence_mask)
+        hard_gates.append(hard_gate)
+        gains_db[idx] = torch.where(hard_gate, torch.full_like(delta, -max_att_db), torch.zeros_like(delta))
 
     gains_lin: list[torch.Tensor] = []
     for idx in range(env_db.size(0)):
         g = 10.0 ** (gains_db[idx] / 20.0)
-        g = _smooth_gain_envelope(g, attack_ms=15.0, release_ms=80.0, sr=sr, hop_ms=hop_ms)
+        # Soften the gate to preserve reactions and breaths
+        g = _smooth_gain_envelope(g, attack_ms=20.0, release_ms=300.0, sr=sr, hop_ms=hop_ms)
         gains_lin.append(g)
 
     hop = max(1, int(sr * hop_ms / 1000.0))
@@ -283,6 +443,16 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
         if g_up.size(-1) < T:
             g_up = torch.nn.functional.pad(g_up, (0, T - g_up.size(-1)), value=last)
         g_up = g_up[:T]
+        # Extra smoothing on the upsampled gain to reduce clicks/chop
+        filt_len = max(1, int(sr * 0.01))
+        if filt_len > 1:
+            kernel = torch.ones(filt_len, dtype=g_up.dtype, device=g_up.device) / float(filt_len)
+            g_up = torch.nn.functional.conv1d(
+                g_up.unsqueeze(0).unsqueeze(0),
+                kernel.view(1, 1, -1),
+                padding=filt_len // 2,
+            ).squeeze()
+            g_up = g_up[:T]
         gated.append(mono * g_up)
 
     out: list[torch.Tensor] = []
@@ -370,13 +540,18 @@ class _Control:
         self.cancel_now = _th.Event()   # immediate cancel request (treated same at chunk boundary)
 
 
-def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, seam_safe: bool = True, control: _Control | None = None, denoise_only: bool = True):
+def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, seam_safe: bool = True, control: _Control | None = None, denoise_only: bool = True, noise_only: bool = False, output_dir: str | Path | None = None):
     from resemble_enhance.enhancer.inference import denoise, enhance
     import torchaudio
     from torchaudio.functional import resample as ta_resample
 
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     expected = len(files)
+    noise_flag = noise_only
+    try:
+        noise_flag = noise_flag or os.environ.get("RESEMBLE_NOISE_ONLY", "0") == "1"
+    except Exception:
+        pass
     if progress_cb:
         progress_cb(0, expected)
 
@@ -392,13 +567,15 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
 
     done = 0
     out_dirs = set()
+    output_base = Path(output_dir) if output_dir else None
     results: list[tuple[str, str]] = []
     for f in files:
         p = Path(f)
-        dest_dir = p.parent / f"Enhanced_{stamp}"
+        dest_dir = _build_output_dest_dir(p, output_base, stamp)
         dest_dir.mkdir(parents=True, exist_ok=True)
         out_dirs.add(dest_dir)
         name = p.name
+        out_name = _build_output_name(p, stamp)
         try:
             os.environ["RESEMBLE_FILE"] = str(p)
         except Exception:
@@ -407,6 +584,7 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
             break
         wav, sr = torchaudio.load(str(p))
         wav = wav.mean(0)
+        wav, orig_len = _pad_audio_tensor_min_samples(wav, MIN_AUDIO_SAMPLES)
         if seam_safe:
             kwargs = dict(chunk_seconds=60.0, overlap_seconds=4.0, align_max_shift_ratio=0.05, align_disable=False)
         else:
@@ -504,22 +682,30 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
         dest_sr = 48000 if profile else sr
         if model_sr != dest_sr:
             hwav = ta_resample(hwav, orig_freq=model_sr, new_freq=dest_sr)
-        exp_len = round(wav.shape[-1] * (dest_sr / sr)) if dest_sr != sr else wav.shape[-1]
+        if not orig_len:
+            orig_len = int(wav.shape[-1])
+        exp_len = round(orig_len * (dest_sr / sr)) if dest_sr != sr else orig_len
         if hwav.shape[-1] > exp_len:
             hwav = hwav[:exp_len]
         elif hwav.shape[-1] < exp_len:
             import torch
             hwav = torch.nn.functional.pad(hwav, (0, exp_len - hwav.shape[-1]))
-        # Transient-safe blend: add a little original back where mismatch is sharp and loud
         try:
             base = wav
             if dest_sr != sr:
                 base = ta_resample(base, orig_freq=sr, new_freq=dest_sr)
+        except Exception:
+            base = wav
+        try:
             if base.shape[-1] > exp_len:
                 base = base[:exp_len]
             elif base.shape[-1] < exp_len:
                 import torch as _t
                 base = _t.nn.functional.pad(base, (0, exp_len - base.shape[-1]))
+        except Exception:
+            pass
+        # Transient-safe blend: add a little original back where mismatch is sharp and loud
+        try:
             # Optional debug dump before post-processing (RAW model output at model_sr)
             if os.environ.get("RESEMBLE_DEBUG_DUMP", "0") == "1":
                 try:
@@ -537,10 +723,12 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
             if os.environ.get('RESEMBLE_LEAD_GUARD', '1') == '1':
                 try:
                     import torch as _t
-                    x = hwav; y = base
+                    x = hwav
+                    y = base
                     n = min(x.numel(), y.numel())
                     if n > dest_sr // 2:
-                        x = x[:n]; y = y[:n]
+                        x = x[:n]
+                        y = y[:n]
                         k_env = max(8, int(dest_sr * 0.005))  # ~5 ms smoothing
                         pad = k_env // 2
                         w = _t.ones(1, 1, k_env, dtype=x.dtype, device=x.device) / float(k_env)
@@ -576,9 +764,12 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
             wet = max(0.0, min(1.0, wet))
             if wet < 1.0:
                 hwav = wet * hwav + (1.0 - wet) * base
+            if noise_flag:
+                # Export the residual (background/noise) instead of the cleaned signal
+                hwav = base - hwav
         except Exception:
             pass
-        out_path = dest_dir / name
+        out_path = dest_dir / out_name
         hwav = _apply_peak_ceiling(hwav, ceiling_db=-1.0)
         # Optional debug dump after processing (POST)
         if os.environ.get("RESEMBLE_DEBUG_DUMP", "0") == "1":
@@ -592,14 +783,20 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
         if progress_cb:
             progress_cb(done, expected)
         results.append((str(p), str(out_path)))
+        try:
+            import torch as _t
+            if str(device).lower() == "cuda" and _t.cuda.is_available():
+                _t.cuda.empty_cache()
+        except Exception:
+            pass
 
     return results
 
 
-def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk_progress_cb=None, seam_safe: bool = True, control: _Control | None = None, denoise_only: bool = True, prefer_cli: bool = False):
+def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk_progress_cb=None, seam_safe: bool = True, control: _Control | None = None, denoise_only: bool = True, prefer_cli: bool = False, noise_only: bool = False, output_dir: str | Path | None = None, force_inprocess: bool = False):
     # When frozen into an EXE, run in-process for full portability
-    if (getattr(sys, 'frozen', False) or control is not None) and not prefer_cli:
-        return _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, seam_safe=seam_safe, control=control, denoise_only=denoise_only)
+    if (getattr(sys, 'frozen', False) or control is not None or noise_only or force_inprocess) and not prefer_cli:
+        return _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, seam_safe=seam_safe, control=control, denoise_only=denoise_only, noise_only=noise_only, output_dir=output_dir)
 
     run_id = uuid.uuid4().hex[:8]
     in_dir = INPUT_TMP_ROOT / run_id / "input_audio"
@@ -607,8 +804,15 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
     out_dir = OUTPUT_ROOT / stamp
     in_dir.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
+    output_base = Path(output_dir) if output_dir else None
+    noise_flag = noise_only
+    try:
+        noise_flag = noise_flag or os.environ.get("RESEMBLE_NOISE_ONLY", "0") == "1"
+    except Exception:
+        pass
 
     # Copy or transcode files into temp input dir; prefer WAV for CLI reliability
+    orig_meta: dict[str, tuple[int, int]] = {}
     for f in files:
         srcp = Path(f)
         if srcp.suffix.lower() != ".wav":
@@ -627,6 +831,9 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
                     else:
                         wav = wav.squeeze(0)
                     _ta.save(str(dst), wav.unsqueeze(0), sr)
+                meta = _pad_wav_on_disk(dst, MIN_AUDIO_SAMPLES)
+                if meta and meta[0] < MIN_AUDIO_SAMPLES:
+                    orig_meta[str(f)] = meta
             except Exception:
                 # Fallback: copy source if transcode fails
                 dst = in_dir / srcp.name
@@ -634,6 +841,9 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
         else:
             dst = in_dir / srcp.name
             shutil.copy2(f, dst)
+            meta = _pad_wav_on_disk(dst, MIN_AUDIO_SAMPLES)
+            if meta and meta[0] < MIN_AUDIO_SAMPLES:
+                orig_meta[str(f)] = meta
 
     py = _get_console_python()
     cmd = [
@@ -677,6 +887,29 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     env = os.environ.copy()
     env["RESEMBLE_PROGRESS"] = "1"
+    log_path = out_dir / "enhancer_cli.log"
+    log_lines = deque(maxlen=200)
+    log_lock = threading.Lock()
+
+    def _record_log(line: str) -> None:
+        if not line:
+            return
+        try:
+            with log_lock:
+                log_lines.append(line)
+        except Exception:
+            pass
+        try:
+            with log_path.open("a", encoding="utf-8", errors="replace") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+    try:
+        with log_path.open("w", encoding="utf-8", errors="replace") as f:
+            f.write("cmd: " + " ".join(cmd) + "\n")
+    except Exception:
+        pass
     proc = subprocess.Popen(
         cmd,
         creationflags=creationflags,
@@ -698,6 +931,7 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
         end_re = re.compile(r"^PROGRESS END file=(.*)$")
         for line in proc.stdout:  # type: ignore[attr-defined]
             line = line.rstrip()
+            _record_log(line)
             m = start_re.match(line)
             if m:
                 current_file = m.group(1)
@@ -750,15 +984,31 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
     if progress_cb:
         progress_cb(completed, expected)
 
+    try:
+        t.join(timeout=1.0)
+    except Exception:
+        pass
+
     rc = proc.returncode
     if rc != 0:
-        raise RuntimeError(f"Enhancer returned code {rc}")
+        tail = []
+        try:
+            with log_lock:
+                tail = list(log_lines)[-10:]
+        except Exception:
+            tail = []
+        if tail:
+            raise RuntimeError(
+                f"Enhancer returned code {rc}. See log: {log_path}. Tail:\n" + "\n".join(tail)
+            )
+        raise RuntimeError(f"Enhancer returned code {rc}. See log: {log_path}")
 
     # Cleanup inputs if outputs look valid
-    # Move outputs next to the original files under Enhanced_<timestamp> (keep originals)
+    # Move outputs to selected output folder (if any), otherwise next to originals under Enhanced_<timestamp>
     results: list[tuple[str, str]] = []
     for f in files:
         name = Path(f).name
+        out_name = _build_output_name(Path(f), stamp)
         tmp_out = out_dir / name
         if not (tmp_out.exists() and tmp_out.stat().st_size > 44):
             # Try common alternate container/extension
@@ -771,16 +1021,65 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
                     tmp_out = alt2
                 else:
                     continue
-        dest_dir = Path(f).parent / f"Enhanced_{stamp}"
+        dest_dir = _build_output_dest_dir(Path(f), output_base, stamp)
         dest_dir.mkdir(parents=True, exist_ok=True)
-        final_out = dest_dir / name
+        final_out = dest_dir / out_name
         try:
             shutil.move(str(tmp_out), str(final_out))
         except Exception:
             # Best-effort fallback to copy
             shutil.copy2(str(tmp_out), str(final_out))
             tmp_out.unlink(missing_ok=True)
+        if str(f) in orig_meta and final_out.suffix.lower() in {".wav", ".wave"}:
+            try:
+                import torchaudio as _ta
+                orig_len, orig_sr = orig_meta[str(f)]
+                wav, out_sr = _ta.load(str(final_out))
+                if orig_sr and out_sr:
+                    target_len = int(round(orig_len * (float(out_sr) / float(orig_sr))))
+                else:
+                    target_len = int(orig_len)
+                if target_len > 0 and wav.size(-1) > target_len:
+                    wav = wav[..., :target_len]
+                    _ta.save(str(final_out), wav, int(out_sr))
+            except Exception:
+                pass
         results.append((str(Path(f)), str(final_out)))
+
+    if noise_flag and results:
+        try:
+            import torchaudio as _ta
+            from torchaudio.functional import resample as _ta_resample
+            import torch as _t
+            updated: list[tuple[str, str]] = []
+            for src_path, out_path in results:
+                try:
+                    orig, orig_sr = _ta.load(str(src_path))
+                    if orig.dim() == 2 and orig.size(0) > 1:
+                        orig = orig.mean(0, keepdim=True)
+                    elif orig.dim() == 1:
+                        orig = orig.unsqueeze(0)
+                    cleaned, out_sr = _ta.load(str(out_path))
+                    if cleaned.dim() == 2 and cleaned.size(0) > 1:
+                        cleaned = cleaned.mean(0, keepdim=True)
+                    elif cleaned.dim() == 1:
+                        cleaned = cleaned.unsqueeze(0)
+                    if orig_sr != out_sr:
+                        orig = _ta_resample(orig, orig_freq=int(orig_sr), new_freq=int(out_sr))
+                    target_len = int(cleaned.size(-1))
+                    if orig.size(-1) > target_len:
+                        orig = orig[..., :target_len]
+                    elif orig.size(-1) < target_len:
+                        orig = _t.nn.functional.pad(orig, (0, target_len - int(orig.size(-1))))
+                    noise = orig - cleaned
+                    noise = _apply_peak_ceiling(noise, ceiling_db=-1.0)
+                    _ta.save(str(out_path), noise, int(out_sr))
+                    updated.append((src_path, out_path))
+                except Exception:
+                    updated.append((src_path, out_path))
+            results = updated
+        except Exception:
+            pass
 
     # Cleanup temporary input dir for this run to avoid accumulating past runs
     try:
@@ -900,6 +1199,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             self._text = getattr(cols, 'fg', '#e5e7eb') if cols is not None else '#e5e7eb'
             self._muted = getattr(cols, 'secondary', '#9aa4b2') if cols is not None else '#9aa4b2'
             self._accent = getattr(cols, 'primary', '#3b82f6') if cols is not None else '#3b82f6'
+            self._success = getattr(cols, 'success', '#22c55e') if cols is not None else '#22c55e'
         else:
             style = ttk.Style()
             try:
@@ -912,6 +1212,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             self._text = "#e5e7eb"
             self._muted = "#9aa4b2"
             self._accent = "#3b82f6"
+            self._success = "#22c55e"
         self.configure(bg=self._bg)
         style.configure('.', background=self._bg, foreground=self._text)
         style.configure('TFrame', background=self._bg)
@@ -1010,11 +1311,48 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self.var_overlap_sec = tk.DoubleVar(value=0.5)
         self.var_wet = tk.DoubleVar(value=1.0)
         self.var_lead_guard = tk.BooleanVar(value=False)
+        self.var_noise_only = tk.BooleanVar(value=False)
         self.var_denoise_only = tk.BooleanVar(value=True)
         self.var_diag_minimal = tk.BooleanVar(value=True)
         self.var_device = tk.StringVar(value='cuda')
         self.var_disable_blend = tk.BooleanVar(value=False)
         self.var_bleed_gate = tk.BooleanVar(value=False)
+        self.var_recursive_folders = tk.BooleanVar(value=True)
+        self.var_output_dir = tk.StringVar(value="")
+        self.var_output_media_clean = tk.BooleanVar(value=True)
+        self.var_reduce_gpu = tk.BooleanVar(value=True)
+
+        folder_opts = ttk.Frame(left)
+        folder_opts.pack(fill='x', pady=(0, 6))
+        ttk.Checkbutton(
+            folder_opts,
+            text='Search subfolders when adding folders',
+            variable=self.var_recursive_folders,
+            style='Opt.TCheckbutton',
+        ).pack(anchor='w')
+
+        out_box = ttk.Frame(left)
+        out_box.pack(fill='x', pady=(0, 8))
+        ttk.Label(out_box, text='Output folder (optional):', style='Info.TLabel').pack(anchor='w')
+        out_row = ttk.Frame(out_box)
+        out_row.pack(fill='x', pady=(2, 0))
+        out_entry = ttk.Entry(out_row, textvariable=self.var_output_dir)
+        out_entry.pack(side='left', fill='x', expand=True)
+        btn_out = ttk.Button(out_row, text='Browse', command=self._choose_output_dir)
+        btn_out.pack(side='left', padx=4)
+        self._bind_hover(btn_out)
+        btn_out_clear = ttk.Button(out_row, text='Clear', command=self._clear_output_dir)
+        btn_out_clear.pack(side='left')
+        self._bind_hover(btn_out_clear)
+        self._output_dir_widgets = (out_entry, btn_out, btn_out_clear)
+        ttk.Checkbutton(
+            out_box,
+            text='Output to 01_MEDIA\\030_AUDIO_CLEAN (per parent)',
+            variable=self.var_output_media_clean,
+            style='Opt.TCheckbutton',
+            command=self._toggle_media_clean_output,
+        ).pack(anchor='w', pady=(4, 0))
+        self._toggle_media_clean_output()
 
         # Diagnostics mode notice (advanced controls disabled)
         diag_box = ttk.Frame(left)
@@ -1027,6 +1365,30 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             text='Reduce mic bleed (experimental)',
             variable=self.var_bleed_gate,
             style='Opt.TCheckbutton'
+        ).pack(anchor='w')
+        noise_box = ttk.Frame(left)
+        noise_box.pack(fill='x', pady=(0, 6))
+        ttk.Checkbutton(
+            noise_box,
+            text='Output background/noise only (invert denoise)',
+            variable=self.var_noise_only,
+            style='Opt.TCheckbutton'
+        ).pack(anchor='w')
+        gpu_box = ttk.Frame(left)
+        gpu_box.pack(fill='x', pady=(0, 6))
+        ttk.Checkbutton(
+            gpu_box,
+            text='Reduce GPU pressure (slower)',
+            variable=self.var_reduce_gpu,
+            style='Opt.TCheckbutton'
+        ).pack(anchor='w')
+        sync_box = ttk.Frame(left)
+        sync_box.pack(fill='x', pady=(0, 6))
+        ttk.Checkbutton(
+            sync_box,
+            text='Sync takes and export multichannel\n(uncheck for cleanup-only per file)',
+            variable=self.var_sync_export,
+            style='Opt.TCheckbutton',
         ).pack(anchor='w')
         self._adv_open = False
         self._adv_wrap = None
@@ -1119,10 +1481,12 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             src = self._drag_iid
             self._drag_iid = None
             if not src or self.status_filter_var.get() != 'All':
-                _drag_cleanup(); return
+                _drag_cleanup()
+                return
             dst = self.queue_tree.identify_row(e.y)
             if not dst or dst == src:
-                _drag_cleanup(); return
+                _drag_cleanup()
+                return
             # Determine types
             spath = self._iid_to_path.get(src)
             sfolder = self._iid_to_folder.get(src)
@@ -1366,6 +1730,30 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self._add_paths([folder])
         self._enable_run()
 
+    def _choose_output_dir(self):
+        folder = filedialog.askdirectory(title="Select output folder")
+        if not folder:
+            return
+        self.var_output_dir.set(folder)
+        try:
+            if self.var_output_media_clean.get():
+                self.var_output_media_clean.set(False)
+                self._toggle_media_clean_output()
+        except Exception:
+            pass
+
+    def _clear_output_dir(self):
+        self.var_output_dir.set("")
+
+    def _toggle_media_clean_output(self):
+        enabled = bool(self.var_output_media_clean.get())
+        state = "disabled" if enabled else "normal"
+        try:
+            for w in getattr(self, "_output_dir_widgets", ()):
+                w.configure(state=state)
+        except Exception:
+            pass
+
     def clear_files(self):
         self.files.clear()
         try:
@@ -1398,10 +1786,16 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 os.environ['RESEMBLE_WET'] = str(max(0.0, min(1.0, float(self.var_wet.get()))))
             except Exception:
                 pass
+            os.environ['RESEMBLE_NOISE_ONLY'] = '1' if self.var_noise_only.get() else '0'
             aggr = self.var_aggressive_denoise.get() or self.var_diag_minimal.get()
             os.environ['RESEMBLE_DENOISE_AGGRESSIVE'] = '1' if aggr else '0'
         except Exception:
             pass
+        noise_only_flag = False
+        try:
+            noise_only_flag = os.environ.get('RESEMBLE_NOISE_ONLY', '0') == '1'
+        except Exception:
+            noise_only_flag = False
 
         # Load source and slice segment
         wav, sr = torchaudio.load(str(src_path))
@@ -1447,11 +1841,28 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
 
         # Resample for profile (48k) if on
         dest_sr = 48000 if self.var_profile.get() else sr
-        base = wav
         if model_sr != dest_sr:
             hwav = ta_resample(hwav, orig_freq=model_sr, new_freq=dest_sr)
-        if dest_sr != sr:
-            base = ta_resample(base, orig_freq=sr, new_freq=dest_sr)
+        exp_len = round(wav.shape[-1] * (dest_sr / sr)) if dest_sr != sr else wav.shape[-1]
+        if hwav.shape[-1] > exp_len:
+            hwav = hwav[:exp_len]
+        elif hwav.shape[-1] < exp_len:
+            import torch
+            hwav = torch.nn.functional.pad(hwav, (0, exp_len - hwav.shape[-1]))
+        try:
+            base = wav
+            if dest_sr != sr:
+                base = ta_resample(base, orig_freq=sr, new_freq=dest_sr)
+        except Exception:
+            base = wav
+        try:
+            if base.shape[-1] > exp_len:
+                base = base[:exp_len]
+            elif base.shape[-1] < exp_len:
+                import torch as _t
+                base = _t.nn.functional.pad(base, (0, exp_len - base.shape[-1]))
+        except Exception:
+            pass
 
         # Wet/dry mix
         try:
@@ -1461,6 +1872,8 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         wet = max(0.0, min(1.0, wet))
         if wet < 1.0:
             hwav = wet * hwav + (1.0 - wet) * base
+        if noise_only_flag:
+            hwav = base - hwav
 
         # Peak ceiling
         hwav = _apply_peak_ceiling(hwav, ceiling_db=-1.0)
@@ -1582,23 +1995,55 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         def _is_audio(path: str) -> bool:
             suf = Path(path).suffix.lower()
             return suf in {'.wav', '.wave', '.mp3'}
+        file_set = set(self.files)
+        skipped_existing = 0
         for p in paths:
             p = str(p)
             try:
                 if Path(p).is_dir():
-                    self.folders.add(p)
-                    # Collect audio files directly under this folder (non-recursive)
-                    for f in sorted(Path(p).iterdir()):
-                        if f.is_file() and _is_audio(str(f)):
-                            sfp = str(f)
-                            if sfp not in self.files:
-                                self.files.append(sfp)
+                    found_any = False
+                    if self.var_recursive_folders.get():
+                        # Collect audio files under all subfolders
+                        for root, _dirs, files in os.walk(p):
+                            for name in files:
+                                if not _is_audio(name):
+                                    continue
+                                sfp = str(Path(root) / name)
+                                if self._has_existing_clean_output(sfp):
+                                    skipped_existing += 1
+                                    continue
+                                if sfp not in file_set:
+                                    file_set.add(sfp)
+                                    self.files.append(sfp)
+                                    found_any = True
+                    else:
+                        # Collect audio files directly under this folder (non-recursive)
+                        for f in sorted(Path(p).iterdir()):
+                            if f.is_file() and _is_audio(str(f)):
+                                sfp = str(f)
+                                if self._has_existing_clean_output(sfp):
+                                    skipped_existing += 1
+                                    continue
+                                if sfp not in file_set:
+                                    file_set.add(sfp)
+                                    self.files.append(sfp)
+                                    found_any = True
+                    if found_any:
+                        self.folders.add(p)
                     continue
             except Exception:
                 pass
             if _is_audio(p) and p not in self.files:
+                if self._has_existing_clean_output(p):
+                    skipped_existing += 1
+                    continue
                 self.files.append(p)
                 self.file_status[p] = self.file_status.get(p, 'queued')
+        if skipped_existing:
+            try:
+                self._log(f"Skipped {skipped_existing} file(s) already CLEAN in 01_MEDIA\\030_AUDIO_CLEAN.")
+            except Exception:
+                pass
         self._refresh_queue_tree()
 
     def _enable_run(self):
@@ -1618,6 +2063,10 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self._path_to_iid.clear()
         self._iid_to_folder.clear()
         self._folder_to_iid.clear()
+        try:
+            self.folders = {d for d in self.folders if any(str(Path(f).parent) == d for f in self.files)}
+        except Exception:
+            pass
         groups: dict[str, list[str]] = {}
         for fp in self.files:
             parent = str(Path(fp).parent)
@@ -1732,17 +2181,38 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         except Exception:
             pass
 
-    def _log(self, msg):
+    def _log(self, msg, color: str | None = None):
         try:
-            self.status_label["text"] = str(msg)
+            self.status_label.configure(text=str(msg), foreground=(color or self._text))
         except Exception:
             pass
 
     def _log_clear(self):
         try:
-            self.status_label["text"] = ''
+            self.status_label.configure(text='', foreground=self._text)
         except Exception:
             pass
+
+    def _get_media_clean_dir(self, src_path: str | Path) -> Path | None:
+        try:
+            return _find_media_clean_dir(Path(src_path))
+        except Exception:
+            return None
+
+    def _has_existing_clean_output(self, src_path: str | Path) -> bool:
+        try:
+            return _has_clean_output_in_media(Path(src_path))
+        except Exception:
+            return False
+
+    def _get_output_override(self) -> str | None:
+        try:
+            if bool(self.var_output_media_clean.get()):
+                return None
+            val = (self.var_output_dir.get() or "").strip()
+            return val if val else None
+        except Exception:
+            return None
 
     def _snapshot_run_config(self, chunk_seconds: float, overlap_seconds: float) -> dict:
         try:
@@ -1764,6 +2234,10 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             "bw64_export": bool(self.var_bw64.get()),
             "batch_by_folder": bool(self.var_batch_folders.get()),
             "lead_guard": bool(self.var_lead_guard.get()),
+            "noise_only_output": bool(self.var_noise_only.get()),
+            "output_override_dir": self._get_output_override() or "",
+            "output_media_clean": bool(self.var_output_media_clean.get()),
+            "recursive_folder_search": bool(self.var_recursive_folders.get()),
             "skip_fine_requested": skip_req,
             "skip_fine_effective": bool(skip_req and not diag),
             "force_fine_align": bool(diag),
@@ -1805,7 +2279,9 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             log_path = log_dir / f"run_flags_{stamp}.json"
             log_path.write_text(json.dumps(payload, indent=2))
-            self.after(0, lambda p=log_path: self._log(f"Run diagnostics log saved: {p}"))
+            status = (snapshot or {}).get("run_status")
+            if status == "completed":
+                self.after(0, lambda: self._log("Run completed successfully.", color=self._success))
         except Exception as exc:  # noqa: BLE001
             try:
                 self.after(0, lambda exc=exc: self._log(f"Run log error: {exc}"))
@@ -1814,7 +2290,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
 
     def _set_status(self, text: str):
         try:
-            self.status_label["text"] = text
+            self.status_label.configure(text=text, foreground=self._text)
         except Exception:
             pass
 
@@ -1993,11 +2469,18 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
 
         def worker():
             run_snapshot = None
+            staging_root = None
             processed_groups = 0
             try:
+                # Clean up temp audio/log artifacts from prior runs
+                _cleanup_run_artifacts(remove_logs=True)
                 # Reset status
                 self.after(0, lambda: self._set_status('Ready'))
                 self.after(0, lambda: self._log("Launching enhancer..."))
+                do_sync = bool(self.var_sync_export.get())
+                if not do_sync:
+                    self.after(0, lambda: self._log("Cleanup-only mode: skipping sync/export; writing one output per file."))
+                media_clean = bool(self.var_output_media_clean.get())
                 # Export run-time env so processing respects GUI settings
                 try:
                     cs = max(1.0, float(self.var_chunk_sec.get()))
@@ -2012,6 +2495,8 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         os.environ['RESEMBLE_WET'] = str(max(0.0, min(1.0, float(self.var_wet.get()))))
                     except Exception:
                         pass
+                    os.environ['RESEMBLE_NOISE_ONLY'] = '1' if self.var_noise_only.get() else '0'
+                    os.environ[OUTPUT_MEDIA_CLEAN_ENV] = '1' if media_clean else '0'
                     os.environ['RESEMBLE_LEAD_GUARD'] = '1' if self.var_lead_guard.get() else '0'
                     aggr = self.var_aggressive_denoise.get() or self.var_diag_minimal.get()
                     os.environ['RESEMBLE_DENOISE_AGGRESSIVE'] = '1' if aggr else '0'
@@ -2027,10 +2512,45 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         os.environ['RESEMBLE_WET'] = '1.0'
                 except Exception:
                     pass
-                # Build groups: batch by folder or single group
+                output_override = self._get_output_override()
+                if output_override:
+                    try:
+                        Path(output_override).mkdir(parents=True, exist_ok=True)
+                    except Exception as exc:
+                        self.after(0, lambda exc=exc: self._log(f"Output folder error: {exc}"))
+                        output_override = None
+                if do_sync:
+                    try:
+                        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        staging_root = INPUT_TMP_ROOT / "staging" / f"{stamp}_{uuid.uuid4().hex[:6]}"
+                        staging_root.mkdir(parents=True, exist_ok=True)
+                    except Exception as exc:
+                        self.after(0, lambda exc=exc: self._log(f"Staging folder error: {exc}"))
+                        staging_root = None
+                # Build groups: always batch by folder when recursive search is enabled
                 files_all = list(self.files)
+                # Skip files already cleaned in 01_MEDIA\\030_AUDIO_CLEAN for that folder
+                if files_all:
+                    skipped = []
+                    kept = []
+                    for fp in files_all:
+                        if self._has_existing_clean_output(fp):
+                            skipped.append(fp)
+                            try:
+                                self.after(0, self._set_file_status, fp, 'done')
+                            except Exception:
+                                pass
+                        else:
+                            kept.append(fp)
+                    if skipped:
+                        self.after(0, lambda n=len(skipped): self._log(f"Skipped {n} file(s) with existing CLEAN output in 01_MEDIA\\030_AUDIO_CLEAN."))
+                    files_all = kept
+                    if not files_all:
+                        self.after(0, lambda: self._log("All selected files already have CLEAN outputs; nothing to process."))
+                        return
                 groups: list[tuple[str, list[str]]] = []
-                if self.var_batch_folders.get():
+                batch_by_folder = bool(self.var_batch_folders.get()) or bool(self.var_recursive_folders.get())
+                if batch_by_folder:
                     by_parent: dict[str, list[str]] = {}
                     for fp in files_all:
                         parent = str(Path(fp).parent)
@@ -2043,6 +2563,28 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 for gi, (gname, gfiles) in enumerate(groups, start=1):
                     if not gfiles:
                         continue
+                    group_media_clean_dir = None
+                    if media_clean:
+                        group_media_clean_dir = self._get_media_clean_dir(gfiles[0])
+                        if group_media_clean_dir is not None:
+                            try:
+                                group_media_clean_dir.mkdir(parents=True, exist_ok=True)
+                            except Exception as exc:
+                                self.after(0, lambda exc=exc: self._log(f"Output folder error: {exc}"))
+                                group_media_clean_dir = None
+                    group_output_dir = output_override
+                    group_do_sync = bool(do_sync and len(gfiles) > 1)
+                    if group_do_sync:
+                        if staging_root is not None:
+                            group_output_dir = str(staging_root / f"group_{gi}")
+                            try:
+                                Path(group_output_dir).mkdir(parents=True, exist_ok=True)
+                            except Exception:
+                                group_output_dir = None
+                        else:
+                            group_output_dir = None
+                        if group_output_dir is None:
+                            self.after(0, lambda: self._log("Staging failed; outputs will not be written to output folder."))
                     self._group_done = 0
                     self._group_total = len(gfiles)
                     self._group_start_time = time.time()
@@ -2060,6 +2602,12 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                     use_files = list(gfiles)
 
                     # Enhance this group
+                    prefer_cli = (self.var_diag_minimal.get() or (not self.var_denoise_only.get()))
+                    if self.var_noise_only.get():
+                        prefer_cli = False
+                    reduce_gpu = bool(self.var_reduce_gpu.get()) and str(self.var_device.get()).lower() == "cuda"
+                    if reduce_gpu:
+                        prefer_cli = False
                     results = run_enhancer_for(
                         use_files,
                         device=self.var_device.get(),
@@ -2067,9 +2615,12 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         progress_cb=lambda d, t: self.after(0, update_prog_group, d, t),
                         chunk_progress_cb=lambda name, i, n: self.after(0, update_chunk, name, i, n),
                         seam_safe=self.var_seam_safe.get(),
-                        control=(None if self.var_diag_minimal.get() else self._control),
+                        control=(self._control if reduce_gpu else (None if self.var_diag_minimal.get() else self._control)),
                         denoise_only=self.var_denoise_only.get(),
-                        prefer_cli=(self.var_diag_minimal.get() or (not self.var_denoise_only.get())),
+                        prefer_cli=prefer_cli,
+                        noise_only=self.var_noise_only.get(),
+                        output_dir=group_output_dir,
+                        force_inprocess=reduce_gpu,
                     )
                     self.after(0, lambda gi=gi: self._log(f"Group {gi}: enhanced {len(results)} file(s)."))
                     # Mark final statuses for this group
@@ -2086,7 +2637,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                     processed_groups = gi
                     if self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set():
                         break
-                    if not self.var_sync_export.get():
+                    if not group_do_sync:
                         self.after(0, lambda results=results: self._append_history(results))
 
                     # Post-processing per group
@@ -2101,7 +2652,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                 self._set_status(f"{msg} - {pct}%")
                                 if self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set():
                                     raise _Cancelled()
-                            _postprocess_level_brighten(outs, progress_cb=lambda i, n, m: self.after(0, pp_prog, i, n, m))
+                            _postprocess_level_shape(outs, progress_cb=lambda i, n, m: self.after(0, pp_prog, i, n, m))
                             self.after(0, lambda: self._log("Level + brighten applied."))
                         except Exception as e:
                             if not isinstance(e, _Cancelled):
@@ -2110,7 +2661,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                             break
 
                     # Sync + export per group
-                    if self.var_sync_export.get() and results:
+                    if group_do_sync and results:
                         try:
                             self.after(0, lambda: self._set_status('Preparing sync'))
                             self.after(0, lambda: self._log("Syncing with Audalign and exporting multichannel..."))
@@ -2142,7 +2693,8 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                 progress_cb=lambda i, n, m: self.after(0, stage_prog, i, n, m),
                                 wav_only=False,
                                 use_bw64=self.var_bw64.get(),
-                                out_base_dir=gname,
+                                out_base_dir=(str(group_media_clean_dir) if group_media_clean_dir else (output_override or gname)),
+                                flat_output=bool(output_override or group_media_clean_dir),
                                 enable_bleed_gate=self.var_bleed_gate.get(),
                             )
                             if out_path:
@@ -2157,6 +2709,21 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                 label = f"Multichannel ({ch} ch)" if ch else "Multichannel"
                                 self.after(0, lambda: self._append_history([(gname, out_path)]))
                                 self.after(0, lambda: self._log(f"Group {gi}: multichannel export written: {out_path}"))
+                                # Remove per-file outputs when a multichannel export is produced
+                                if group_do_sync and group_output_dir:
+                                    try:
+                                        shutil.rmtree(group_output_dir, ignore_errors=True)
+                                    except Exception:
+                                        pass
+                                else:
+                                    try:
+                                        for _src, out in results:
+                                            try:
+                                                Path(out).unlink(missing_ok=True)
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
                             else:
                                 self.after(0, lambda: self._log("Multichannel export failed: no output produced"))
                         except Exception as e:
@@ -2183,7 +2750,14 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                     run_snapshot["run_status"] = f"error: {e}"
                 self.after(0, lambda e=e: self._log(f"Error: {e}"))
             finally:
+                try:
+                    if staging_root is not None:
+                        shutil.rmtree(staging_root, ignore_errors=True)
+                except Exception:
+                    pass
                 self._write_run_flag_log(run_snapshot)
+                # Always clean temp artifacts after each run
+                _cleanup_run_artifacts(remove_logs=True)
                 def _reset():
                     self.run_btn.config(state="normal")
                     self.pause_btn.config(state="disabled")
@@ -2222,6 +2796,7 @@ def _sync_and_export_multichannel_simple(
     wav_only: bool = False,
     use_bw64: bool = True,
     out_base_dir: str | None = None,
+    flat_output: bool = False,
     enable_bleed_gate: bool = False,
 ) -> str | None:
     """Simplified Audalign-based alignment and multichannel export.
@@ -2270,13 +2845,18 @@ def _sync_and_export_multichannel_simple(
         base_dir = Path(out_base_dir)
     else:
         base_dir = first_parent.parent if first_parent.name.startswith('Enhanced_') else first_parent
-    final_dir = base_dir / f"Synced_{stamp}"
-    final_dir.mkdir(parents=True, exist_ok=True)
+    if flat_output and out_base_dir:
+        base_dir.mkdir(parents=True, exist_ok=True)
+        final_dir = base_dir
+    else:
+        final_dir = base_dir / f"Synced_{stamp}"
+        final_dir.mkdir(parents=True, exist_ok=True)
 
     def _abort(reason: str) -> None:
         _emit(reason, force_console=True)
         try:
-            shutil.rmtree(final_dir, ignore_errors=True)
+            if not (flat_output and out_base_dir):
+                shutil.rmtree(final_dir, ignore_errors=True)
         except Exception:
             pass
         return None
@@ -2415,7 +2995,7 @@ def _sync_and_export_multichannel_simple(
 
     multich = torch.cat(chan_tensors, dim=0)
     n_ch = int(multich.size(0))
-    out_wav = final_dir / f"Synced_Multichannel_{stamp}.wav"
+    out_wav = final_dir / f"CLEAN_Synced_Multichannel_{stamp}.wav"
     multich = _apply_peak_ceiling(multich, ceiling_db=-1.0)
     torchaudio.save(str(out_wav), multich, target_sr)
 
@@ -2425,7 +3005,7 @@ def _sync_and_export_multichannel_simple(
     try:
         ff = shutil.which('ffmpeg') or shutil.which('ffmpeg.exe')
         if ff and not wav_only:
-            out_mov = final_dir / f"Synced_Multichannel_{stamp}.mov"
+            out_mov = final_dir / f"CLEAN_Synced_Multichannel_{stamp}.mov"
             if n_ch == 2:
                 filt = "[0:a]channelsplit=channel_layout=stereo[L][R]"
                 cmd = [
@@ -2831,87 +3411,63 @@ def _seam_smooth_files(paths: list[str], progress_cb=None) -> None:
     
 
 
-def _postprocess_level_brighten(paths: list[str], target_lufs: float = -16.0, range_min: float = -20.0, range_max: float = -14.0, progress_cb=None) -> None:
-    """Simple, safe loudness normalization with gentle brightening.
-
-    Steps per file:
-    - Convert to float32, remove DC (HPF 20 Hz)
-    - Apply gentle high-mid/air peaking boosts (+1.0 dB @3.5 kHz, +0.8 dB @8 kHz)
-    - Compute single uniform gain based on RMS target and peak ceiling
-      gain = min(target_rms / rms, ceiling / peak), capped to +4 dB max
-    - Apply gain and save
-    """
-    import math
+def _postprocess_level_shape(paths: list[str], target_rms_db: float = -16.0, max_boost_db: float = 8.0, progress_cb=None) -> None:
+    """Raise average level with presence lift and a soft limiter."""
     import torchaudio
     import torch
-    try:
-        import pyloudnorm as pyln
-    except Exception:
-        pyln = None
+    from torchaudio.functional import highpass_biquad, equalizer_biquad
 
-    from torchaudio.functional import equalizer_biquad, highpass_biquad
-
-    # Targets
-    ceiling_db = -6.0
-    ceiling = 10 ** (ceiling_db / 20.0)
-    target_rms_db = -16.0
     target_rms = 10 ** (target_rms_db / 20.0)
-    max_boost_db = 4.0
     max_boost = 10 ** (max_boost_db / 20.0)
+    ceiling_db = -1.0
+    ceiling = 10 ** (ceiling_db / 20.0)
+
+    def _presence_shaper(wav, sr):
+        try:
+            shaped = highpass_biquad(wav, sr, cutoff_freq=30.0, Q=0.707)
+            shaped = equalizer_biquad(shaped, sr, center_freq=3200.0, gain=2.0, Q=0.9)
+            shaped = equalizer_biquad(shaped, sr, center_freq=7500.0, gain=1.5, Q=0.8)
+            return shaped
+        except Exception:
+            return wav
+
+    def _soft_limiter_tensor(wav):
+        thr = 10 ** (-1.2 / 20.0)  # closer to ceiling for more loudness
+        knee = 0.3  # amount of transition (linear)
+        absw = torch.abs(wav)
+        over = absw > thr
+        if not torch.any(over):
+            return wav
+        out = wav.clone()
+        excess = absw[over] - thr
+        comp = thr + (excess / (1.0 + (excess / max(knee, 1e-6))))
+        out[over] = torch.sign(out[over]) * torch.clamp(comp, max=0.999)
+        return out
 
     total = max(1, len(paths))
-    for idx, p in enumerate(paths, start=1):
+    for idx, path in enumerate(paths, start=1):
         if progress_cb:
-            progress_cb(idx-1, total, f'Post process {idx}/{total}')
-        wav, sr = torchaudio.load(str(p))
+            progress_cb(idx - 1, total, f'Loudness {idx}/{total}')
+        wav, sr = torchaudio.load(str(path))
         if wav.dtype != torch.float32:
             wav = wav.to(torch.float32)
-        # DC removal
-        try:
-            wav = highpass_biquad(wav, sr, cutoff_freq=20.0, Q=0.707)
-        except Exception:
-            pass
-        # Gentle brightening
-        try:
-            wav = equalizer_biquad(wav, sr, center_freq=3500.0, gain=1.0, Q=0.707)
-            wav = equalizer_biquad(wav, sr, center_freq=8000.0, gain=0.8, Q=0.707)
-        except Exception:
-            pass
+        wav = _presence_shaper(wav, sr)
 
-        # Reference loudness (mono mix)
         mono = wav.mean(0) if wav.dim() == 2 else wav
         rms = float(torch.sqrt(torch.mean(mono * mono) + 1e-12))
         peak = float(torch.max(torch.abs(wav)))
-
-        # Optional LUFS correction for short clips only
-        dur = float(wav.size(-1)) / float(sr or 1)
-        if pyln is not None and dur <= 60.0:
-            try:
-                meter = pyln.Meter(sr)
-                lufs = float(meter.integrated_loudness(mono.numpy()))
-                if not (range_min <= lufs <= range_max):
-                    # convert LUFS delta to linear scale and cap
-                    gain_db = max(-6.0, min(4.0, target_lufs - lufs))
-                    wav = wav * float(10 ** (gain_db / 20.0))
-                    mono = wav.mean(0) if wav.dim() == 2 else wav
-                    rms = float(torch.sqrt(torch.mean(mono * mono) + 1e-12))
-                    peak = float(torch.max(torch.abs(wav)))
-            except Exception:
-                pass
-
-        # Single safe gain
-        gain_rms = target_rms / max(rms, 1e-9)
-        gain_peak = ceiling / max(peak, 1e-9)
+        gain_rms = target_rms / max(rms, 1e-9) if rms > 0 else 1.0
+        gain_peak = ceiling / max(peak, 1e-9) if peak > 0 else max_boost
         gain = min(gain_rms, gain_peak, max_boost)
-        if gain <= 0:
-            gain = 1.0
         wav = wav * float(gain)
 
-        if progress_cb:
-            progress_cb(idx, total, f'Post process {idx}/{total}')
+        wav = _soft_limiter_tensor(wav)
+        wav = _apply_peak_ceiling(wav, ceiling_db=ceiling_db)
 
-        wav = _apply_peak_ceiling(wav, ceiling_db=-1.0)
-        torchaudio.save(str(p), wav, sr)
+        if progress_cb:
+            progress_cb(idx, total, f'Loudness {idx}/{total}')
+
+        torchaudio.save(str(path), wav, sr)
 
 
 if __name__ == "__main__":
