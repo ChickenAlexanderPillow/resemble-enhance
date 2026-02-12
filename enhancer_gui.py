@@ -939,6 +939,21 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
                 kwargs['overlap_seconds'] = float(min(ov, max_ov))
         except Exception:
             pass
+        if denoise_only:
+            # Denoise-only safety profile:
+            # 1) disable cross-chunk alignment shifts (can create doubling/echo feel)
+            # 2) use larger chunks + overlap for smoother seams
+            cs_cur = float(kwargs.get("chunk_seconds", 31.0))
+            ov_cur = float(kwargs.get("overlap_seconds", 1.0))
+            cs_safe = max(45.0, cs_cur)
+            ov_safe = max(2.5, ov_cur)
+            ov_safe = min(ov_safe, cs_safe / 4.0)
+            kwargs.update(
+                chunk_seconds=cs_safe,
+                overlap_seconds=ov_safe,
+                align_disable=True,
+                align_max_shift_ratio=0.0,
+            )
         # Force single-chunk mode via env for diagnostics
         try:
             if os.environ.get("RESEMBLE_FORCE_SINGLE_CHUNK", "0") == "1":
@@ -1228,6 +1243,18 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
         cs = os.environ.get('RESEMBLE_CHUNK_SECONDS', '31.0') or '31.0'
         ov = os.environ.get('RESEMBLE_OVERLAP_SECONDS', '1.0') or '1.0'
         cmd += ["--align_disable", "--chunk_seconds", str(cs), "--overlap_seconds", str(ov)]
+    if denoise_only:
+        # Denoise-only safety profile for CLI path (same intent as in-process path).
+        try:
+            cs_eff = max(45.0, float(cs))
+        except Exception:
+            cs_eff = 45.0
+        try:
+            ov_eff = max(2.5, float(ov))
+        except Exception:
+            ov_eff = 2.5
+        ov_eff = min(ov_eff, cs_eff / 4.0)
+        cmd += ["--align_disable", "--chunk_seconds", str(cs_eff), "--overlap_seconds", str(ov_eff), "--align_max_shift_ratio", "0.0"]
 
     # Launch process
     creationflags = 0
@@ -2168,6 +2195,11 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             kwargs = dict(chunk_seconds=float(os.environ.get('RESEMBLE_CHUNK_SECONDS', '60.0') or 60.0), overlap_seconds=float(os.environ.get('RESEMBLE_OVERLAP_SECONDS', '4.0') or 4.0), align_max_shift_ratio=0.05, align_disable=False)
         else:
             kwargs = dict(chunk_seconds=float(os.environ.get('RESEMBLE_CHUNK_SECONDS', '31.0') or 31.0), overlap_seconds=float(os.environ.get('RESEMBLE_OVERLAP_SECONDS', '1.0') or 1.0), align_max_shift_ratio=0.25, align_disable=True)
+        if self.var_denoise_only.get():
+            cs_safe = max(45.0, float(kwargs.get("chunk_seconds", 31.0)))
+            ov_safe = max(2.5, float(kwargs.get("overlap_seconds", 1.0)))
+            ov_safe = min(ov_safe, cs_safe / 4.0)
+            kwargs.update(chunk_seconds=cs_safe, overlap_seconds=ov_safe, align_max_shift_ratio=0.0, align_disable=True)
         device = 'cuda'
         try:
             hwav, model_sr = denoise(dwav=wav, sr=sr, device=device, run_dir=run_dir, **kwargs)
