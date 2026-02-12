@@ -26,6 +26,24 @@ def _si_sdr_db(pred: Tensor, target: Tensor, eps: float = 1e-8) -> Tensor:
     return 10.0 * torch.log10(ratio + eps)
 
 
+def _vad_weighted_l1(pred: Tensor, target: Tensor, margin_db: float, speech_boost: float, eps: float = 1e-8) -> Tensor:
+    """Energy-adaptive VAD weighting so speech frames drive denoiser optimization harder."""
+    # Smooth short-term envelope (~20 ms at 44.1k).
+    k = 883
+    env = F.avg_pool1d(target.abs().unsqueeze(1), kernel_size=k, stride=1, padding=k // 2).squeeze(1)
+    env_db = 20.0 * torch.log10(env + eps)
+    try:
+        floor_db = torch.quantile(env_db.detach(), 0.2, dim=-1, keepdim=True)
+    except Exception:
+        vals, _ = torch.sort(env_db.detach(), dim=-1)
+        idx = int(max(0, min(vals.size(-1) - 1, round(0.2 * (vals.size(-1) - 1)))))
+        floor_db = vals[:, idx : idx + 1]
+    speech = env_db > (floor_db + float(margin_db))
+    weights = 1.0 + float(speech_boost) * speech.float()
+    err = (pred - target).abs()
+    return (err * weights).sum() / torch.clamp(weights.sum(), min=1.0)
+
+
 class Denoiser(nn.Module):
     @property
     def stft_cfg(self) -> dict:
@@ -188,7 +206,12 @@ class Denoiser(nn.Module):
         o = F.pad(o, (0, npad))
 
         if y is not None:
-            l1 = F.l1_loss(o, y)
+            l1 = _vad_weighted_l1(
+                o,
+                y,
+                margin_db=float(self.hp.denoiser_vad_margin_db),
+                speech_boost=float(self.hp.denoiser_vad_speech_boost),
+            )
             mr = self.mrstft(o, y)
             sisdr_db = _si_sdr_db(o, y)
             sisdr_loss = torch.relu(self.hp.denoiser_sisdr_target_db - sisdr_db).mean() / max(

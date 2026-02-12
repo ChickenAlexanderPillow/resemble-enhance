@@ -416,6 +416,7 @@ class _BleedGateConfig:
     hard_mute_attack_ms: float = 8.0
     hard_mute_release_ms: float = 45.0
     hard_open_pad_ms: float = 12.0
+    hard_open_hold_ms: float = 95.0
 
     @classmethod
     def from_env(cls) -> "_BleedGateConfig":
@@ -443,6 +444,7 @@ class _BleedGateConfig:
         cfg.hard_mute_attack_ms = max(0.5, _env_float("RESEMBLE_BLEED_HARD_MUTE_ATTACK_MS", cfg.hard_mute_attack_ms))
         cfg.hard_mute_release_ms = max(2.0, _env_float("RESEMBLE_BLEED_HARD_MUTE_RELEASE_MS", cfg.hard_mute_release_ms))
         cfg.hard_open_pad_ms = max(0.0, _env_float("RESEMBLE_BLEED_HARD_OPEN_PAD_MS", cfg.hard_open_pad_ms))
+        cfg.hard_open_hold_ms = max(0.0, _env_float("RESEMBLE_BLEED_HARD_OPEN_HOLD_MS", cfg.hard_open_hold_ms))
         return cfg
 
 
@@ -698,6 +700,19 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
                     padding=pad_frames,
                 ).squeeze()
                 open_mask = dil > 0.0
+            hold_frames = max(0, int(round(cfg.hard_open_hold_ms / max(1e-3, hop_ms))))
+            if hold_frames > 0 and open_mask.numel() > 1:
+                # Keep a channel open briefly after it wins to avoid choppy reaction words.
+                held = open_mask.clone()
+                hold_left = 0
+                for t in range(int(open_mask.numel())):
+                    if bool(open_mask[t].item()):
+                        hold_left = hold_frames
+                        held[t] = True
+                    elif hold_left > 0:
+                        held[t] = True
+                        hold_left -= 1
+                open_mask = held
             g = torch.where(open_mask, torch.ones_like(conf), torch.zeros_like(conf))
             # De-click hard transitions without re-opening bleed materially.
             g = _smooth_gain_envelope(
@@ -1627,7 +1642,6 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self.var_diag_minimal = tk.BooleanVar(value=True)
         self.var_device = tk.StringVar(value='cuda')
         self.var_disable_blend = tk.BooleanVar(value=False)
-        self.var_bleed_gate = tk.BooleanVar(value=False)
         self.var_recursive_folders = tk.BooleanVar(value=True)
         self.var_output_dir = tk.StringVar(value="")
         self.var_output_media_clean = tk.BooleanVar(value=True)
@@ -1669,14 +1683,6 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         diag_box = ttk.Frame(left)
         diag_box.pack(fill='x', pady=(4, 6))
         ttk.Label(diag_box, text='Diagnostics alignment mode is locked. Advanced options are temporarily removed.', wraplength=260, justify='left').pack(fill='x')
-        bleed_box = ttk.Frame(left)
-        bleed_box.pack(fill='x', pady=(0, 6))
-        ttk.Checkbutton(
-            bleed_box,
-            text='Reduce mic bleed (experimental)',
-            variable=self.var_bleed_gate,
-            style='Opt.TCheckbutton'
-        ).pack(anchor='w')
         noise_box = ttk.Frame(left)
         noise_box.pack(fill='x', pady=(0, 6))
         ttk.Checkbutton(
@@ -2997,6 +3003,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         try:
                             self.after(0, lambda: self._set_status('Preparing sync'))
                             self.after(0, lambda: self._log("Syncing with Audalign and exporting multichannel..."))
+                            self.after(0, lambda: self._log(f"Group {gi}: auto mic bleed enabled (tracks={len(gfiles)})."))
                             outs = [out for _, out in results]
                             # Deduplicate outputs in case an upstream retry produced duplicates
                             seen_paths = set()
@@ -3027,7 +3034,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                 use_bw64=self.var_bw64.get(),
                                 out_base_dir=(str(group_media_clean_dir) if group_media_clean_dir else (output_override or gname)),
                                 flat_output=bool(output_override or group_media_clean_dir),
-                                enable_bleed_gate=self.var_bleed_gate.get(),
+                                enable_bleed_gate=True,
                             )
                             if out_path:
                                 ch = 0
