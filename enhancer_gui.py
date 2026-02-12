@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -38,6 +39,17 @@ MIN_AUDIO_SAMPLES = 2048
 OUTPUT_MEDIA_CLEAN_ENV = "RESEMBLE_OUTPUT_MEDIA_CLEAN"
 MEDIA_ROOT_FOLDER = "01_MEDIA"
 MEDIA_CLEAN_FOLDER = "030_AUDIO_CLEAN"
+LAST_MODEL_SR: int | None = None
+LAST_MODEL_SR_PATH: str | None = None
+
+def _format_seconds(seconds: float) -> str:
+    try:
+        s = float(seconds)
+    except Exception:
+        return "n/a"
+    if s < 1.0:
+        return f"{s * 1000.0:.0f} ms"
+    return f"{s:.2f} s"
 
 def _find_media_clean_dir(src_path: Path) -> Path | None:
     try:
@@ -357,8 +369,64 @@ def _smooth_gain_envelope(env, attack_ms: float, release_ms: float, sr: int, hop
     return out
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+@dataclass
+class _BleedGateConfig:
+    win_ms: float = 25.0
+    hop_ms: float = 10.0
+    silence_db: float = -62.0
+    activity_db: float = 7.0
+    start_db: float = 3.0
+    full_db: float = 9.0
+    max_att_db: float = 24.0
+    min_att_db: float = 16.0
+    min_att_conf: float = 0.35
+    hold_ms: float = 120.0
+    switch_db: float = 2.5
+    overlap_margin_db: float = 2.0
+    attack_ms: float = 18.0
+    release_ms: float = 260.0
+    upsample_smooth_ms: float = 10.0
+    contender_frames: int = 3
+    score_smooth_frames: int = 3
+    lookahead_ms: float = 30.0
+    spectral_sim_low: float = 0.55
+    spectral_sim_high: float = 0.86
+    spectral_bleed_sim: float = 0.90
+
+    @classmethod
+    def from_env(cls) -> "_BleedGateConfig":
+        cfg = cls()
+        cfg.start_db = max(0.1, _env_float("RESEMBLE_BLEED_START_DB", cfg.start_db))
+        cfg.full_db = max(cfg.start_db + 0.25, _env_float("RESEMBLE_BLEED_FULL_DB", cfg.full_db))
+        cfg.max_att_db = max(1.0, _env_float("RESEMBLE_BLEED_MAX_ATT_DB", cfg.max_att_db))
+        cfg.min_att_db = max(0.0, _env_float("RESEMBLE_BLEED_MIN_ATT_DB", cfg.min_att_db))
+        cfg.min_att_conf = min(1.0, max(0.0, _env_float("RESEMBLE_BLEED_MIN_ATT_CONF", cfg.min_att_conf)))
+        cfg.hold_ms = max(0.0, _env_float("RESEMBLE_BLEED_HOLD_MS", cfg.hold_ms))
+        cfg.switch_db = max(0.0, _env_float("RESEMBLE_BLEED_SWITCH_DB", cfg.switch_db))
+        cfg.overlap_margin_db = max(0.0, _env_float("RESEMBLE_BLEED_OVERLAP_MARGIN_DB", cfg.overlap_margin_db))
+        cfg.attack_ms = max(2.0, _env_float("RESEMBLE_BLEED_ATTACK_MS", cfg.attack_ms))
+        cfg.release_ms = max(10.0, _env_float("RESEMBLE_BLEED_RELEASE_MS", cfg.release_ms))
+        cfg.contender_frames = max(1, int(round(_env_float("RESEMBLE_BLEED_CONTENDER_FRAMES", float(cfg.contender_frames)))))
+        cfg.score_smooth_frames = max(1, int(round(_env_float("RESEMBLE_BLEED_SCORE_SMOOTH_FRAMES", float(cfg.score_smooth_frames)))))
+        cfg.lookahead_ms = max(0.0, _env_float("RESEMBLE_BLEED_LOOKAHEAD_MS", cfg.lookahead_ms))
+        cfg.spectral_sim_low = min(0.99, max(0.0, _env_float("RESEMBLE_BLEED_SPECTRAL_SIM_LOW", cfg.spectral_sim_low)))
+        cfg.spectral_sim_high = min(0.999, max(cfg.spectral_sim_low + 1e-3, _env_float("RESEMBLE_BLEED_SPECTRAL_SIM_HIGH", cfg.spectral_sim_high)))
+        cfg.spectral_bleed_sim = min(0.999, max(cfg.spectral_sim_low, _env_float("RESEMBLE_BLEED_SPECTRAL_BLEED_SIM", cfg.spectral_bleed_sim)))
+        return cfg
+
+
 def _apply_bleed_gate(monos: list, sr: int) -> list:
-    """Attenuate bleed by gating quieter tracks relative to the loudest channel."""
+    """Attenuate bleed with confidence + hysteresis winner selection across N channels."""
     try:
         import torch
     except Exception:
@@ -377,12 +445,9 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
     if T <= 0:
         return monos
 
-    win_ms = 30.0
-    hop_ms = 12.0
-    silence_db = -60.0
-    # Winner-takes-all: if a mic is sufficiently quieter, attenuate it.
-    start_db = 4.0
-    max_att_db = 18.0
+    cfg = _BleedGateConfig.from_env()
+    win_ms = cfg.win_ms
+    hop_ms = cfg.hop_ms
 
     padded: list[torch.Tensor] = []
     for mono in monos:
@@ -404,32 +469,192 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
         except Exception:
             return _compute_rms_envelope(m, sr, win_ms=win_ms, hop_ms=hop_ms)
 
-    envs = [_compute_rms_envelope(m, sr, win_ms=win_ms, hop_ms=hop_ms) for m in padded]
+    def _forward_mean_1d(x: torch.Tensor, look: int) -> torch.Tensor:
+        if look <= 0 or x.numel() <= 1:
+            return x
+        n = int(x.numel())
+        csum = torch.cumsum(torch.cat([torch.zeros(1, dtype=x.dtype, device=x.device), x], dim=0), dim=0)
+        idx = torch.arange(n, device=x.device, dtype=torch.long)
+        end = torch.clamp(idx + look + 1, max=n)
+        den = (end - idx).to(x.dtype)
+        return (csum[end] - csum[idx]) / torch.clamp(den, min=1.0)
+
+    def _forward_mean_2d(x: torch.Tensor, look: int) -> torch.Tensor:
+        if look <= 0 or x.size(-1) <= 1:
+            return x
+        n = int(x.size(-1))
+        z = torch.zeros((x.size(0), 1), dtype=x.dtype, device=x.device)
+        csum = torch.cumsum(torch.cat([z, x], dim=1), dim=1)
+        idx = torch.arange(n, device=x.device, dtype=torch.long)
+        end = torch.clamp(idx + look + 1, max=n)
+        den = (end - idx).to(x.dtype).unsqueeze(0)
+        return (csum[:, end] - csum[:, idx]) / torch.clamp(den, min=1.0)
+
+    def _spectral_vectors(chans: list[torch.Tensor]) -> torch.Tensor | None:
+        if highpass_biquad is None or lowpass_biquad is None:
+            return None
+        bands = [(120.0, 420.0), (420.0, 1800.0), (1800.0, 4200.0)]
+        all_ch: list[torch.Tensor] = []
+        for m in chans:
+            per_band: list[torch.Tensor] = []
+            try:
+                sig = m.unsqueeze(0)
+                for lo, hi in bands:
+                    b = highpass_biquad(sig, sr, cutoff_freq=float(lo), Q=0.707)
+                    b = lowpass_biquad(b, sr, cutoff_freq=float(hi), Q=0.707)
+                    per_band.append(_compute_rms_envelope(b.squeeze(0), sr, win_ms=win_ms, hop_ms=hop_ms))
+            except Exception:
+                return None
+            all_ch.append(torch.stack(per_band, dim=0))
+        spec = torch.stack(all_ch, dim=0) + 1e-9  # [C,B,F]
+        denom = torch.clamp(spec.sum(dim=1, keepdim=True), min=1e-9)
+        return spec / denom
+
+    wide_envs = [_compute_rms_envelope(m, sr, win_ms=win_ms, hop_ms=hop_ms) for m in padded]
     voice_envs = [_voice_env(m) for m in padded]
-    env = torch.stack(envs, dim=0) + 1e-9
+    wide = torch.stack(wide_envs, dim=0) + 1e-9
     venv = torch.stack(voice_envs, dim=0) + 1e-9
-    env = (0.35 * env) + (0.65 * venv)
+    env = (0.20 * wide) + (0.80 * venv)
     env_db = 20.0 * torch.log10(env)
+    wide_db = 20.0 * torch.log10(wide)
+    n_ch, n_frames = int(env_db.size(0)), int(env_db.size(1))
+
+    def _q10(x: torch.Tensor) -> float:
+        try:
+            return float(torch.quantile(x.detach(), 0.1))
+        except Exception:
+            vals, _ = torch.sort(x.detach())
+            if vals.numel() <= 1:
+                return float(vals[0]) if vals.numel() else -90.0
+            idx = int(max(0, min(vals.numel() - 1, round(0.1 * (vals.numel() - 1)))))
+            return float(vals[idx])
+
+    noise_floor = torch.tensor([_q10(env_db[i]) for i in range(n_ch)], dtype=env_db.dtype, device=env_db.device)
+    active = env_db > (noise_floor.unsqueeze(1) + cfg.activity_db)
+    has_active = active.any(dim=0)
+    active_count = active.sum(dim=0)
+    multi_active = active_count >= 2
     max_env_db, _ = env_db.max(dim=0)
-    silence_mask = (max_env_db < silence_db)
+    near_silence = (~has_active) | (max_env_db < cfg.silence_db)
+
+    score = (0.85 * env_db) + (0.15 * wide_db)
+    if cfg.score_smooth_frames > 1 and n_frames > 1:
+        k = int(cfg.score_smooth_frames)
+        if k % 2 == 0:
+            k += 1
+        kernel = torch.ones(1, 1, k, dtype=score.dtype, device=score.device) / float(k)
+        score = torch.nn.functional.conv1d(score.unsqueeze(1), kernel, padding=k // 2).squeeze(1)
+    lookahead_frames = max(0, int(round(cfg.lookahead_ms / max(1e-3, cfg.hop_ms))))
+    score_look = _forward_mean_2d(score, lookahead_frames)
+    neg_inf = torch.full_like(score, -1e9)
+    active_score = torch.where(active, score_look, neg_inf)
+    _, top1_idx = active_score.max(dim=0)
+    active_score_2 = active_score.clone()
+    active_score_2.scatter_(0, top1_idx.unsqueeze(0), -1e9)
+    _, top2_idx = active_score_2.max(dim=0)
+
+    winner_env = env_db.gather(0, top1_idx.unsqueeze(0)).squeeze(0)
+    runner_env = env_db.gather(0, top2_idx.unsqueeze(0)).squeeze(0)
+    single_ref = noise_floor[top1_idx]
+    margin_db = torch.where(multi_active, winner_env - runner_env, winner_env - single_ref)
+    margin_db = torch.where(has_active, margin_db, torch.zeros_like(margin_db))
+    margin_db_look = _forward_mean_1d(margin_db, lookahead_frames)
+
+    spec_sim12 = None
+    spec = _spectral_vectors(padded)
+    if spec is not None and int(spec.size(-1)) == n_frames:
+        s = spec.permute(2, 0, 1)  # [F,C,B]
+        idxf = torch.arange(n_frames, device=env_db.device)
+        v1 = s[idxf, top1_idx]  # [F,B]
+        v2 = s[idxf, top2_idx]  # [F,B]
+        n1 = torch.sqrt(torch.sum(v1 * v1, dim=1) + 1e-9)
+        n2 = torch.sqrt(torch.sum(v2 * v2, dim=1) + 1e-9)
+        spec_sim12 = torch.clamp(torch.sum(v1 * v2, dim=1) / (n1 * n2), 0.0, 1.0)
+    if spec_sim12 is None:
+        spec_sim12 = torch.zeros_like(margin_db)
+
+    uncertain_overlap = multi_active & (margin_db_look < cfg.overlap_margin_db) & (spec_sim12 < cfg.spectral_bleed_sim)
+
+    conf = (margin_db_look - cfg.start_db) / max(1e-6, (cfg.full_db - cfg.start_db))
+    conf = torch.clamp(conf, 0.0, 1.0)
+    if spec is not None:
+        sim_range = max(1e-6, cfg.spectral_sim_high - cfg.spectral_sim_low)
+        sim_boost = torch.clamp((spec_sim12 - cfg.spectral_sim_low) / sim_range, 0.0, 1.0)
+        # If winner/runner-up spectra are very similar, treat the loser as likely bleed.
+        conf = torch.clamp((0.75 * conf) + (0.25 * sim_boost), 0.0, 1.0)
+    conf = torch.where(uncertain_overlap | near_silence, torch.zeros_like(conf), conf)
+
+    winner_idx = top1_idx.clone()
+    hold_frames = max(1, int(round(cfg.hold_ms / max(1e-3, cfg.hop_ms))))
+    contender_need = max(1, int(cfg.contender_frames))
+    switches = 0
+    prev_winner = -1
+    hold_left = 0
+    contender = -1
+    contender_count = 0
+    for t in range(n_frames):
+        cand = int(top1_idx[t].item())
+        if bool(near_silence[t].item()):
+            winner_idx[t] = cand if prev_winner < 0 else prev_winner
+            contender = -1
+            contender_count = 0
+            continue
+        if prev_winner < 0:
+            prev_winner = cand
+            hold_left = hold_frames
+            winner_idx[t] = cand
+            continue
+        if cand == prev_winner:
+            winner_idx[t] = prev_winner
+            contender = -1
+            contender_count = 0
+            if hold_left > 0:
+                hold_left -= 1
+            continue
+        cand_vs_prev = float(env_db[cand, t] - env_db[prev_winner, t])
+        if hold_left > 0 and cand_vs_prev < cfg.switch_db:
+            winner_idx[t] = prev_winner
+            conf[t] = conf[t] * 0.35
+            hold_left -= 1
+            contender = -1
+            contender_count = 0
+            continue
+        if cand_vs_prev >= cfg.switch_db:
+            if contender == cand:
+                contender_count += 1
+            else:
+                contender = cand
+                contender_count = 1
+            if contender_count >= contender_need:
+                prev_winner = cand
+                winner_idx[t] = cand
+                hold_left = hold_frames
+                contender = -1
+                contender_count = 0
+                switches += 1
+            else:
+                winner_idx[t] = prev_winner
+                conf[t] = conf[t] * 0.5
+        else:
+            winner_idx[t] = prev_winner
+            conf[t] = conf[t] * 0.35
+            contender = -1
+            contender_count = 0
+            if hold_left > 0:
+                hold_left -= 1
 
     gains_db = torch.zeros_like(env_db)
-    hard_gates: list[torch.Tensor] = []
-    max_idx = env_db.argmax(dim=0)
-    for idx in range(env_db.size(0)):
-        delta = max_env_db - env_db[idx]
-        delta = torch.where(silence_mask, torch.zeros_like(delta), delta)
-        is_winner = (max_idx == idx)
-        # Per-frame gating: attenuate only when this channel loses by enough margin.
-        hard_gate = (~is_winner) & (delta >= start_db) & (~silence_mask)
-        hard_gates.append(hard_gate)
-        gains_db[idx] = torch.where(hard_gate, torch.full_like(delta, -max_att_db), torch.zeros_like(delta))
+    for idx in range(n_ch):
+        loser_mask = (winner_idx != idx) & (~uncertain_overlap) & (~near_silence)
+        base_att = cfg.max_att_db * conf
+        floor_mask = conf >= cfg.min_att_conf
+        eff_att = torch.where(floor_mask, torch.maximum(base_att, torch.full_like(base_att, cfg.min_att_db)), base_att)
+        gains_db[idx] = torch.where(loser_mask, -eff_att, torch.zeros_like(conf))
 
     gains_lin: list[torch.Tensor] = []
     for idx in range(env_db.size(0)):
         g = 10.0 ** (gains_db[idx] / 20.0)
-        # Soften the gate to preserve reactions and breaths
-        g = _smooth_gain_envelope(g, attack_ms=20.0, release_ms=300.0, sr=sr, hop_ms=hop_ms)
+        g = _smooth_gain_envelope(g, attack_ms=cfg.attack_ms, release_ms=cfg.release_ms, sr=sr, hop_ms=hop_ms)
         gains_lin.append(g)
 
     hop = max(1, int(sr * hop_ms / 1000.0))
@@ -443,8 +668,7 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
         if g_up.size(-1) < T:
             g_up = torch.nn.functional.pad(g_up, (0, T - g_up.size(-1)), value=last)
         g_up = g_up[:T]
-        # Extra smoothing on the upsampled gain to reduce clicks/chop
-        filt_len = max(1, int(sr * 0.01))
+        filt_len = max(1, int(sr * (cfg.upsample_smooth_ms / 1000.0)))
         if filt_len > 1:
             kernel = torch.ones(filt_len, dtype=g_up.dtype, device=g_up.device) / float(filt_len)
             g_up = torch.nn.functional.conv1d(
@@ -458,6 +682,28 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
     out: list[torch.Tensor] = []
     for orig, ga in zip(monos, gated):
         out.append(ga[..., :orig.size(-1)])
+    try:
+        dur_s = float(T / max(1, sr))
+        dur_min = max(1e-6, dur_s / 60.0)
+        confident_ratio = float((conf > 0.66).float().mean().item()) if conf.numel() else 0.0
+        uncertain_ratio = float(uncertain_overlap.float().mean().item()) if uncertain_overlap.numel() else 0.0
+        neg = gains_db[gains_db < 0]
+        mean_att = float((-neg).mean().item()) if neg.numel() else 0.0
+        switch_per_min = float(switches / dur_min)
+        print(
+            f"[bleed] confident={confident_ratio*100.0:.1f}% "
+            f"uncertain_overlap={uncertain_ratio*100.0:.1f}% "
+            f"switches_per_min={switch_per_min:.2f} "
+            f"mean_loser_att_db={mean_att:.2f}"
+        )
+        diag_mode = str(os.environ.get("RESEMBLE_DIAG_MINIMAL", "0")).strip().lower() in {"1", "true", "yes", "on"}
+        if diag_mode:
+            active_ratio = active.float().mean(dim=1)
+            med_margin = float(torch.median(margin_db).item()) if margin_db.numel() else 0.0
+            details = ", ".join([f"ch{i+1}_active={float(active_ratio[i].item())*100.0:.1f}%" for i in range(n_ch)])
+            print(f"[bleed] median_margin_db={med_margin:.2f} {details}")
+    except Exception:
+        pass
     return out
 
 
@@ -679,6 +925,13 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
                         raise
         except _Cancelled:
             break
+        # Record model sample rate for diagnostics
+        try:
+            global LAST_MODEL_SR, LAST_MODEL_SR_PATH
+            LAST_MODEL_SR = int(model_sr) if model_sr is not None else None
+            LAST_MODEL_SR_PATH = str(p)
+        except Exception:
+            pass
         dest_sr = 48000 if profile else sr
         if model_sr != dest_sr:
             hwav = ta_resample(hwav, orig_freq=model_sr, new_freq=dest_sr)
@@ -2471,9 +2724,13 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             run_snapshot = None
             staging_root = None
             processed_groups = 0
+            run_t0 = time.perf_counter()
             try:
                 # Clean up temp audio/log artifacts from prior runs
+                cleanup_pre_t0 = time.perf_counter()
                 _cleanup_run_artifacts(remove_logs=True)
+                cleanup_pre_dt = time.perf_counter() - cleanup_pre_t0
+                self.after(0, lambda dt=cleanup_pre_dt: self._log(f"Timing: pre-run cleanup {_format_seconds(dt)}"))
                 # Reset status
                 self.after(0, lambda: self._set_status('Ready'))
                 self.after(0, lambda: self._log("Launching enhancer..."))
@@ -2563,6 +2820,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 for gi, (gname, gfiles) in enumerate(groups, start=1):
                     if not gfiles:
                         continue
+                    group_t0 = time.perf_counter()
                     group_media_clean_dir = None
                     if media_clean:
                         group_media_clean_dir = self._get_media_clean_dir(gfiles[0])
@@ -2608,6 +2866,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                     reduce_gpu = bool(self.var_reduce_gpu.get()) and str(self.var_device.get()).lower() == "cuda"
                     if reduce_gpu:
                         prefer_cli = False
+                    enhance_t0 = time.perf_counter()
                     results = run_enhancer_for(
                         use_files,
                         device=self.var_device.get(),
@@ -2622,6 +2881,16 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         output_dir=group_output_dir,
                         force_inprocess=reduce_gpu,
                     )
+                    enhance_dt = time.perf_counter() - enhance_t0
+                    self.after(0, lambda gi=gi, dt=enhance_dt: self._log(f"Timing: group {gi} enhance {_format_seconds(dt)}"))
+                    try:
+                        if LAST_MODEL_SR is not None:
+                            msg = f"Model SR: {LAST_MODEL_SR} Hz"
+                            if LAST_MODEL_SR_PATH:
+                                msg += f" ({Path(LAST_MODEL_SR_PATH).name})"
+                            self.after(0, lambda m=msg: self._log(m))
+                    except Exception:
+                        pass
                     self.after(0, lambda gi=gi: self._log(f"Group {gi}: enhanced {len(results)} file(s)."))
                     # Mark final statuses for this group
                     try:
@@ -2642,6 +2911,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
 
                     # Post-processing per group
                     if self.var_postproc.get() and results:
+                        post_t0 = time.perf_counter()
                         try:
                             self.after(0, lambda: self._set_status('Preparing post-process'))
                             outs = [out for _, out in results]
@@ -2657,11 +2927,15 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         except Exception as e:
                             if not isinstance(e, _Cancelled):
                                 self.after(0, lambda e=e: self._log(f"Post-process error: {e}"))
+                        finally:
+                            post_dt = time.perf_counter() - post_t0
+                            self.after(0, lambda gi=gi, dt=post_dt: self._log(f"Timing: group {gi} post-process {_format_seconds(dt)}"))
                         if self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set():
                             break
 
                     # Sync + export per group
                     if group_do_sync and results:
+                        sync_t0 = time.perf_counter()
                         try:
                             self.after(0, lambda: self._set_status('Preparing sync'))
                             self.after(0, lambda: self._log("Syncing with Audalign and exporting multichannel..."))
@@ -2729,6 +3003,11 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         except Exception as e:
                             if not isinstance(e, _Cancelled):
                                 self.after(0, lambda e=e: self._log(f"Sync/export error: {e}"))
+                        finally:
+                            sync_dt = time.perf_counter() - sync_t0
+                            self.after(0, lambda gi=gi, dt=sync_dt: self._log(f"Timing: group {gi} sync/export {_format_seconds(dt)}"))
+                    group_dt = time.perf_counter() - group_t0
+                    self.after(0, lambda gi=gi, dt=group_dt: self._log(f"Timing: group {gi} total {_format_seconds(dt)}"))
                 if run_snapshot is not None:
                     run_snapshot["groups_total"] = total_groups
                     run_snapshot["groups_completed"] = processed_groups
@@ -2757,7 +3036,12 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                     pass
                 self._write_run_flag_log(run_snapshot)
                 # Always clean temp artifacts after each run
+                cleanup_post_t0 = time.perf_counter()
                 _cleanup_run_artifacts(remove_logs=True)
+                cleanup_post_dt = time.perf_counter() - cleanup_post_t0
+                run_dt = time.perf_counter() - run_t0
+                self.after(0, lambda dt=cleanup_post_dt: self._log(f"Timing: post-run cleanup {_format_seconds(dt)}"))
+                self.after(0, lambda dt=run_dt: self._log(f"Timing: run total {_format_seconds(dt)}"))
                 def _reset():
                     self.run_btn.config(state="normal")
                     self.pause_btn.config(state="disabled")
@@ -2804,6 +3088,7 @@ def _sync_and_export_multichannel_simple(
     Uses Audalign directly on the input files and then assembles a multichannel
     WAV/MOV without extra proxy generation, drift correction, or manual offsets.
     """
+    sync_t0 = time.perf_counter()
     import importlib
     from datetime import datetime
     import torchaudio
@@ -2874,6 +3159,25 @@ def _sync_and_export_multichannel_simple(
             except Exception:
                 pass
 
+    def _audalign_worker_count(n_files: int) -> int:
+        # Env override: RESEMBLE_AUDALIGN_WORKERS=0/empty means auto.
+        override = os.environ.get("RESEMBLE_AUDALIGN_WORKERS", "").strip()
+        if override:
+            try:
+                forced = int(override)
+                if forced > 0:
+                    return forced
+            except Exception:
+                pass
+        cpu = os.cpu_count() or 1
+        if n_files <= 1 or cpu <= 2:
+            return 1
+        # Keep one core free for UI/audio I/O; cap to avoid oversubscription.
+        return max(1, min(cpu - 1, 12))
+
+    audalign_workers = _audalign_worker_count(len(file_paths))
+    _emit(f"Audalign workers: {audalign_workers}")
+
     def _make_recognizer(name: str):
         try:
             rec_cls = getattr(ad, name)
@@ -2886,8 +3190,18 @@ def _sync_and_export_multichannel_simple(
         try:
             cfg = getattr(rec, 'config', None)
             if cfg is not None:
-                setattr(cfg, 'multiprocessing', False)
-                setattr(cfg, 'num_processors', 1)
+                mp_enabled = audalign_workers > 1
+                # audalign recognizers vary; set common knobs best-effort.
+                setattr(cfg, 'multiprocessing', mp_enabled)
+                setattr(cfg, 'num_processors', int(audalign_workers))
+                try:
+                    setattr(cfg, 'n_jobs', int(audalign_workers))
+                except Exception:
+                    pass
+                try:
+                    setattr(cfg, 'workers', int(audalign_workers))
+                except Exception:
+                    pass
         except Exception:
             pass
         return rec
@@ -2907,6 +3221,7 @@ def _sync_and_export_multichannel_simple(
             return align_files(*file_paths, destination_path=str(tmp_dir), **kwargs)
 
     _emit('Running Audalign alignment...')
+    align_t0 = time.perf_counter()
     results = None
     for rec in (primary_rec, fallback_rec, None):
         try:
@@ -2917,12 +3232,14 @@ def _sync_and_export_multichannel_simple(
             break
 
     step(1, 'Audalign alignment')
+    _emit(f"Timing: Audalign alignment {_format_seconds(time.perf_counter() - align_t0)}")
 
     if not results:
         return _abort('Audalign could not align the provided files.')
 
     # 2) Load aligned files from tmp_dir and build multichannel tensor
     _emit('Assembling multichannel file...')
+    assemble_t0 = time.perf_counter()
     produced = sorted(tmp_dir.rglob("*.wav"))
     basenames = [Path(p).name for p in file_paths]
     aligned_paths: list[Path] = []
@@ -3000,8 +3317,10 @@ def _sync_and_export_multichannel_simple(
     torchaudio.save(str(out_wav), multich, target_sr)
 
     step(1, 'Assemble multichannel')
+    _emit(f"Timing: assemble multichannel {_format_seconds(time.perf_counter() - assemble_t0)}")
 
     # Optional container / metadata tweaks (reuse existing helpers)
+    container_t0 = time.perf_counter()
     try:
         ff = shutil.which('ffmpeg') or shutil.which('ffmpeg.exe')
         if ff and not wav_only:
@@ -3057,13 +3376,17 @@ def _sync_and_export_multichannel_simple(
     except Exception:
         # Keep WAV if conversion/finalization fails
         pass
+    _emit(f"Timing: container/metadata {_format_seconds(time.perf_counter() - container_t0)}")
 
+    cleanup_t0 = time.perf_counter()
     try:
         import shutil as _sh
         _sh.rmtree(tmp_dir, ignore_errors=True)
     except Exception:
         pass
     step(1, 'Cleanup')
+    _emit(f"Timing: sync cleanup {_format_seconds(time.perf_counter() - cleanup_t0)}")
+    _emit(f"Timing: sync/export total {_format_seconds(time.perf_counter() - sync_t0)}")
 
     return str(out_wav)
 
