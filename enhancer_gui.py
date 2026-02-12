@@ -413,6 +413,9 @@ class _BleedGateConfig:
     hard_att_db: float = 42.0
     hard_doubletalk_sim_max: float = 0.72
     hard_mute: bool = True
+    hard_mute_attack_ms: float = 8.0
+    hard_mute_release_ms: float = 45.0
+    hard_open_pad_ms: float = 12.0
 
     @classmethod
     def from_env(cls) -> "_BleedGateConfig":
@@ -437,6 +440,9 @@ class _BleedGateConfig:
         cfg.hard_att_db = max(6.0, _env_float("RESEMBLE_BLEED_HARD_ATT_DB", cfg.hard_att_db))
         cfg.hard_doubletalk_sim_max = min(0.99, max(0.0, _env_float("RESEMBLE_BLEED_HARD_DOUBLETALK_SIM_MAX", cfg.hard_doubletalk_sim_max)))
         cfg.hard_mute = _env_bool("RESEMBLE_BLEED_HARD_MUTE", cfg.hard_mute)
+        cfg.hard_mute_attack_ms = max(0.5, _env_float("RESEMBLE_BLEED_HARD_MUTE_ATTACK_MS", cfg.hard_mute_attack_ms))
+        cfg.hard_mute_release_ms = max(2.0, _env_float("RESEMBLE_BLEED_HARD_MUTE_RELEASE_MS", cfg.hard_mute_release_ms))
+        cfg.hard_open_pad_ms = max(0.0, _env_float("RESEMBLE_BLEED_HARD_OPEN_PAD_MS", cfg.hard_open_pad_ms))
         return cfg
 
 
@@ -681,7 +687,27 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
     gains_lin: list[torch.Tensor] = []
     for idx in range(env_db.size(0)):
         if cfg.hard_isolation and cfg.hard_mute:
-            g = torch.where(hard_loser_masks[idx], torch.zeros_like(conf), torch.ones_like(conf))
+            open_mask = ~hard_loser_masks[idx]
+            pad_frames = max(0, int(round(cfg.hard_open_pad_ms / max(1e-3, hop_ms))))
+            if pad_frames > 0 and open_mask.numel() > 1:
+                k = (2 * pad_frames) + 1
+                kern = torch.ones(1, 1, k, dtype=conf.dtype, device=conf.device)
+                dil = torch.nn.functional.conv1d(
+                    open_mask.float().unsqueeze(0).unsqueeze(0),
+                    kern,
+                    padding=pad_frames,
+                ).squeeze()
+                open_mask = dil > 0.0
+            g = torch.where(open_mask, torch.ones_like(conf), torch.zeros_like(conf))
+            # De-click hard transitions without re-opening bleed materially.
+            g = _smooth_gain_envelope(
+                g,
+                attack_ms=cfg.hard_mute_attack_ms,
+                release_ms=cfg.hard_mute_release_ms,
+                sr=sr,
+                hop_ms=hop_ms,
+            )
+            g = torch.clamp(g, 0.0, 1.0)
         else:
             g = 10.0 ** (gains_db[idx] / 20.0)
             g = _smooth_gain_envelope(g, attack_ms=cfg.attack_ms, release_ms=cfg.release_ms, sr=sr, hop_ms=hop_ms)

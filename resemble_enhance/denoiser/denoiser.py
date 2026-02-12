@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from ..enhancer.univnet.mrstft import MRSTFTLoss
 from ..melspec import MelSpectrogram
 from .hparams import HParams
 from .unet import UNet
@@ -13,6 +14,16 @@ logger = logging.getLogger(__name__)
 
 def _normalize(x: Tensor) -> Tensor:
     return x / (x.abs().max(dim=-1, keepdim=True).values + 1e-7)
+
+
+def _si_sdr_db(pred: Tensor, target: Tensor, eps: float = 1e-8) -> Tensor:
+    """Scale-invariant SDR in dB for each batch item."""
+    target_energy = torch.sum(target * target, dim=-1, keepdim=True) + eps
+    scale = torch.sum(pred * target, dim=-1, keepdim=True) / target_energy
+    s_target = scale * target
+    e_noise = pred - s_target
+    ratio = (torch.sum(s_target * s_target, dim=-1) + eps) / (torch.sum(e_noise * e_noise, dim=-1) + eps)
+    return 10.0 * torch.log10(ratio + eps)
 
 
 class Denoiser(nn.Module):
@@ -34,6 +45,7 @@ class Denoiser(nn.Module):
         self.hp = hp
         self.net = UNet(input_dim=3, output_dim=3)
         self.mel_fn = MelSpectrogram(hp)
+        self.mrstft = MRSTFTLoss(hp)
 
         self.dummy: Tensor
         self.register_buffer("dummy", torch.zeros(1), persistent=False)
@@ -176,6 +188,17 @@ class Denoiser(nn.Module):
         o = F.pad(o, (0, npad))
 
         if y is not None:
-            self.losses = dict(l1=F.l1_loss(o, y))
+            l1 = F.l1_loss(o, y)
+            mr = self.mrstft(o, y)
+            sisdr_db = _si_sdr_db(o, y)
+            sisdr_loss = torch.relu(self.hp.denoiser_sisdr_target_db - sisdr_db).mean() / max(
+                1.0, float(self.hp.denoiser_sisdr_target_db)
+            )
+            self.losses = dict(
+                l1=l1 * float(self.hp.denoiser_l1_weight),
+                mr_sc=mr["sc"] * float(self.hp.denoiser_mrstft_sc_weight),
+                mr_mag=mr["mag"] * float(self.hp.denoiser_mrstft_mag_weight),
+                sisdr=sisdr_loss * float(self.hp.denoiser_sisdr_weight),
+            )
 
         return o

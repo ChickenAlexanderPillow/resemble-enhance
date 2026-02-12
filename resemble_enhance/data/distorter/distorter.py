@@ -1,6 +1,6 @@
 from ...hparams import HParams
 from .base import Chain, Choice, Permutation
-from .custom import RandomGaussianNoise, RandomRIR
+from .custom import RandomBabbleNoise, RandomGaussianNoise, RandomRIR, RandomTransientClicks
 
 
 class Distorter(Chain):
@@ -13,6 +13,8 @@ class Distorter(Chain):
                 RandomRIR(hp.rir_dir),
                 RandomReverb(),
                 RandomGaussianNoise(),
+                RandomBabbleNoise(),
+                RandomTransientClicks(),
                 RandomOverdrive(),
                 RandomEqualizer(),
                 Choice(
