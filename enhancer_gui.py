@@ -1301,23 +1301,27 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
         nonlocal expected
         current_file = None
         cur_n = 0
-        start_re = re.compile(r"^PROGRESS START file=(.*) n=(\d+)$")
-        chunk_re = re.compile(r"^PROGRESS CHUNK file=(.*) i=(\d+) n=(\d+)$")
-        end_re = re.compile(r"^PROGRESS END file=(.*)$")
+        start_re = re.compile(r"PROGRESS START file=(.*) n=(\d+)")
+        chunk_re = re.compile(r"PROGRESS CHUNK file=(.*) i=(\d+) n=(\d+)")
+        end_re = re.compile(r"PROGRESS END file=(.*)")
         for line in proc.stdout:  # type: ignore[attr-defined]
             line = line.rstrip()
             _record_log(line)
-            m = start_re.match(line)
+            m = start_re.search(line)
             if m:
                 current_file = m.group(1)
                 try:
                     cur_n = int(m.group(2))
                 except Exception:
                     cur_n = 0
+                try:
+                    print(f"PROGRESS START file={current_file} n={cur_n}", flush=True)
+                except Exception:
+                    pass
                 if chunk_progress_cb:
                     chunk_progress_cb(current_file or "", 0, cur_n)
                 continue
-            m = chunk_re.match(line)
+            m = chunk_re.search(line)
             if m:
                 name = m.group(1)
                 try:
@@ -1325,12 +1329,20 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
                     n = int(m.group(3))
                 except Exception:
                     i, n = 0, 0
+                try:
+                    print(f"PROGRESS CHUNK file={name} i={i} n={n}", flush=True)
+                except Exception:
+                    pass
                 if chunk_progress_cb:
                     chunk_progress_cb(name or current_file or "", i, n)
                 continue
-            m = end_re.match(line)
+            m = end_re.search(line)
             if m:
                 name = m.group(1)
+                try:
+                    print(f"PROGRESS END file={name}", flush=True)
+                except Exception:
+                    pass
                 if chunk_progress_cb:
                     chunk_progress_cb(name or current_file or "", cur_n, cur_n)
                 continue

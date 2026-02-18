@@ -193,6 +193,58 @@ def _apply_aggressive_ambience_gate(wav: torch.Tensor, sr: int, window_s: float 
         return wav
 
 
+def _apply_non_speech_residual_suppress(
+    wav: torch.Tensor,
+    sr: int,
+    margin_db: float = 8.0,
+    max_att_db: float = 6.0,
+    env_win_ms: float = 30.0,
+    speech_pad_ms: float = 70.0,
+    smooth_ms: float = 25.0,
+) -> torch.Tensor:
+    """Mildly attenuate residual noise in non-speech windows using an envelope VAD."""
+    try:
+        if wav.dim() != 1 or wav.numel() < max(64, int(sr * 0.05)):
+            return wav
+        x = wav
+        n = int(x.numel())
+        # Envelope
+        env_k = max(8, int(sr * max(0.01, env_win_ms / 1000.0)))
+        env_pad = env_k // 2
+        env_w = torch.ones(1, 1, env_k, dtype=x.dtype, device=x.device) / float(env_k)
+        env = torch.nn.functional.conv1d(x.abs().unsqueeze(0).unsqueeze(0), env_w, padding=env_pad).squeeze()
+        env = env[:n]
+        env_db = 20.0 * torch.log10(env + 1e-8)
+        try:
+            floor_db = float(torch.quantile(env_db.detach(), 0.2).item())
+        except Exception:
+            floor_db = float(torch.median(env_db.detach()).item()) - 6.0
+        speech = env_db > (floor_db + float(margin_db))
+        # Protect syllable tails and consonants: dilate speech activity in time.
+        pad_n = max(0, int(sr * max(0.0, speech_pad_ms / 1000.0)))
+        if pad_n > 0:
+            k = (2 * pad_n) + 1
+            ker = torch.ones(1, 1, k, dtype=x.dtype, device=x.device)
+            speech = (
+                torch.nn.functional.conv1d(speech.float().unsqueeze(0).unsqueeze(0), ker, padding=pad_n).squeeze() > 0
+            )
+            speech = speech[:n]
+        nonspeech = (~speech).float()
+        # Smooth the non-speech mask to avoid pumping.
+        sm_k = max(4, int(sr * max(0.005, smooth_ms / 1000.0)))
+        sm_pad = sm_k // 2
+        sm_w = torch.ones(1, 1, sm_k, dtype=x.dtype, device=x.device) / float(sm_k)
+        nonspeech = torch.nn.functional.conv1d(nonspeech.unsqueeze(0).unsqueeze(0), sm_w, padding=sm_pad).squeeze()
+        nonspeech = torch.clamp(nonspeech[:n], 0.0, 1.0)
+        depth = max(0.0, float(max_att_db))
+        if depth <= 0.0:
+            return wav
+        gain = torch.exp((-math.log(10.0) / 20.0) * depth * nonspeech)
+        return x * gain
+    except Exception:
+        return wav
+
+
 def remove_weight_norm_recursively(module):
     for _, module in module.named_modules():
         try:
@@ -388,6 +440,20 @@ def inference(
             auto_wins = _auto_detect_transients(hwav, sr)
             if auto_wins:
                 hwav = _bypass_windows(hwav, dwav, sr, auto_wins)
+    except Exception:
+        pass
+
+    try:
+        if os.environ.get("RESEMBLE_NS_SUPPRESS", "1") == "1":
+            hwav = _apply_non_speech_residual_suppress(
+                hwav,
+                sr,
+                margin_db=float(os.environ.get("RESEMBLE_NS_MARGIN_DB", "8.0") or 8.0),
+                max_att_db=float(os.environ.get("RESEMBLE_NS_MAX_ATT_DB", "6.0") or 6.0),
+                env_win_ms=float(os.environ.get("RESEMBLE_NS_ENV_WIN_MS", "30.0") or 30.0),
+                speech_pad_ms=float(os.environ.get("RESEMBLE_NS_SPEECH_PAD_MS", "70.0") or 70.0),
+                smooth_ms=float(os.environ.get("RESEMBLE_NS_SMOOTH_MS", "25.0") or 25.0),
+            )
     except Exception:
         pass
 
