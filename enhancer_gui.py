@@ -1,5 +1,6 @@
-﻿import os
+import os
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -11,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, ttk
+from tkinter import filedialog, ttk, messagebox
 # Optional modern theming via ttkbootstrap
 try:
     import ttkbootstrap as _ttkb  # type: ignore[import-not-found]
@@ -39,6 +40,8 @@ MIN_AUDIO_SAMPLES = 2048
 OUTPUT_MEDIA_CLEAN_ENV = "RESEMBLE_OUTPUT_MEDIA_CLEAN"
 MEDIA_ROOT_FOLDER = "01_MEDIA"
 MEDIA_CLEAN_FOLDER = "030_AUDIO_CLEAN"
+MEDIA_AUDIO_RAW_FOLDER = "040_AUDIO_RAW"
+MEDIA_VIDEO_RAW_FOLDER = "020_VIDEO_RAW"
 LAST_MODEL_SR: int | None = None
 LAST_MODEL_SR_PATH: str | None = None
 
@@ -130,6 +133,234 @@ def _has_clean_output_in_media(src_path: Path) -> bool:
         return False
     except Exception:
         return False
+
+def _find_existing_clean_for_source(src_path: Path) -> Path | None:
+    """Find an existing CLEAN file that corresponds to a source file."""
+    try:
+        if src_path.name.upper().startswith("CLEAN_") and src_path.exists():
+            return src_path
+        stem = src_path.stem
+        matches: list[Path] = []
+        # Probe multiple plausible locations where CLEAN files may exist.
+        cand_dirs: list[Path] = []
+        media_dir = _find_media_clean_dir(src_path)
+        if media_dir is not None:
+            cand_dirs.append(media_dir)
+        cand_dirs.append(src_path.parent)
+        try:
+            # If source is in 040_AUDIO_RAW, also probe sibling 030_AUDIO_CLEAN.
+            if src_path.parent.name.lower() == MEDIA_AUDIO_RAW_FOLDER.lower():
+                cand_dirs.append(src_path.parent.parent / MEDIA_CLEAN_FOLDER)
+        except Exception:
+            pass
+        # Deduplicate and search.
+        seen_dirs: set[str] = set()
+        uniq_dirs: list[Path] = []
+        for d in cand_dirs:
+            try:
+                k = str(d.resolve()).lower()
+            except Exception:
+                k = str(d).lower()
+            if k in seen_dirs:
+                continue
+            seen_dirs.add(k)
+            uniq_dirs.append(d)
+
+        # First-pass strict: CLEAN_<exact-stem>* in candidate dirs.
+        strict_pat = f"CLEAN_{stem}*"
+        for d in uniq_dirs:
+            try:
+                if not d.exists() or not d.is_dir():
+                    continue
+                for cand in d.glob(strict_pat):
+                    try:
+                        if cand.is_file():
+                            matches.append(cand)
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        # Fallback fuzzy: CLEAN files containing source stem token.
+        if not matches:
+            stem_l = stem.lower()
+            for d in uniq_dirs:
+                try:
+                    if not d.exists() or not d.is_dir():
+                        continue
+                    for cand in d.glob("CLEAN_*"):
+                        try:
+                            if not cand.is_file():
+                                continue
+                            if stem_l in cand.stem.lower():
+                                matches.append(cand)
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+
+        # Final fallback: if there is exactly one CLEAN*.mov in candidate dirs,
+        # use it as a reusable synced source (common dual-mono workflow).
+        if not matches:
+            movs: list[Path] = []
+            for d in uniq_dirs:
+                try:
+                    if not d.exists() or not d.is_dir():
+                        continue
+                    for cand in d.glob("CLEAN*.mov"):
+                        try:
+                            if cand.is_file():
+                                movs.append(cand)
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+            if len(movs) == 1:
+                matches = movs
+
+        if not matches:
+            return None
+        # Prefer MOV first (synced dual-/multi-mono workflows), then newest.
+        def _rank(p: Path) -> tuple[int, float]:
+            try:
+                mtime = p.stat().st_mtime if p.exists() else 0.0
+            except Exception:
+                mtime = 0.0
+            is_mov = 1 if p.suffix.lower() == ".mov" else 0
+            return (is_mov, mtime)
+        matches.sort(key=_rank, reverse=True)
+        return matches[0]
+    except Exception:
+        return None
+
+
+def _find_reusable_synced_clean_for_group(group_files: list[str]) -> Path | None:
+    """Find a reusable synced CLEAN MOV for a group of source files."""
+    try:
+        cand_dirs: list[Path] = []
+        for fp in group_files:
+            src_path = Path(fp)
+            media_dir = _find_media_clean_dir(src_path)
+            if media_dir is not None:
+                cand_dirs.append(media_dir)
+            cand_dirs.append(src_path.parent)
+            try:
+                if src_path.parent.name.lower() == MEDIA_AUDIO_RAW_FOLDER.lower():
+                    cand_dirs.append(src_path.parent.parent / MEDIA_CLEAN_FOLDER)
+            except Exception:
+                pass
+
+        seen_dirs: set[str] = set()
+        uniq_dirs: list[Path] = []
+        for d in cand_dirs:
+            try:
+                k = str(d.resolve()).lower()
+            except Exception:
+                k = str(d).lower()
+            if k in seen_dirs:
+                continue
+            seen_dirs.add(k)
+            uniq_dirs.append(d)
+
+        movs: list[Path] = []
+        for d in uniq_dirs:
+            try:
+                if not d.exists() or not d.is_dir():
+                    continue
+                for cand in d.glob("CLEAN_Synced_Multichannel*.mov"):
+                    try:
+                        if cand.is_file():
+                            movs.append(cand)
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        if not movs:
+            for d in uniq_dirs:
+                try:
+                    if not d.exists() or not d.is_dir():
+                        continue
+                    for cand in d.glob("CLEAN*.mov"):
+                        try:
+                            if cand.is_file():
+                                movs.append(cand)
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+        if not movs:
+            return None
+
+        def _mtime(p: Path) -> float:
+            try:
+                return p.stat().st_mtime
+            except Exception:
+                return 0.0
+
+        movs.sort(key=_mtime, reverse=True)
+        return movs[0]
+    except Exception:
+        return None
+
+
+def _find_synced_clean_for_group(group_files: list[str]) -> Path | None:
+    """Find newest synced CLEAN multichannel source for a group (MOV preferred, then WAV)."""
+    try:
+        cand_dirs: list[Path] = []
+        for fp in group_files:
+            src_path = Path(fp)
+            media_dir = _find_media_clean_dir(src_path)
+            if media_dir is not None:
+                cand_dirs.append(media_dir)
+            cand_dirs.append(src_path.parent)
+            try:
+                if src_path.parent.name.lower() == MEDIA_AUDIO_RAW_FOLDER.lower():
+                    cand_dirs.append(src_path.parent.parent / MEDIA_CLEAN_FOLDER)
+            except Exception:
+                pass
+        seen_dirs: set[str] = set()
+        uniq_dirs: list[Path] = []
+        for d in cand_dirs:
+            try:
+                k = str(d.resolve()).lower()
+            except Exception:
+                k = str(d).lower()
+            if k in seen_dirs:
+                continue
+            seen_dirs.add(k)
+            uniq_dirs.append(d)
+
+        movs: list[Path] = []
+        wavs: list[Path] = []
+        for d in uniq_dirs:
+            try:
+                if not d.exists() or not d.is_dir():
+                    continue
+                for cand in d.glob("CLEAN_Synced_Multichannel*.mov"):
+                    if cand.is_file():
+                        movs.append(cand)
+                for cand in d.glob("CLEAN_Synced_Multichannel*.wav"):
+                    if cand.is_file():
+                        wavs.append(cand)
+            except Exception:
+                continue
+
+        def _mtime(p: Path) -> float:
+            try:
+                return float(p.stat().st_mtime)
+            except Exception:
+                return 0.0
+
+        if movs:
+            movs.sort(key=_mtime, reverse=True)
+            return movs[0]
+        if wavs:
+            wavs.sort(key=_mtime, reverse=True)
+            return wavs[0]
+        return None
+    except Exception:
+        return None
+
 
 def _build_output_name(src_path: Path, stamp: str) -> str:
     stem = src_path.stem
@@ -448,34 +679,33 @@ class _BleedGateConfig:
         return cfg
 
 
-def _apply_bleed_gate(monos: list, sr: int) -> list:
-    """Attenuate bleed with confidence + hysteresis winner selection across N channels."""
+def _analyze_speaker_activity(monos: list, sr: int, cfg: _BleedGateConfig | None = None):
+    """Shared confidence/winner analysis used by bleed-gate and OTIO cut logic."""
     try:
         import torch
     except Exception:
-        return monos
+        return None
     try:
         from torchaudio.functional import highpass_biquad, lowpass_biquad
     except Exception:
         highpass_biquad = None
         lowpass_biquad = None
     if len(monos) < 2:
-        return monos
+        return None
     lengths = [int(m.size(-1)) for m in monos if isinstance(m, torch.Tensor)]
     if not lengths:
-        return monos
+        return None
     T = max(lengths)
     if T <= 0:
-        return monos
-
-    cfg = _BleedGateConfig.from_env()
+        return None
+    cfg = cfg or _BleedGateConfig.from_env()
     win_ms = cfg.win_ms
     hop_ms = cfg.hop_ms
 
     padded: list[torch.Tensor] = []
     for mono in monos:
         if not isinstance(mono, torch.Tensor):
-            return monos
+            return None
         if mono.size(-1) < T:
             mono = torch.nn.functional.pad(mono, (0, T - mono.size(-1)))
         padded.append(mono)
@@ -529,7 +759,7 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
             except Exception:
                 return None
             all_ch.append(torch.stack(per_band, dim=0))
-        spec = torch.stack(all_ch, dim=0) + 1e-9  # [C,B,F]
+        spec = torch.stack(all_ch, dim=0) + 1e-9
         denom = torch.clamp(spec.sum(dim=1, keepdim=True), min=1e-9)
         return spec / denom
 
@@ -586,10 +816,10 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
     spec_sim12 = None
     spec = _spectral_vectors(padded)
     if spec is not None and int(spec.size(-1)) == n_frames:
-        s = spec.permute(2, 0, 1)  # [F,C,B]
+        s = spec.permute(2, 0, 1)
         idxf = torch.arange(n_frames, device=env_db.device)
-        v1 = s[idxf, top1_idx]  # [F,B]
-        v2 = s[idxf, top2_idx]  # [F,B]
+        v1 = s[idxf, top1_idx]
+        v2 = s[idxf, top2_idx]
         n1 = torch.sqrt(torch.sum(v1 * v1, dim=1) + 1e-9)
         n2 = torch.sqrt(torch.sum(v2 * v2, dim=1) + 1e-9)
         spec_sim12 = torch.clamp(torch.sum(v1 * v2, dim=1) / (n1 * n2), 0.0, 1.0)
@@ -598,8 +828,6 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
 
     base_uncertain_overlap = multi_active & (margin_db_look < cfg.overlap_margin_db)
     uncertain_overlap = base_uncertain_overlap
-    # In hard isolation, only preserve overlaps that look like true double-talk
-    # (spectrally dissimilar voices). Spectrally similar overlaps are treated as bleed.
     if cfg.hard_isolation:
         if spec is not None:
             uncertain_overlap = base_uncertain_overlap & (spec_sim12 <= cfg.hard_doubletalk_sim_max)
@@ -611,7 +839,6 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
     if spec is not None:
         sim_range = max(1e-6, cfg.spectral_sim_high - cfg.spectral_sim_low)
         sim_boost = torch.clamp((spec_sim12 - cfg.spectral_sim_low) / sim_range, 0.0, 1.0)
-        # If winner/runner-up spectra are very similar, treat the loser as likely bleed.
         conf = torch.clamp((0.75 * conf) + (0.25 * sim_boost), 0.0, 1.0)
     conf = torch.where(uncertain_overlap | near_silence, torch.zeros_like(conf), conf)
 
@@ -673,6 +900,209 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
             contender_count = 0
             if hold_left > 0:
                 hold_left -= 1
+
+    return {
+        "cfg": cfg,
+        "padded": padded,
+        "T": T,
+        "n_ch": n_ch,
+        "env_db": env_db,
+        "active": active,
+        "near_silence": near_silence,
+        "uncertain_overlap": uncertain_overlap,
+        "winner_idx": winner_idx,
+        "conf": conf,
+        "gains_template": torch.zeros_like(env_db),
+        "switches": switches,
+        "hop_ms": hop_ms,
+    }
+
+
+def _load_audio_tracks_any(path: str | Path, target_sr: int = 48000):
+    """Load audio tracks from WAV/MOV/etc. Returns list of mono tensors at target_sr."""
+    try:
+        import torchaudio
+        import torch
+        from torchaudio.functional import resample as ta_resample
+    except Exception:
+        return []
+    p = Path(path)
+
+    def _wav_to_tracks(wav, sr) -> list:
+        if wav is None or sr is None:
+            return []
+        try:
+            if wav.dim() == 1:
+                wav = wav.unsqueeze(0)
+            tracks = []
+            for ch in range(int(wav.size(0))):
+                mono = wav[ch].to(torch.float32)
+                if int(sr) != int(target_sr):
+                    mono = ta_resample(mono, orig_freq=int(sr), new_freq=int(target_sr))
+                tracks.append(mono)
+            return tracks
+        except Exception:
+            return []
+
+    # Fast-path: direct loader.
+    try:
+        wav, sr = torchaudio.load(str(p))
+        tracks = _wav_to_tracks(wav, sr)
+        if len(tracks) >= 2:
+            return tracks
+    except Exception:
+        pass
+
+    ff = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+    fp = shutil.which("ffprobe") or shutil.which("ffprobe.exe")
+    if not ff:
+        return []
+
+    # Probe audio stream layout for robust extraction of multi-stream / multi-channel containers.
+    streams = []
+    if fp:
+        try:
+            probe_cmd = [fp, "-v", "error", "-show_streams", "-of", "json", str(p)]
+            probe = subprocess.run(probe_cmd, capture_output=True, text=True)
+            if probe.returncode == 0 and probe.stdout:
+                parsed = json.loads(probe.stdout)
+                all_streams = parsed.get("streams", []) if isinstance(parsed, dict) else []
+                for s in all_streams:
+                    try:
+                        if str(s.get("codec_type", "")).lower() != "audio":
+                            continue
+                        streams.append(
+                            {
+                                "index": int(s.get("index", 0)),
+                                "channels": int(s.get("channels", 1) or 1),
+                            }
+                        )
+                    except Exception:
+                        continue
+        except Exception:
+            streams = []
+
+    try:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tdir = Path(td)
+            extracted_tracks: list = []
+
+            # Strategy A: multiple audio streams -> one mono track per stream.
+            if len(streams) >= 2:
+                for i in range(len(streams)):
+                    tmp_wav = tdir / f"stream_{i}.wav"
+                    cmd = [
+                        ff,
+                        "-nostdin",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-i",
+                        str(p),
+                        "-map",
+                        f"0:a:{i}",
+                        "-ac",
+                        "1",
+                        "-c:a",
+                        "pcm_s16le",
+                        str(tmp_wav),
+                    ]
+                    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if proc.returncode != 0 or not tmp_wav.exists():
+                        continue
+                    wav_i, sr_i = torchaudio.load(str(tmp_wav))
+                    tracks_i = _wav_to_tracks(wav_i, sr_i)
+                    if tracks_i:
+                        extracted_tracks.append(tracks_i[0])
+                if len(extracted_tracks) >= 2:
+                    return extracted_tracks
+
+            # Strategy B: single stream with multiple channels -> split each channel.
+            ch_count = 0
+            if streams:
+                try:
+                    ch_count = max(1, int(streams[0].get("channels", 1)))
+                except Exception:
+                    ch_count = 0
+            if ch_count >= 2:
+                for ch in range(ch_count):
+                    tmp_wav = tdir / f"ch_{ch}.wav"
+                    cmd = [
+                        ff,
+                        "-nostdin",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-i",
+                        str(p),
+                        "-filter_complex",
+                        f"[0:a:0]pan=mono|c0=c{ch}[aout]",
+                        "-map",
+                        "[aout]",
+                        "-c:a",
+                        "pcm_s16le",
+                        str(tmp_wav),
+                    ]
+                    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if proc.returncode != 0 or not tmp_wav.exists():
+                        continue
+                    wav_i, sr_i = torchaudio.load(str(tmp_wav))
+                    tracks_i = _wav_to_tracks(wav_i, sr_i)
+                    if tracks_i:
+                        extracted_tracks.append(tracks_i[0])
+                if len(extracted_tracks) >= 2:
+                    return extracted_tracks
+
+            # Final fallback: single decode (may be mono/stereo depending on container/decoder).
+            tmp_wav = tdir / "audio_extract.wav"
+            cmd = [
+                ff,
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(p),
+                "-vn",
+                "-c:a",
+                "pcm_s16le",
+                str(tmp_wav),
+            ]
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if proc.returncode == 0 and tmp_wav.exists():
+                wav, sr = torchaudio.load(str(tmp_wav))
+                return _wav_to_tracks(wav, sr)
+    except Exception:
+        return []
+    return []
+
+
+def _apply_bleed_gate(monos: list, sr: int) -> list:
+    """Attenuate bleed with confidence + hysteresis winner selection across N channels."""
+    try:
+        import torch
+    except Exception:
+        return monos
+    analysis = _analyze_speaker_activity(monos, sr)
+    if not analysis:
+        return monos
+    cfg = analysis["cfg"]
+    padded = analysis["padded"]
+    T = int(analysis["T"])
+    n_ch = int(analysis["n_ch"])
+    env_db = analysis["env_db"]
+    active = analysis["active"]
+    near_silence = analysis["near_silence"]
+    uncertain_overlap = analysis["uncertain_overlap"]
+    winner_idx = analysis["winner_idx"]
+    conf = analysis["conf"]
+    switches = int(analysis["switches"])
+    hop_ms = float(analysis["hop_ms"])
 
     gains_db = torch.zeros_like(env_db)
     hard_loser_masks: list[torch.Tensor] = []
@@ -776,7 +1206,8 @@ def _apply_bleed_gate(monos: list, sr: int) -> list:
         diag_mode = str(os.environ.get("RESEMBLE_DIAG_MINIMAL", "0")).strip().lower() in {"1", "true", "yes", "on"}
         if diag_mode:
             active_ratio = active.float().mean(dim=1)
-            med_margin = float(torch.median(margin_db).item()) if margin_db.numel() else 0.0
+            margin_like = ((conf * max(1e-6, (cfg.full_db - cfg.start_db))) + cfg.start_db)
+            med_margin = float(torch.median(margin_like).item()) if margin_like.numel() else 0.0
             details = ", ".join([f"ch{i+1}_active={float(active_ratio[i].item())*100.0:.1f}%" for i in range(n_ch)])
             print(f"[bleed] median_margin_db={med_margin:.2f} {details}")
     except Exception:
@@ -1095,8 +1526,8 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
                         # mismatch and level envelopes
                         d = (x - y).abs().unsqueeze(0).unsqueeze(0)
                         d_s = _t.nn.functional.conv1d(d, w, padding=pad).squeeze()
-                        l = _t.maximum(x.abs(), y.abs()).unsqueeze(0).unsqueeze(0)
-                        l_s = _t.nn.functional.conv1d(l, w, padding=pad).squeeze()
+                        level_env = _t.maximum(x.abs(), y.abs()).unsqueeze(0).unsqueeze(0)
+                        l_s = _t.nn.functional.conv1d(level_env, w, padding=pad).squeeze()
                         # thresholds
                         d_med = _t.quantile(d_s, 0.5)
                         d_thr = d_med * 4.0
@@ -1563,6 +1994,12 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self.folders: set[str] = set()
         # Per-file status: queued|running|done|failed
         self.file_status: dict[str, str] = {}
+        # Client-aware queue metadata for project/client ingestion mode
+        self.client_mode_active: bool = False
+        self.client_queue: dict[str, list[str]] = {}
+        self.client_meta: dict[str, dict] = {}
+        self.client_order: list[str] = []
+        self.file_to_client: dict[str, str] = {}
         self._iid_to_path: dict[str, str] = {}
         self._path_to_iid: dict[str, str] = {}
         self._iid_to_folder: dict[str, str] = {}
@@ -1667,13 +2104,17 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         pw.bind('<Button-1>', _maybe_block_pane_drag)
         pw.bind('<B1-Motion>', _maybe_block_pane_drag)
 
+        # Left column uses a dedicated bottom action row so run controls stay pinned.
+        left_body = ttk.Frame(left)
+        left_body.pack(fill='both', expand=True)
+
         # Left column: title, buttons, options, queue list
         title = "Drop or select audio files to enhance" if DND_AVAILABLE else "Select audio files to enhance"
-        ttk.Label(left, text=title, style='Title.TLabel').pack(anchor='w')
+        ttk.Label(left_body, text=title, style='Title.TLabel').pack(anchor='w')
 
         # (Removed dedicated drop zone; drag-and-drop works on the list below.)
 
-        btns = ttk.Frame(left)
+        btns = ttk.Frame(left_body)
         btns.pack(fill='x', pady=(0, 6))
         btn_add = ttk.Button(btns, text='Add Files', command=self.add_files)
         btn_add.pack(side='left')
@@ -1681,6 +2122,12 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         btn_add_folder = ttk.Button(btns, text='Add Folder', command=self.add_folder)
         btn_add_folder.pack(side='left', padx=6)
         self._bind_hover(btn_add_folder)
+        btn_project = ttk.Button(btns, text='Select Project', command=self._select_project_folder)
+        btn_project.pack(side='left', padx=6)
+        self._bind_hover(btn_project)
+        btn_client = ttk.Button(btns, text='Select Client', command=self._select_single_client_folder)
+        btn_client.pack(side='left', padx=6)
+        self._bind_hover(btn_client)
         btn_clear = ttk.Button(btns, text='Clear', command=self.clear_files)
         btn_clear.pack(side='left', padx=6)
         self._bind_hover(btn_clear)
@@ -1707,8 +2154,20 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self.var_output_dir = tk.StringVar(value="")
         self.var_output_media_clean = tk.BooleanVar(value=True)
         self.var_reduce_gpu = tk.BooleanVar(value=True)
+        self.var_generate_otio = tk.BooleanVar(value=False)
+        self.var_otio_client = tk.StringVar(value="")
+        self.var_otio_wide = tk.StringVar(value="")
+        self.var_otio_guest_closeup = tk.StringVar(value="")
+        self.var_otio_host_closeup = tk.StringVar(value="")
+        self.var_otio_extras = tk.StringVar(value="")
+        self.var_otio_timeline_name = tk.StringVar(value="")
+        self.client_camera_roles: dict[str, dict[str, str]] = {}
+        self._otio_client_label_to_id: dict[str, str] = {}
+        self._otio_label_to_path: dict[str, str] = {}
+        self._otio_path_to_label: dict[str, str] = {}
+        self._otio_thumb_images: dict[str, tk.PhotoImage] = {}
 
-        folder_opts = ttk.Frame(left)
+        folder_opts = ttk.Frame(left_body)
         folder_opts.pack(fill='x', pady=(0, 6))
         ttk.Checkbutton(
             folder_opts,
@@ -1717,7 +2176,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             style='Opt.TCheckbutton',
         ).pack(anchor='w')
 
-        out_box = ttk.Frame(left)
+        out_box = ttk.Frame(left_body)
         out_box.pack(fill='x', pady=(0, 8))
         ttk.Label(out_box, text='Output folder (optional):', style='Info.TLabel').pack(anchor='w')
         out_row = ttk.Frame(out_box)
@@ -1741,10 +2200,10 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self._toggle_media_clean_output()
 
         # Diagnostics mode notice (advanced controls disabled)
-        diag_box = ttk.Frame(left)
+        diag_box = ttk.Frame(left_body)
         diag_box.pack(fill='x', pady=(4, 6))
         ttk.Label(diag_box, text='Diagnostics alignment mode is locked. Advanced options are temporarily removed.', wraplength=260, justify='left').pack(fill='x')
-        noise_box = ttk.Frame(left)
+        noise_box = ttk.Frame(left_body)
         noise_box.pack(fill='x', pady=(0, 6))
         ttk.Checkbutton(
             noise_box,
@@ -1752,7 +2211,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             variable=self.var_noise_only,
             style='Opt.TCheckbutton'
         ).pack(anchor='w')
-        gpu_box = ttk.Frame(left)
+        gpu_box = ttk.Frame(left_body)
         gpu_box.pack(fill='x', pady=(0, 6))
         ttk.Checkbutton(
             gpu_box,
@@ -1760,7 +2219,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             variable=self.var_reduce_gpu,
             style='Opt.TCheckbutton'
         ).pack(anchor='w')
-        sync_box = ttk.Frame(left)
+        sync_box = ttk.Frame(left_body)
         sync_box.pack(fill='x', pady=(0, 6))
         ttk.Checkbutton(
             sync_box,
@@ -1768,12 +2227,52 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             variable=self.var_sync_export,
             style='Opt.TCheckbutton',
         ).pack(anchor='w')
+        otio_box = ttk.Frame(left_body)
+        otio_box.pack(fill='x', pady=(0, 6))
+        ttk.Checkbutton(
+            otio_box,
+            text='Generate OTIO active-speaker timeline',
+            variable=self.var_generate_otio,
+            style='Opt.TCheckbutton',
+        ).pack(anchor='w')
+        ttk.Label(otio_box, text='Client for camera assignment:', style='Info.TLabel').pack(anchor='w')
+        self.cmb_otio_client = ttk.Combobox(otio_box, textvariable=self.var_otio_client, state='readonly')
+        self.cmb_otio_client.pack(fill='x', pady=(1, 2))
+        self.cmb_otio_client.bind('<<ComboboxSelected>>', lambda e: self._on_otio_client_selected())
+        ttk.Label(otio_box, text='Wide Camera (required for OTIO):', style='Info.TLabel').pack(anchor='w')
+        row_w = ttk.Frame(otio_box)
+        row_w.pack(fill='x', pady=(1, 2))
+        self.cmb_otio_wide = ttk.Combobox(row_w, textvariable=self.var_otio_wide, state='readonly')
+        self.cmb_otio_wide.pack(side='left', fill='x', expand=True)
+        self.lbl_thumb_wide = ttk.Label(row_w, text='No thumb', style='Info.TLabel')
+        self.lbl_thumb_wide.pack(side='left', padx=(6, 0))
+        self.cmb_otio_wide.bind('<<ComboboxSelected>>', lambda e: self._on_otio_role_changed())
+        ttk.Label(otio_box, text='Guest Closeup (optional):', style='Info.TLabel').pack(anchor='w')
+        row_g = ttk.Frame(otio_box)
+        row_g.pack(fill='x', pady=(1, 2))
+        self.cmb_otio_guest = ttk.Combobox(row_g, textvariable=self.var_otio_guest_closeup, state='readonly')
+        self.cmb_otio_guest.pack(side='left', fill='x', expand=True)
+        self.lbl_thumb_guest = ttk.Label(row_g, text='No thumb', style='Info.TLabel')
+        self.lbl_thumb_guest.pack(side='left', padx=(6, 0))
+        self.cmb_otio_guest.bind('<<ComboboxSelected>>', lambda e: self._on_otio_role_changed())
+        ttk.Label(otio_box, text='Host Closeup (optional):', style='Info.TLabel').pack(anchor='w')
+        row_h = ttk.Frame(otio_box)
+        row_h.pack(fill='x', pady=(1, 2))
+        self.cmb_otio_host = ttk.Combobox(row_h, textvariable=self.var_otio_host_closeup, state='readonly')
+        self.cmb_otio_host.pack(side='left', fill='x', expand=True)
+        self.lbl_thumb_host = ttk.Label(row_h, text='No thumb', style='Info.TLabel')
+        self.lbl_thumb_host.pack(side='left', padx=(6, 0))
+        self.cmb_otio_host.bind('<<ComboboxSelected>>', lambda e: self._on_otio_role_changed())
+        ttk.Label(otio_box, text='Extra closeups role=path;role=path', style='Info.TLabel').pack(anchor='w')
+        ttk.Entry(otio_box, textvariable=self.var_otio_extras).pack(fill='x', pady=(1, 2))
+        ttk.Label(otio_box, text='OTIO Timeline Name (optional):', style='Info.TLabel').pack(anchor='w')
+        ttk.Entry(otio_box, textvariable=self.var_otio_timeline_name).pack(fill='x')
         self._adv_open = False
         self._adv_wrap = None
         self._adv_btn = None
 
         # Queue controls: filter + actions
-        ctl = ttk.Frame(left)
+        ctl = ttk.Frame(left_body)
         ctl.pack(fill='x', pady=(4, 4))
         ttk.Label(ctl, text='Show:').pack(side='left')
         self.status_filter_var = tk.StringVar(value='All')
@@ -1782,7 +2281,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self.status_filter.bind('<<ComboboxSelected>>', lambda e: self._refresh_queue_tree())
 
         # Queue tree: grouped folders with child files; multi-select enabled
-        self.queue_tree = ttk.Treeview(left, show='tree', selectmode='extended')
+        self.queue_tree = ttk.Treeview(left_body, show='tree', selectmode='extended')
         self.queue_tree.pack(fill='both', expand=True)
         # Drag-to-reorder support (when filter is 'All')
         self._drag_iid = None
@@ -1877,7 +2376,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                     if dpath:  # drop on file
                         base = self.files.index(dpath)
                         ti = base if self._drag_before else (base + 1)
-                    elif dfolder:  # drop on folder row â€“ before/after the whole block
+                    elif dfolder:  # drop on folder row – before/after the whole block
                         # Compute start and end of the folder block
                         indices = [i for i, f in enumerate(self.files) if str(Path(f).parent) == dfolder]
                         if not indices:
@@ -1998,7 +2497,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self.queue_tree.bind('<Button-3>', _q_menu_popup)
 
         # Trash can button bottom-right under queue
-        queue_footer = ttk.Frame(left)
+        queue_footer = ttk.Frame(left_body)
         queue_footer.pack(fill='x', pady=(4, 0))
         self.trash_btn = ttk.Button(queue_footer, text='Remove', width=8, command=self._remove_selected)
         self.trash_btn.pack(side='right')
@@ -2013,21 +2512,6 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 dnd_enabled = False
         if not dnd_enabled:
             _install_win_dnd(self.queue_tree, lambda files: self._add_paths(files) or self._enable_run())
-
-        # Action button at bottom of left column
-        bottom_actions = ttk.Frame(left)
-        bottom_actions.pack(fill='x', side='bottom', pady=(8, 0))
-        self.run_btn = ttk.Button(bottom_actions, text='Enhance', command=self.run_task, state='disabled', style='Accent.TButton')
-        self.run_btn.pack(fill='x')
-        self.run_btn.bind('<Enter>', lambda e: self.run_btn.configure(style='AccentHover.TButton'))
-        self.run_btn.bind('<Leave>', lambda e: self.run_btn.configure(style='Accent.TButton'))
-        # Pause/Cancel controls
-        ctrlfrm = ttk.Frame(bottom_actions)
-        ctrlfrm.pack(fill='x', pady=(6, 0))
-        self.pause_btn = ttk.Button(ctrlfrm, text='Pause', command=self._toggle_pause, state='disabled')
-        self.pause_btn.pack(side='left')
-        self.cancel_btn = ttk.Button(ctrlfrm, text='Cancel', command=self._cancel_graceful, state='disabled')
-        self.cancel_btn.pack(side='left', padx=(6, 0))
 
         progfrm = ttk.Frame(right)
         progfrm.pack(fill='x', pady=(8, 6), padx=(12, 12))
@@ -2083,6 +2567,19 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         btn_gr = ttk.Button(btnhist, text='Open Preview (Browser)', command=self._open_gradio_preview)
         btn_gr.pack(side='left', padx=(8,0))
         self._bind_hover(btn_gr)
+        # Keep run controls in the same persistent row as "Open Selected Output".
+        bottom_actions = ttk.Frame(btnhist)
+        bottom_actions.pack(side='right')
+        self.run_btn = ttk.Button(bottom_actions, text='Enhance', command=self.run_task, state='disabled', style='Accent.TButton')
+        self.run_btn.pack(side='right')
+        self.run_btn.bind('<Enter>', lambda e: self.run_btn.configure(style='AccentHover.TButton'))
+        self.run_btn.bind('<Leave>', lambda e: self.run_btn.configure(style='Accent.TButton'))
+        ctrlfrm = ttk.Frame(bottom_actions)
+        ctrlfrm.pack(side='right', padx=(8, 0))
+        self.pause_btn = ttk.Button(ctrlfrm, text='Pause', command=self._toggle_pause, state='disabled')
+        self.pause_btn.pack(side='left')
+        self.cancel_btn = ttk.Button(ctrlfrm, text='Cancel', command=self._cancel_graceful, state='disabled')
+        self.cancel_btn.pack(side='left', padx=(6, 0))
 
         # Preview handled via Gradio in a browser; no inline preview widgets
 
@@ -2105,8 +2602,290 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         folder = filedialog.askdirectory(title="Select folder containing audio")
         if not folder:
             return
+        # Legacy fallback mode
+        self.client_mode_active = False
         self._add_paths([folder])
         self._enable_run()
+
+    def _scan_client_folder(self, client_root: Path) -> tuple[Path, list[str], list[str], str | None]:
+        try:
+            # Accept selecting either client root or the 01_MEDIA folder directly.
+            if client_root.name.lower() == MEDIA_ROOT_FOLDER.lower():
+                resolved_root = client_root.parent
+                media_root = client_root
+            else:
+                resolved_root = client_root
+                media_root = client_root / MEDIA_ROOT_FOLDER
+            audio_dir = media_root / MEDIA_AUDIO_RAW_FOLDER
+            video_dir = media_root / MEDIA_VIDEO_RAW_FOLDER
+            if not audio_dir.exists() or not audio_dir.is_dir():
+                return resolved_root, [], [], f"missing {MEDIA_ROOT_FOLDER}\\{MEDIA_AUDIO_RAW_FOLDER}"
+            if not video_dir.exists() or not video_dir.is_dir():
+                return resolved_root, [], [], f"missing {MEDIA_ROOT_FOLDER}\\{MEDIA_VIDEO_RAW_FOLDER}"
+            audio_files: list[str] = []
+            for p in sorted(audio_dir.rglob("*")):
+                if p.is_file() and p.suffix.lower() in {".wav", ".wave", ".mp3"}:
+                    audio_files.append(str(p))
+            video_files: list[str] = []
+            for p in sorted(video_dir.rglob("*")):
+                if p.is_file() and p.suffix.lower() in {".mp4", ".mov", ".mxf", ".mkv", ".avi", ".mts", ".m2ts"}:
+                    video_files.append(str(p))
+            if not audio_files:
+                return resolved_root, [], video_files, f"no audio in {MEDIA_ROOT_FOLDER}\\{MEDIA_AUDIO_RAW_FOLDER}"
+            if not video_files:
+                return resolved_root, audio_files, [], f"no video in {MEDIA_ROOT_FOLDER}\\{MEDIA_VIDEO_RAW_FOLDER}"
+            return resolved_root, audio_files, video_files, None
+        except Exception as exc:
+            return client_root, [], [], str(exc)
+
+    def _apply_client_specs(self, specs: list[dict], source_desc: str) -> None:
+        # Replace queue with discovered client audio inputs.
+        self.files.clear()
+        self.folders.clear()
+        self.file_status.clear()
+        self.client_queue.clear()
+        self.client_meta.clear()
+        self.client_order.clear()
+        self.file_to_client.clear()
+        ready_clients = 0
+        skipped_clients = 0
+        detected_existing = 0
+        for spec in specs:
+            cid = str(spec.get("client_id", ""))
+            croot = str(spec.get("client_root", ""))
+            afiles = list(spec.get("audio_files", []) or [])
+            vfiles = list(spec.get("video_files", []) or [])
+            reason = spec.get("skip_reason")
+            self.client_meta[cid] = {
+                "client_root": croot,
+                "video_files": vfiles,
+                "skip_reason": reason,
+            }
+            self.client_order.append(cid)
+            if reason:
+                skipped_clients += 1
+                self.client_queue[cid] = []
+                continue
+            self.client_queue[cid] = []
+            for fp in afiles:
+                if self._has_existing_clean_output(fp):
+                    detected_existing += 1
+                if fp in self.file_to_client:
+                    continue
+                self.files.append(fp)
+                self.file_status[fp] = "queued"
+                self.file_to_client[fp] = cid
+                self.client_queue[cid].append(fp)
+                try:
+                    self.folders.add(str(Path(fp).parent))
+                except Exception:
+                    pass
+            if self.client_queue[cid]:
+                ready_clients += 1
+            else:
+                skipped_clients += 1
+                self.client_meta[cid]["skip_reason"] = "no discovered audio files"
+        self.client_mode_active = True
+        self._refresh_queue_tree()
+        self._refresh_otio_client_dropdown()
+        self._enable_run()
+        total_files = len(self.files)
+        self._log(
+            f"[client] {source_desc}: ready clients={ready_clients}, skipped={skipped_clients}, "
+            f"queued files={total_files}, detected_existing_clean={detected_existing}"
+        )
+        for cid in self.client_order:
+            meta = self.client_meta.get(cid, {})
+            reason = str(meta.get("skip_reason") or "").strip()
+            if reason:
+                root_name = Path(str(meta.get("client_root") or cid)).name
+                self._log(f"[client] skipped {root_name}: {reason}")
+        try:
+            messagebox.showinfo(
+                "Client Selection",
+                f"Ready clients: {ready_clients}\nSkipped clients: {skipped_clients}\nQueued files: {total_files}",
+                parent=self,
+            )
+        except Exception:
+            pass
+
+    def _select_project_folder(self):
+        folder = filedialog.askdirectory(title="Select project folder (contains client folders)")
+        if not folder:
+            return
+        parent = Path(folder)
+        specs: list[dict] = []
+        for child in sorted(parent.iterdir()):
+            if not child.is_dir():
+                continue
+            resolved_root, audio_files, video_files, reason = self._scan_client_folder(child)
+            cid = str(resolved_root.resolve())
+            specs.append({
+                "client_id": cid,
+                "client_root": str(resolved_root),
+                "audio_files": audio_files,
+                "video_files": video_files,
+                "skip_reason": reason,
+            })
+        if not specs:
+            self._log(f"[client] no client folders found under {folder}")
+            return
+        self._apply_client_specs(specs, source_desc=f"project selected {folder}")
+
+    def _select_single_client_folder(self):
+        folder = filedialog.askdirectory(title="Select single client folder")
+        if not folder:
+            return
+        root = Path(folder)
+        resolved_root, audio_files, video_files, reason = self._scan_client_folder(root)
+        cid = str(resolved_root.resolve())
+        specs = [{
+            "client_id": cid,
+            "client_root": str(resolved_root),
+            "audio_files": audio_files,
+            "video_files": video_files,
+            "skip_reason": reason,
+        }]
+        self._apply_client_specs(specs, source_desc=f"single client selected {folder}")
+
+    def _confirm_queue_before_run(self) -> bool:
+        """Mandatory pre-run confirmation with client/file removal support."""
+        if not self.files:
+            return False
+        temp_files = list(self.files)
+        temp_status = dict(self.file_status)
+        temp_f2c = dict(self.file_to_client)
+        temp_meta = dict(self.client_meta)
+        temp_order = list(self.client_order)
+        if not temp_f2c:
+            # Legacy fallback: synthesize client groups by parent folder.
+            for fp in temp_files:
+                cid = str(Path(fp).parent)
+                temp_f2c[fp] = cid
+                if cid not in temp_meta:
+                    temp_meta[cid] = {"client_root": cid, "video_files": [], "skip_reason": None}
+                if cid not in temp_order:
+                    temp_order.append(cid)
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Confirm Queue")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.geometry("780x500")
+        ttk.Label(dlg, text="Review queue before execution", style='Title.TLabel').pack(anchor='w', padx=10, pady=(8, 4))
+        info_var = tk.StringVar(value="")
+        ttk.Label(dlg, textvariable=info_var, style='Info.TLabel').pack(anchor='w', padx=10, pady=(0, 6))
+
+        tree = ttk.Treeview(dlg, show='tree')
+        tree.pack(fill='both', expand=True, padx=10, pady=(0, 8))
+        iid_to_file: dict[str, str] = {}
+        iid_to_client: dict[str, str] = {}
+        result = {"confirmed": False}
+
+        def _groups_from_temp() -> dict[str, list[str]]:
+            g: dict[str, list[str]] = {}
+            for fp in temp_files:
+                cid = temp_f2c.get(fp, str(Path(fp).parent))
+                g.setdefault(cid, []).append(fp)
+            return g
+
+        def _refresh_dialog_tree():
+            for iid in tree.get_children(""):
+                tree.delete(iid)
+            iid_to_file.clear()
+            iid_to_client.clear()
+            groups = _groups_from_temp()
+            ccount = 0
+            for cid in temp_order:
+                files = groups.get(cid, [])
+                if not files:
+                    continue
+                ccount += 1
+                meta = temp_meta.get(cid, {})
+                cname = Path(str(meta.get("client_root") or cid)).name or cid
+                cnode = tree.insert("", "end", text=f"{cname} ({len(files)} file(s))", open=True)
+                iid_to_client[cnode] = cid
+                for fp in files:
+                    fnode = tree.insert(cnode, "end", text=Path(fp).name)
+                    iid_to_file[fnode] = fp
+            info_var.set(f"Clients: {ccount} | Files: {len(temp_files)}")
+
+        def _remove_client():
+            sels = list(tree.selection())
+            if not sels:
+                return
+            remove_cids = set()
+            for iid in sels:
+                cid = iid_to_client.get(iid)
+                if cid:
+                    remove_cids.add(cid)
+                else:
+                    parent = tree.parent(iid)
+                    if parent:
+                        cid2 = iid_to_client.get(parent)
+                        if cid2:
+                            remove_cids.add(cid2)
+            if not remove_cids:
+                return
+            keep = []
+            for fp in temp_files:
+                if temp_f2c.get(fp) not in remove_cids:
+                    keep.append(fp)
+            temp_files[:] = keep
+            _refresh_dialog_tree()
+
+        def _remove_file():
+            sels = list(tree.selection())
+            if not sels:
+                return
+            remove_files = {iid_to_file.get(iid) for iid in sels if iid_to_file.get(iid)}
+            if not remove_files:
+                return
+            temp_files[:] = [fp for fp in temp_files if fp not in remove_files]
+            _refresh_dialog_tree()
+
+        btns = ttk.Frame(dlg)
+        btns.pack(fill='x', padx=10, pady=(0, 10))
+        b_rm_client = ttk.Button(btns, text="Remove Client", command=_remove_client)
+        b_rm_client.pack(side='left')
+        self._bind_hover(b_rm_client)
+        b_rm_file = ttk.Button(btns, text="Remove File", command=_remove_file)
+        b_rm_file.pack(side='left', padx=(6, 0))
+        self._bind_hover(b_rm_file)
+
+        def _on_confirm():
+            if not temp_files:
+                messagebox.showwarning("Empty Queue", "No files remain in the queue. Nothing to run.", parent=dlg)
+                return
+            self.files = list(temp_files)
+            self.file_status = {fp: temp_status.get(fp, "queued") for fp in self.files}
+            self.file_to_client = {fp: temp_f2c.get(fp, str(Path(fp).parent)) for fp in self.files}
+            # Rebuild client_queue and prune stale client metadata.
+            new_client_queue: dict[str, list[str]] = {}
+            for fp in self.files:
+                cid = self.file_to_client.get(fp, str(Path(fp).parent))
+                new_client_queue.setdefault(cid, []).append(fp)
+            self.client_queue = new_client_queue
+            self.client_order = [cid for cid in temp_order if cid in new_client_queue]
+            self.client_meta = {cid: temp_meta.get(cid, {"client_root": cid, "video_files": [], "skip_reason": None}) for cid in self.client_order}
+            self._refresh_queue_tree()
+            self._enable_run()
+            result["confirmed"] = True
+            self._log(f"[queue] confirmed: clients={len(self.client_queue)}, files={len(self.files)}")
+            dlg.destroy()
+
+        def _on_cancel():
+            result["confirmed"] = False
+            dlg.destroy()
+
+        b_cancel = ttk.Button(btns, text="Cancel", command=_on_cancel)
+        b_cancel.pack(side='right')
+        self._bind_hover(b_cancel)
+        b_ok = ttk.Button(btns, text="Confirm Run", command=_on_confirm, style='Accent.TButton')
+        b_ok.pack(side='right', padx=(0, 6))
+        _refresh_dialog_tree()
+        dlg.wait_window()
+        return bool(result["confirmed"])
 
     def _choose_output_dir(self):
         folder = filedialog.askdirectory(title="Select output folder")
@@ -2132,8 +2911,236 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         except Exception:
             pass
 
+    def _choose_otio_video(self, target_var):
+        path = filedialog.askopenfilename(
+            title="Select video file",
+            filetypes=[
+                ("Video files", ".mp4 .MP4 .mov .MOV .mxf .MXF .mkv .MKV .avi .AVI"),
+                ("All files", "*.*"),
+            ],
+        )
+        if path:
+            try:
+                target_var.set(path)
+            except Exception:
+                pass
+
+    def _auto_suggest_camera_roles(self, video_files: list[str]) -> dict[str, str]:
+        out: dict[str, str] = {}
+        if not video_files:
+            return out
+        files = list(video_files)
+        lowers = [Path(p).name.lower() for p in files]
+        def _pick(keys: list[str]) -> str | None:
+            for k in keys:
+                for i, nm in enumerate(lowers):
+                    if k in nm:
+                        return files[i]
+            return None
+        wide = _pick(["wide", "master", "program", "all"])
+        if not wide and files:
+            wide = files[0]
+        guest = _pick(["guest", "cam_b", "b_cam"])
+        host = _pick(["host", "interviewer", "cam_a", "a_cam"])
+        if wide:
+            out["wide"] = wide
+        if guest and guest != wide:
+            out["guest_closeup"] = guest
+        if host and host != wide:
+            out["host_closeup"] = host
+        return out
+
+    def _get_current_otio_client_id(self) -> str | None:
+        label = str(self.var_otio_client.get() or "").strip()
+        if not label:
+            return None
+        return self._otio_client_label_to_id.get(label)
+
+    def _save_otio_roles_for_current_client(self) -> None:
+        cid = self._get_current_otio_client_id()
+        if not cid:
+            return
+        wide_path = self._otio_label_to_path.get(str(self.var_otio_wide.get() or "").strip(), "")
+        guest_path = self._otio_label_to_path.get(str(self.var_otio_guest_closeup.get() or "").strip(), "")
+        host_path = self._otio_label_to_path.get(str(self.var_otio_host_closeup.get() or "").strip(), "")
+        self.client_camera_roles[cid] = {
+            "wide": wide_path,
+            "guest_closeup": guest_path,
+            "host_closeup": host_path,
+        }
+
+    def _ensure_video_thumbnail(self, video_path: str, width: int = 120, height: int = 68) -> tk.PhotoImage | None:
+        p = str(video_path or "").strip()
+        if not p:
+            return None
+        if p in self._otio_thumb_images:
+            return self._otio_thumb_images[p]
+        try:
+            thumbs_dir = INPUT_TMP_ROOT / "thumbs"
+            thumbs_dir.mkdir(parents=True, exist_ok=True)
+            src = Path(p)
+            if not src.exists():
+                return None
+            key = f"{src.stem}_{int(src.stat().st_mtime)}_{abs(hash(str(src.resolve()))) & 0xfffffff}.png"
+            outp = thumbs_dir / key
+            if not outp.exists():
+                ff = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+                if not ff:
+                    return None
+                cmd = [
+                    ff, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    "-ss", "00:00:02.000",
+                    "-i", str(src),
+                    "-frames:v", "1",
+                    "-vf", f"scale={int(width)}:{int(height)}:force_original_aspect_ratio=decrease,pad={int(width)}:{int(height)}:(ow-iw)/2:(oh-ih)/2",
+                    str(outp),
+                ]
+                proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if proc.returncode != 0 or not outp.exists():
+                    return None
+            img = tk.PhotoImage(file=str(outp))
+            self._otio_thumb_images[p] = img
+            return img
+        except Exception:
+            return None
+
+    def _refresh_otio_role_thumbnails(self) -> None:
+        role_map = [
+            (str(self.var_otio_wide.get() or "").strip(), getattr(self, "lbl_thumb_wide", None)),
+            (str(self.var_otio_guest_closeup.get() or "").strip(), getattr(self, "lbl_thumb_guest", None)),
+            (str(self.var_otio_host_closeup.get() or "").strip(), getattr(self, "lbl_thumb_host", None)),
+        ]
+        for label, widget in role_map:
+            if widget is None:
+                continue
+            p = self._otio_label_to_path.get(label, "")
+            img = self._ensure_video_thumbnail(p) if p else None
+            try:
+                if img is None:
+                    widget.configure(image="", text="No thumb")
+                else:
+                    widget.configure(image=img, text="")
+                    widget.image = img  # keep ref
+            except Exception:
+                pass
+
+    def _on_otio_role_changed(self) -> None:
+        self._save_otio_roles_for_current_client()
+        self._refresh_otio_role_thumbnails()
+
+    def _on_otio_client_selected(self) -> None:
+        self._refresh_otio_camera_dropdowns()
+
+    def _refresh_otio_client_dropdown(self) -> None:
+        labels: list[str] = []
+        self._otio_client_label_to_id.clear()
+        if self.client_mode_active and self.client_order:
+            for cid in self.client_order:
+                meta = self.client_meta.get(cid, {})
+                root = str(meta.get("client_root", cid))
+                name = Path(root).name or cid
+                label = name
+                if label in self._otio_client_label_to_id:
+                    label = f"{name} [{cid[-6:]}]"
+                self._otio_client_label_to_id[label] = cid
+                labels.append(label)
+        try:
+            self.cmb_otio_client.configure(values=labels)
+        except Exception:
+            pass
+        if labels:
+            cur = str(self.var_otio_client.get() or "")
+            if cur not in labels:
+                self.var_otio_client.set(labels[0])
+        else:
+            self.var_otio_client.set("")
+        self._refresh_otio_camera_dropdowns()
+
+    def _refresh_otio_camera_dropdowns(self) -> None:
+        cid = self._get_current_otio_client_id()
+        videos: list[str] = []
+        if cid:
+            videos = [str(v) for v in (self.client_meta.get(cid, {}).get("video_files", []) or []) if str(v).strip()]
+        self._otio_label_to_path.clear()
+        self._otio_path_to_label.clear()
+        labels: list[str] = []
+        if videos:
+            seen_labels: dict[str, int] = {}
+            for p in videos:
+                base = Path(p).name
+                n = seen_labels.get(base, 0) + 1
+                seen_labels[base] = n
+                label = base if n == 1 else f"{base} ({n})"
+                self._otio_label_to_path[label] = p
+                self._otio_path_to_label[p] = label
+                labels.append(label)
+        values = [""] + labels
+        for cmb in (getattr(self, "cmb_otio_wide", None), getattr(self, "cmb_otio_guest", None), getattr(self, "cmb_otio_host", None)):
+            try:
+                if cmb is not None:
+                    cmb.configure(values=values)
+            except Exception:
+                pass
+        # Load saved or auto-suggested values for selected client.
+        roles = dict(self.client_camera_roles.get(cid or "", {}))
+        if not roles and videos:
+            roles = self._auto_suggest_camera_roles(videos)
+            if cid:
+                self.client_camera_roles[cid] = dict(roles)
+        self.var_otio_wide.set(str(self._otio_path_to_label.get(str(roles.get("wide", "")), "")))
+        self.var_otio_guest_closeup.set(str(self._otio_path_to_label.get(str(roles.get("guest_closeup", "")), "")))
+        self.var_otio_host_closeup.set(str(self._otio_path_to_label.get(str(roles.get("host_closeup", "")), "")))
+        self._refresh_otio_role_thumbnails()
+
+    def _build_otio_camera_roles(self, client_id: str | None = None) -> dict[str, str]:
+        roles: dict[str, str] = {}
+        if client_id:
+            stored = self.client_camera_roles.get(client_id, {})
+            wide = str(stored.get("wide", "") or "").strip()
+            guest = str(stored.get("guest_closeup", "") or "").strip()
+            host = str(stored.get("host_closeup", "") or "").strip()
+        else:
+            wide = self._otio_label_to_path.get((self.var_otio_wide.get() or "").strip(), "")
+            guest = self._otio_label_to_path.get((self.var_otio_guest_closeup.get() or "").strip(), "")
+            host = self._otio_label_to_path.get((self.var_otio_host_closeup.get() or "").strip(), "")
+        if wide:
+            roles["wide"] = wide
+        if guest:
+            roles["guest_closeup"] = guest
+        if host:
+            roles["host_closeup"] = host
+        raw_extras = (self.var_otio_extras.get() or "").strip()
+        if raw_extras:
+            host_i = 1
+            guest_i = 1
+            for chunk in raw_extras.split(";"):
+                part = chunk.strip()
+                if not part:
+                    continue
+                if "=" not in part:
+                    continue
+                role, path = part.split("=", 1)
+                rr = role.strip().lower()
+                pp = path.strip()
+                if not pp:
+                    continue
+                if rr.startswith("host"):
+                    roles[f"extra_host_{host_i}"] = pp
+                    host_i += 1
+                elif rr.startswith("guest"):
+                    roles[f"extra_guest_{guest_i}"] = pp
+                    guest_i += 1
+        return roles
+
     def clear_files(self):
         self.files.clear()
+        self.client_mode_active = False
+        self.client_queue.clear()
+        self.client_meta.clear()
+        self.client_order.clear()
+        self.client_camera_roles.clear()
+        self.var_otio_client.set("")
+        self.file_to_client.clear()
         try:
             self.folders.clear()
         except Exception:
@@ -2146,6 +3153,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self.progress["value"] = 0
         self._log_clear()
         self._refresh_queue_tree()
+        self._refresh_otio_client_dropdown()
 
     # Removed the old modal preview dialog in favor of inline media preview
 
@@ -2376,11 +3384,20 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
 
     # Removed inline preview playback and export; using Gradio-based preview instead
     def _add_paths(self, paths):
+        # Legacy ingestion path: disable client mode if explicitly adding raw files/folders.
+        if paths:
+            self.client_mode_active = False
+            self.client_queue.clear()
+            self.client_meta.clear()
+            self.client_order.clear()
+            self.client_camera_roles.clear()
+            self.var_otio_client.set("")
+            self.file_to_client.clear()
         def _is_audio(path: str) -> bool:
             suf = Path(path).suffix.lower()
             return suf in {'.wav', '.wave', '.mp3'}
         file_set = set(self.files)
-        skipped_existing = 0
+        detected_existing = 0
         for p in paths:
             p = str(p)
             try:
@@ -2394,8 +3411,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                     continue
                                 sfp = str(Path(root) / name)
                                 if self._has_existing_clean_output(sfp):
-                                    skipped_existing += 1
-                                    continue
+                                    detected_existing += 1
                                 if sfp not in file_set:
                                     file_set.add(sfp)
                                     self.files.append(sfp)
@@ -2406,8 +3422,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                             if f.is_file() and _is_audio(str(f)):
                                 sfp = str(f)
                                 if self._has_existing_clean_output(sfp):
-                                    skipped_existing += 1
-                                    continue
+                                    detected_existing += 1
                                 if sfp not in file_set:
                                     file_set.add(sfp)
                                     self.files.append(sfp)
@@ -2419,16 +3434,19 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 pass
             if _is_audio(p) and p not in self.files:
                 if self._has_existing_clean_output(p):
-                    skipped_existing += 1
-                    continue
+                    detected_existing += 1
                 self.files.append(p)
                 self.file_status[p] = self.file_status.get(p, 'queued')
-        if skipped_existing:
+        if detected_existing:
             try:
-                self._log(f"Skipped {skipped_existing} file(s) already CLEAN in 01_MEDIA\\030_AUDIO_CLEAN.")
+                self._log(
+                    f"Detected existing CLEAN outputs for {detected_existing} file(s). "
+                    f"Enhance will be skipped for those files, but sync/OTIO can still run."
+                )
             except Exception:
                 pass
         self._refresh_queue_tree()
+        self._refresh_otio_client_dropdown()
 
     def _enable_run(self):
         enabled = "normal" if self.files else "disabled"
@@ -2452,28 +3470,54 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         except Exception:
             pass
         groups: dict[str, list[str]] = {}
-        for fp in self.files:
-            parent = str(Path(fp).parent)
-            groups.setdefault(parent, []).append(fp)
-        # Include explicitly added empty folders
-        for d in self.folders:
-            groups.setdefault(d, groups.get(d, []))
-        # Determine folder order by first appearance in self.files, then any explicitly added folders
-        seen = set()
         folder_order: list[str] = []
-        for f in self.files:
-            parent = str(Path(f).parent)
-            if parent not in seen:
-                seen.add(parent)
-                folder_order.append(parent)
-        for d in self.folders:
-            if d not in seen:
-                seen.add(d)
-                folder_order.append(d)
+        if self.client_mode_active:
+            for cid in self.client_order:
+                groups.setdefault(cid, [])
+            for fp in self.files:
+                cid = self.file_to_client.get(fp, str(Path(fp).parent))
+                groups.setdefault(cid, []).append(fp)
+            seen = set()
+            for cid in self.client_order:
+                if cid not in seen:
+                    seen.add(cid)
+                    folder_order.append(cid)
+            for cid in groups.keys():
+                if cid not in seen:
+                    seen.add(cid)
+                    folder_order.append(cid)
+        else:
+            for fp in self.files:
+                parent = str(Path(fp).parent)
+                groups.setdefault(parent, []).append(fp)
+            # Include explicitly added empty folders
+            for d in self.folders:
+                groups.setdefault(d, groups.get(d, []))
+            # Determine folder order by first appearance in self.files, then any explicitly added folders
+            seen = set()
+            for f in self.files:
+                parent = str(Path(f).parent)
+                if parent not in seen:
+                    seen.add(parent)
+                    folder_order.append(parent)
+            for d in self.folders:
+                if d not in seen:
+                    seen.add(d)
+                    folder_order.append(d)
 
         gidx = 0
         for folder in folder_order:
-            node = self.queue_tree.insert('', 'end', text=folder, open=True)
+            if self.client_mode_active and folder in self.client_meta:
+                meta = self.client_meta.get(folder, {})
+                cname = Path(str(meta.get("client_root", folder))).name
+                reason = str(meta.get("skip_reason") or "").strip()
+                if reason and not groups.get(folder):
+                    title = f"{cname} (skipped: {reason})"
+                else:
+                    title = f"{cname}"
+            else:
+                title = folder
+            node = self.queue_tree.insert('', 'end', text=title, open=True)
             self._iid_to_folder[node] = folder
             self._folder_to_iid[folder] = node
             gtag = 'g_odd' if (gidx % 2 == 0) else 'g_even'
@@ -2484,7 +3528,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             gidx += 1
             children = groups[folder]
             if not children:
-                self.queue_tree.insert(node, 'end', text='(no wav files)')
+                self.queue_tree.insert(node, 'end', text='(no queued files)')
             else:
                 # Preserve ordering as in self.files; apply status filter
                 want = self.status_filter_var.get()
@@ -2566,8 +3610,13 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             pass
 
     def _log(self, msg, color: str | None = None):
+        text = str(msg)
         try:
-            self.status_label.configure(text=str(msg), foreground=(color or self._text))
+            print(text, flush=True)
+        except Exception:
+            pass
+        try:
+            self.status_label.configure(text=text, foreground=(color or self._text))
         except Exception:
             pass
 
@@ -2631,6 +3680,12 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             "denoise_mix_wet": float(self.var_wet.get()),
             "chunk_seconds_effective": float(chunk_seconds),
             "overlap_seconds_effective": float(overlap_seconds),
+            "generate_otio": bool(self.var_generate_otio.get()),
+            "otio_wide": str(self._otio_label_to_path.get(str(self.var_otio_wide.get() or "").strip(), "")),
+            "otio_guest_closeup": str(self._otio_label_to_path.get(str(self.var_otio_guest_closeup.get() or "").strip(), "")),
+            "otio_host_closeup": str(self._otio_label_to_path.get(str(self.var_otio_host_closeup.get() or "").strip(), "")),
+            "otio_extras": str(self.var_otio_extras.get() or ""),
+            "otio_timeline_name": str(self.var_otio_timeline_name.get() or ""),
             "files_enqueued": files,
             "file_count": len(files),
             "ffmpeg_path": shutil.which('ffmpeg') or shutil.which('ffmpeg.exe') or '',
@@ -2687,6 +3742,13 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
 
     def _clear_queue(self):
         self.files.clear()
+        self.client_mode_active = False
+        self.client_queue.clear()
+        self.client_meta.clear()
+        self.client_order.clear()
+        self.client_camera_roles.clear()
+        self.var_otio_client.set("")
+        self.file_to_client.clear()
         try:
             self.folders.clear()
         except Exception:
@@ -2733,8 +3795,20 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             return
         self.files = [f for f in self.files if f not in sel]
         for f in sel:
+            self.file_to_client.pop(f, None)
+        for f in sel:
             self.file_status.pop(f, None)
+        if self.client_mode_active:
+            rebuilt: dict[str, list[str]] = {}
+            for f in self.files:
+                cid = self.file_to_client.get(f)
+                if cid:
+                    rebuilt.setdefault(cid, []).append(f)
+            self.client_queue = rebuilt
+            self.client_order = [cid for cid in self.client_order if cid in rebuilt]
+            self.client_meta = {cid: self.client_meta.get(cid, {"client_root": cid, "video_files": [], "skip_reason": None}) for cid in self.client_order}
         self._refresh_queue_tree()
+        self._refresh_otio_client_dropdown()
         self._enable_run()
 
     def _move_selection(self, direction: int):
@@ -2760,6 +3834,16 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
 
     def _clear_processed(self):
         self.files = [f for f in self.files if self.file_status.get(f) != 'done']
+        if self.client_mode_active:
+            self.file_to_client = {f: c for f, c in self.file_to_client.items() if f in set(self.files)}
+            rebuilt: dict[str, list[str]] = {}
+            for f in self.files:
+                cid = self.file_to_client.get(f)
+                if cid:
+                    rebuilt.setdefault(cid, []).append(f)
+            self.client_queue = rebuilt
+            self.client_order = [cid for cid in self.client_order if cid in rebuilt]
+            self.client_meta = {cid: self.client_meta.get(cid, {"client_root": cid, "video_files": [], "skip_reason": None}) for cid in self.client_order}
         self._refresh_queue_tree()
         self._enable_run()
 
@@ -2782,6 +3866,12 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
 
     def run_task(self):
         if not self.files:
+            return
+        if not self._confirm_queue_before_run():
+            self._log("[queue] run cancelled at confirmation step.")
+            return
+        if not self.files:
+            self._log("[queue] no files remain after confirmation.")
             return
 
         # Initialize control flags and UI
@@ -2918,25 +4008,35 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         staging_root = None
                 # Build groups: always batch by folder when recursive search is enabled
                 files_all = list(self.files)
-                # Skip files already cleaned in 01_MEDIA\\030_AUDIO_CLEAN for that folder
+                # Detect reusable CLEAN outputs so we can skip enhance but still run sync/OTIO.
+                existing_clean_map: dict[str, str] = {}
                 if files_all:
-                    skipped = []
-                    kept = []
+                    reused = 0
                     for fp in files_all:
-                        if self._has_existing_clean_output(fp):
-                            skipped.append(fp)
-                            try:
-                                self.after(0, self._set_file_status, fp, 'done')
-                            except Exception:
-                                pass
-                        else:
-                            kept.append(fp)
-                    if skipped:
-                        self.after(0, lambda n=len(skipped): self._log(f"Skipped {n} file(s) with existing CLEAN output in 01_MEDIA\\030_AUDIO_CLEAN."))
-                    files_all = kept
-                    if not files_all:
-                        self.after(0, lambda: self._log("All selected files already have CLEAN outputs; nothing to process."))
-                        return
+                        p = _find_existing_clean_for_source(Path(fp))
+                        if p is not None:
+                            existing_clean_map[str(fp)] = str(p)
+                            reused += 1
+                    if reused:
+                        try:
+                            sample_map = list(existing_clean_map.items())[:4]
+                            for src, clean in sample_map:
+                                self.after(0, lambda s=Path(src).name, c=Path(clean).name: self._log(f"Reuse: {s} -> {c}"))
+                        except Exception:
+                            pass
+                        self.after(
+                            0,
+                            lambda n=reused: self._log(
+                                f"Reusing existing CLEAN output for {n} file(s); skipping enhance for those while keeping sync/OTIO enabled."
+                            ),
+                        )
+                    else:
+                        self.after(
+                            0,
+                            lambda: self._log(
+                                "No reusable CLEAN outputs detected for current selection; running enhance on queued files."
+                            ),
+                        )
                 groups: list[tuple[str, list[str]]] = []
                 batch_by_folder = bool(self.var_batch_folders.get()) or bool(self.var_recursive_folders.get())
                 if batch_by_folder:
@@ -2990,6 +4090,37 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         self.overall_label["text"] = f"Group {gi}/{total_groups}: {done} of {total} files ({pct}%)"
 
                     use_files = list(gfiles)
+                    # Group-level fallback: if a synced CLEAN MOV exists, map all files to it
+                    # so we can skip enhance/sync and still generate OTIO.
+                    try:
+                        if len(gfiles) >= 2:
+                            mapped_now = sum(1 for f in gfiles if f in existing_clean_map)
+                            if mapped_now < len(gfiles):
+                                grp_clean = _find_reusable_synced_clean_for_group(gfiles)
+                                if grp_clean is not None:
+                                    added = 0
+                                    grp_clean_s = str(grp_clean)
+                                    for f in gfiles:
+                                        if f not in existing_clean_map:
+                                            existing_clean_map[f] = grp_clean_s
+                                            added += 1
+                                    if added > 0:
+                                        self.after(
+                                            0,
+                                            lambda gi=gi, a=added, p=Path(grp_clean_s).name: self._log(
+                                                f"Group {gi}: mapped {a} file(s) to reusable synced CLEAN source {p}."
+                                            ),
+                                        )
+                    except Exception:
+                        pass
+                    existing_results = [(src, existing_clean_map[src]) for src in gfiles if src in existing_clean_map]
+                    use_files = [f for f in use_files if f not in existing_clean_map]
+                    self.after(
+                        0,
+                        lambda gi=gi, total=len(gfiles), reused=len(existing_results), pending=len(use_files): self._log(
+                            f"Group {gi}: queue summary total={total}, reusable_clean={reused}, to_enhance={pending}"
+                        ),
+                    )
 
                     # Enhance this group
                     prefer_cli = (self.var_diag_minimal.get() or (not self.var_denoise_only.get()))
@@ -2999,22 +4130,100 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                     if reduce_gpu:
                         prefer_cli = False
                     enhance_t0 = time.perf_counter()
-                    results = run_enhancer_for(
-                        use_files,
-                        device=self.var_device.get(),
-                        profile=self.var_profile.get(),
-                        progress_cb=lambda d, t: self.after(0, update_prog_group, d, t),
-                        chunk_progress_cb=lambda name, i, n: self.after(0, update_chunk, name, i, n),
-                        seam_safe=self.var_seam_safe.get(),
-                        control=(self._control if reduce_gpu else (None if self.var_diag_minimal.get() else self._control)),
-                        denoise_only=self.var_denoise_only.get(),
-                        prefer_cli=prefer_cli,
-                        noise_only=self.var_noise_only.get(),
-                        output_dir=group_output_dir,
-                        force_inprocess=reduce_gpu,
-                    )
+                    results: list[tuple[str, str]] = []
+                    if use_files:
+                        results = run_enhancer_for(
+                            use_files,
+                            device=self.var_device.get(),
+                            profile=self.var_profile.get(),
+                            progress_cb=lambda d, t: self.after(0, update_prog_group, d, t),
+                            chunk_progress_cb=lambda name, i, n: self.after(0, update_chunk, name, i, n),
+                            seam_safe=self.var_seam_safe.get(),
+                            control=(self._control if reduce_gpu else (None if self.var_diag_minimal.get() else self._control)),
+                            denoise_only=self.var_denoise_only.get(),
+                            prefer_cli=prefer_cli,
+                            noise_only=self.var_noise_only.get(),
+                            output_dir=group_output_dir,
+                            force_inprocess=reduce_gpu,
+                        )
+                    if existing_results:
+                        results.extend(existing_results)
                     enhance_dt = time.perf_counter() - enhance_t0
                     self.after(0, lambda gi=gi, dt=enhance_dt: self._log(f"Timing: group {gi} enhance {_format_seconds(dt)}"))
+                    if existing_results and not use_files:
+                        self.after(0, lambda gi=gi, n=len(existing_results): self._log(f"Group {gi}: skipped enhance for {n} file(s), using existing CLEAN files."))
+                        # If every input in this group already has CLEAN output, skip downstream
+                        # post-process/sync. Still try OTIO generation from existing clean files.
+                        try:
+                            done_set_existing = {src for (src, _out) in existing_results}
+                            for f in gfiles:
+                                if f in done_set_existing:
+                                    self.after(0, self._set_file_status, f, 'done')
+                            self.after(0, lambda results=existing_results: self._append_history(results))
+                            write_otio = bool(self.var_generate_otio.get())
+                            group_client_id = None
+                            try:
+                                if gfiles:
+                                    group_client_id = self.file_to_client.get(gfiles[0])
+                            except Exception:
+                                group_client_id = None
+                            otio_roles = self._build_otio_camera_roles(client_id=group_client_id) if write_otio else None
+                            otio_name = (self.var_otio_timeline_name.get() or "").strip() if write_otio else ""
+                            otio_out_dir = None
+                            if write_otio and group_client_id:
+                                try:
+                                    croot = str(self.client_meta.get(group_client_id, {}).get("client_root", "")).strip()
+                                    if croot:
+                                        otio_out_dir = str(Path(croot) / "02_EDIT")
+                                except Exception:
+                                    otio_out_dir = None
+                            if write_otio and (not otio_roles or not str(otio_roles.get("wide", "")).strip()):
+                                self.after(0, lambda: self._log("[otio] Wide camera is required. Skipping OTIO for this all-clean group."))
+                                write_otio = False
+                            if write_otio:
+                                try:
+                                    target_sr = 48000
+                                    clean_src = _find_synced_clean_for_group(gfiles)
+                                    if clean_src is None:
+                                        self.after(0, lambda: self._log("[otio] clean synced multichannel source not found; skipping OTIO."))
+                                    else:
+                                        switch_monos = _load_audio_tracks_any(clean_src, target_sr=target_sr)
+                                        max_len = max([0] + [int(m.size(-1)) for m in switch_monos]) if switch_monos else 0
+                                        aligned_paths = [Path(p) for p in gfiles]
+                                        if len(switch_monos) >= 2 and max_len > 0:
+                                            out_dir_for_otio = Path(otio_out_dir) if otio_out_dir else (group_media_clean_dir if group_media_clean_dir else Path(gname))
+                                            out_dir_for_otio.mkdir(parents=True, exist_ok=True)
+                                            stamp_ot = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                                            otio_path, turns_path = _write_active_speaker_otio(
+                                                aligned_paths=aligned_paths,
+                                                switch_monos=switch_monos,
+                                                target_sr=target_sr,
+                                                total_samples=max_len,
+                                                out_dir=out_dir_for_otio,
+                                                stamp=stamp_ot,
+                                                camera_roles=otio_roles,
+                                                clean_audio_path=str(clean_src),
+                                                timeline_name=(otio_name or None),
+                                                log=lambda m: self.after(0, self._log, m),
+                                            )
+                                            if otio_path:
+                                                self.after(0, lambda p=otio_path: self._append_history([(gname, p)]))
+                                                self.after(0, lambda p=otio_path: self._log(f"[otio] written (all-clean group): {p}"))
+                                            if turns_path:
+                                                self.after(0, lambda p=turns_path: self._log(f"[otio] turns diagnostics: {p}"))
+                                        else:
+                                            self.after(0, lambda: self._log("[otio] skipped for all-clean group: need >=2 clean channels for switching."))
+                                except Exception as exc:
+                                    self.after(0, lambda exc=exc: self._log(f"[otio] all-clean generation error: {exc}"))
+                            self.after(0, lambda gi=gi: self._log(f"Group {gi}: all inputs already CLEAN; skipped post-process and sync."))
+                        except Exception as exc:
+                            self.after(0, lambda gi=gi, exc=exc: self._log(f"Group {gi}: all-clean skip path error: {exc}"))
+                        processed_groups = gi
+                        if self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set():
+                            break
+                        group_dt = time.perf_counter() - group_t0
+                        self.after(0, lambda gi=gi, dt=group_dt: self._log(f"Timing: group {gi} total {_format_seconds(dt)}"))
+                        continue
                     try:
                         if LAST_MODEL_SR is not None:
                             msg = f"Model SR: {LAST_MODEL_SR} Hz"
@@ -3088,11 +4297,26 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                 self._set_status(f"{msg} - {pct}%")
                                 if self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set():
                                     raise _Cancelled()
-                            skip_fine_align = self.var_skip_fine.get()
-                            force_fine_align = self.var_diag_minimal.get()
-                            force_drift = force_fine_align
-                            if force_fine_align:
-                                skip_fine_align = False  # Diagnostics require fine alignment to verify sync.
+                            write_otio = bool(self.var_generate_otio.get())
+                            group_client_id = None
+                            try:
+                                if gfiles:
+                                    group_client_id = self.file_to_client.get(gfiles[0])
+                            except Exception:
+                                group_client_id = None
+                            otio_roles = self._build_otio_camera_roles(client_id=group_client_id) if write_otio else None
+                            otio_name = (self.var_otio_timeline_name.get() or "").strip() if write_otio else ""
+                            otio_out_dir = None
+                            if write_otio and group_client_id:
+                                try:
+                                    croot = str(self.client_meta.get(group_client_id, {}).get("client_root", "")).strip()
+                                    if croot:
+                                        otio_out_dir = str(Path(croot) / "02_EDIT")
+                                except Exception:
+                                    otio_out_dir = None
+                            if write_otio and (not otio_roles or not str(otio_roles.get("wide", "")).strip()):
+                                self.after(0, lambda: self._log("[otio] Wide camera is required. Skipping OTIO for this group."))
+                                write_otio = False
                             out_path = _sync_and_export_multichannel_simple(
                                 outs,
                                 prefer_48k=self.var_profile.get(),
@@ -3103,17 +4327,12 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                 out_base_dir=(str(group_media_clean_dir) if group_media_clean_dir else (output_override or gname)),
                                 flat_output=bool(output_override or group_media_clean_dir),
                                 enable_bleed_gate=True,
+                                write_otio=write_otio,
+                                otio_camera_roles=otio_roles,
+                                otio_timeline_name=(otio_name or None),
+                                otio_out_dir=otio_out_dir,
                             )
                             if out_path:
-                                ch = 0
-                                try:
-                                    if str(out_path).lower().endswith('.wav'):
-                                        import torchaudio as _ta
-                                        info = _ta.info(out_path)
-                                        ch = getattr(info, 'num_channels', 0) or 0
-                                except Exception:
-                                    ch = 0
-                                label = f"Multichannel ({ch} ch)" if ch else "Multichannel"
                                 self.after(0, lambda: self._append_history([(gname, out_path)]))
                                 self.after(0, lambda: self._log(f"Group {gi}: multichannel export written: {out_path}"))
                                 # Remove per-file outputs when a multichannel export is produced
@@ -3205,6 +4424,1083 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
 
 # --- Alignment and multichannel export helpers (Audalign-based) ---
 
+_LOW_INFO_FILLERS = {
+    "hmm", "hm", "mhmm", "mmhmm", "mmm", "uhhuh", "uh-huh", "uhuh", "mm", "mhm",
+}
+_LOW_INFO_ACKS = {
+    "yeah", "yep", "ok", "okay", "right", "sure", "cool",
+}
+
+
+def _tokenize_words(text: str) -> list[str]:
+    return [t for t in re.findall(r"[a-zA-Z']+", str(text).lower()) if t]
+
+
+def _is_low_info_text(text: str) -> bool:
+    toks = _tokenize_words(text)
+    if not toks:
+        return True
+    if all(t in _LOW_INFO_FILLERS for t in toks):
+        return True
+    non_fill = [t for t in toks if t not in _LOW_INFO_FILLERS]
+    if len(non_fill) <= 1 and all(t in _LOW_INFO_ACKS or t in _LOW_INFO_FILLERS for t in non_fill):
+        return True
+    return False
+
+
+def _build_speaker_turns(
+    winner_idx,
+    conf,
+    hop_ms: float,
+    n_speakers: int,
+    min_conf: float = 0.66,
+    min_dur_s: float = 0.8,
+    merge_gap_s: float = 0.35,
+) -> list[dict]:
+    """Convert per-frame winner/confidence to stable speaker turns."""
+    if winner_idx is None or conf is None:
+        return []
+    if int(getattr(winner_idx, "numel", lambda: 0)()) <= 0:
+        return []
+    hop_s = max(1e-6, float(hop_ms) / 1000.0)
+    min_frames = max(1, int(round(float(min_dur_s) / hop_s)))
+    merge_gap_frames = max(0, int(round(float(merge_gap_s) / hop_s)))
+    conf_thr = float(min_conf)
+    n_frames = int(winner_idx.numel())
+    turns: list[dict] = []
+    cur_spk = None
+    cur_start = 0
+    conf_sum = 0.0
+    conf_cnt = 0
+
+    def _close(end_f: int):
+        nonlocal cur_spk, cur_start, conf_sum, conf_cnt
+        if cur_spk is None:
+            return
+        dur = int(end_f - cur_start)
+        if dur >= min_frames and conf_cnt > 0:
+            avg_conf = conf_sum / max(1, conf_cnt)
+            if avg_conf >= conf_thr:
+                turns.append({
+                    "speaker_idx": int(cur_spk),
+                    "start_s": float(cur_start * hop_s),
+                    "end_s": float(end_f * hop_s),
+                    "avg_conf": float(avg_conf),
+                    "text": "",
+                    "is_filtered": False,
+                })
+        cur_spk = None
+        conf_sum = 0.0
+        conf_cnt = 0
+
+    for i in range(n_frames):
+        spk = int(winner_idx[i].item())
+        if spk < 0 or spk >= int(n_speakers):
+            _close(i)
+            continue
+        c = float(conf[i].item()) if i < int(conf.numel()) else 0.0
+        if c < conf_thr:
+            _close(i)
+            continue
+        if cur_spk is None:
+            cur_spk = spk
+            cur_start = i
+            conf_sum = c
+            conf_cnt = 1
+            continue
+        if spk == cur_spk:
+            conf_sum += c
+            conf_cnt += 1
+            continue
+        _close(i)
+        cur_spk = spk
+        cur_start = i
+        conf_sum = c
+        conf_cnt = 1
+    _close(n_frames)
+
+    if not turns:
+        return turns
+    merged: list[dict] = [turns[0]]
+    for t in turns[1:]:
+        prev = merged[-1]
+        gap = float(t["start_s"] - prev["end_s"])
+        if int(t["speaker_idx"]) == int(prev["speaker_idx"]) and gap <= float(merge_gap_frames * hop_s):
+            prev["end_s"] = float(t["end_s"])
+            prev["avg_conf"] = float((float(prev["avg_conf"]) + float(t["avg_conf"])) * 0.5)
+        else:
+            merged.append(t)
+    return merged
+
+
+def _transcribe_words_openai(wav_path: Path) -> list[dict]:
+    api_key = str(os.environ.get("OPENAI_API_KEY", "")).strip()
+    if not api_key:
+        return []
+    try:
+        from openai import OpenAI  # type: ignore[import-not-found]
+    except Exception:
+        return []
+    try:
+        client = OpenAI(api_key=api_key)
+        with wav_path.open("rb") as f:
+            rsp = client.audio.transcriptions.create(
+                model="gpt-4o-mini-transcribe",
+                file=f,
+                response_format="verbose_json",
+                timestamp_granularities=["word"],
+            )
+    except Exception:
+        return []
+    try:
+        words_raw = getattr(rsp, "words", None)
+        if words_raw is None and isinstance(rsp, dict):
+            words_raw = rsp.get("words")
+        out: list[dict] = []
+        for w in (words_raw or []):
+            if hasattr(w, "word"):
+                txt = str(getattr(w, "word", "") or "")
+                st = float(getattr(w, "start", 0.0) or 0.0)
+                en = float(getattr(w, "end", st) or st)
+            else:
+                txt = str((w or {}).get("word", "") or "")
+                st = float((w or {}).get("start", 0.0) or 0.0)
+                en = float((w or {}).get("end", st) or st)
+            out.append({"word": txt, "start": st, "end": max(st, en)})
+        return out
+    except Exception:
+        return []
+
+
+def _attach_turn_text(turns: list[dict], words_by_speaker: dict[int, list[dict]]) -> None:
+    for t in turns:
+        si = int(t.get("speaker_idx", -1))
+        t0 = float(t.get("start_s", 0.0))
+        t1 = float(t.get("end_s", t0))
+        words = []
+        for w in words_by_speaker.get(si, []):
+            ws = float(w.get("start", 0.0))
+            we = float(w.get("end", ws))
+            if we >= t0 and ws <= t1:
+                words.append(str(w.get("word", "") or "").strip())
+        txt = " ".join([w for w in words if w])
+        t["text"] = txt
+        if txt:
+            t["is_filtered"] = bool(_is_low_info_text(txt))
+        else:
+            t["is_filtered"] = False
+
+
+def _probe_video_fps(path: Path, default_fps: float = 25.0) -> float:
+    ffprobe = shutil.which("ffprobe") or shutil.which("ffprobe.exe")
+    if not ffprobe:
+        return float(default_fps)
+    try:
+        cmd = [
+            ffprobe,
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=0",
+            str(path),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        txt = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        m = re.search(r"(avg_frame_rate|r_frame_rate)=([0-9]+)/([0-9]+)", txt)
+        if m:
+            num = float(m.group(2))
+            den = float(m.group(3))
+            if den > 0:
+                fps = num / den
+                if fps > 1.0:
+                    return fps
+    except Exception:
+        pass
+    return float(default_fps)
+
+
+def _select_camera_for_speaker(speaker_idx: int, host_idx: int, wide: str, camera_roles: dict[str, str]) -> str:
+    host_paths: list[str] = []
+    guest_paths: list[str] = []
+    host_close = str(camera_roles.get("host_closeup", "")).strip()
+    guest_close = str(camera_roles.get("guest_closeup", "")).strip()
+    if host_close:
+        host_paths.append(host_close)
+    if guest_close:
+        guest_paths.append(guest_close)
+    for k, v in camera_roles.items():
+        vv = str(v or "").strip()
+        if not vv:
+            continue
+        lk = str(k).lower()
+        if lk.startswith("extra_host"):
+            host_paths.append(vv)
+        elif lk.startswith("extra_guest"):
+            guest_paths.append(vv)
+    if int(speaker_idx) == int(host_idx):
+        return host_paths[0] if host_paths else wide
+    return guest_paths[0] if guest_paths else wide
+
+
+def _probe_media_duration(path: Path) -> float:
+    ffprobe = shutil.which("ffprobe") or shutil.which("ffprobe.exe")
+    if not ffprobe:
+        return 0.0
+    try:
+        cmd = [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        return max(0.0, float((proc.stdout or "0").strip() or 0.0))
+    except Exception:
+        return 0.0
+
+
+def _compute_camera_overlap_window(camera_paths: list[str]) -> tuple[float, float] | None:
+    vals: list[float] = []
+    for p in camera_paths:
+        d = _probe_media_duration(Path(p))
+        if d > 0.0:
+            vals.append(d)
+    if not vals:
+        return None
+    return (0.0, float(min(vals)))
+
+
+def _detect_speech_onset_seconds(mono, sr: int, hop_s: float = 0.1, min_stable_s: float = 1.5) -> float | None:
+    try:
+        import numpy as np
+        import torch
+        if isinstance(mono, torch.Tensor):
+            x = mono.detach().cpu().float().numpy()
+        else:
+            x = np.asarray(mono, dtype=np.float32)
+        if x.ndim != 1 or x.size < int(sr * 0.5):
+            return None
+        hop = max(1, int(round(float(sr) * float(hop_s))))
+        n = int(x.size // hop)
+        if n < 8:
+            return None
+        x = x[: n * hop].reshape(n, hop)
+        env = np.sqrt(np.mean(x * x, axis=1) + 1e-12)
+        nf = float(np.quantile(env, 0.2))
+        thr = max(nf * 3.5, nf + float(np.std(env)) * 2.0)
+        voiced = env > thr
+        need = max(1, int(round(float(min_stable_s) / float(hop_s))))
+        run = 0
+        for i, v in enumerate(voiced.tolist()):
+            run = run + 1 if v else 0
+            if run >= need:
+                return float((i - need + 1) * hop_s)
+        return None
+    except Exception:
+        return None
+
+
+def _estimate_pair_offset_voiced(ref_mono, src_mono, sr: int, ref_onset_s: float, src_onset_s: float, window_s: float = 45.0) -> dict:
+    try:
+        import numpy as np
+        if hasattr(ref_mono, "detach"):
+            ref = ref_mono.detach().cpu().float().numpy()
+        else:
+            ref = np.asarray(ref_mono, dtype=np.float32)
+        if hasattr(src_mono, "detach"):
+            src = src_mono.detach().cpu().float().numpy()
+        else:
+            src = np.asarray(src_mono, dtype=np.float32)
+        if ref.size < sr or src.size < sr:
+            return {"ok": False, "reason": "too_short", "offset_s": 0.0, "residual_s": None}
+
+        w = int(max(1, round(window_s * sr)))
+        rs = max(0, int(round(ref_onset_s * sr)) - (w // 2))
+        ss = max(0, int(round(src_onset_s * sr)) - (w // 2))
+        re = min(ref.size, rs + w)
+        se = min(src.size, ss + w)
+        rw = ref[rs:re]
+        sw = src[ss:se]
+        n = min(rw.size, sw.size)
+        if n < int(sr * 2):
+            return {"ok": False, "reason": "window_too_short", "offset_s": 0.0, "residual_s": None}
+        rw = rw[:n]
+        sw = sw[:n]
+        lag = float(_gcc_phat_lag(rw, sw) / float(sr))
+        # src offset relative to ref: positive means src starts later.
+        off = float(-lag + (src_onset_s - ref_onset_s))
+
+        # residual check after applying solved offset.
+        d = int(round(max(0.0, off) * sr))
+        sw2 = sw[d:] if d > 0 and d < sw.size else sw
+        n2 = min(rw.size, sw2.size)
+        if n2 >= int(sr * 1):
+            res = float(_gcc_phat_lag(rw[:n2], sw2[:n2]) / float(sr))
+        else:
+            res = None
+        return {"ok": True, "reason": "ok", "offset_s": off, "residual_s": res}
+    except Exception as exc:
+        return {"ok": False, "reason": f"error:{exc}", "offset_s": 0.0, "residual_s": None}
+
+
+def _solve_multisource_offsets_from_anchor(source_paths: list[str], target_sr: int = 48000, log=None) -> dict:
+    def _emit(msg: str) -> None:
+        if log:
+            try:
+                log(msg)
+            except Exception:
+                pass
+
+    srcs = [str(p).strip() for p in source_paths if str(p).strip()]
+    out = {
+        "offsets": {p: 0.0 for p in srcs},
+        "onsets": {p: None for p in srcs},
+        "quality": {},
+    }
+    if len(srcs) < 2:
+        return out
+    monos: dict[str, object] = {}
+    for p in srcs:
+        tr = _load_audio_tracks_any(p, target_sr=target_sr)
+        if not tr:
+            _emit(f"[otio] source decode failed for onset solve: {p}")
+            continue
+        try:
+            if len(tr) > 1:
+                import torch
+                mono = torch.mean(torch.stack(tr, dim=0), dim=0)
+            else:
+                mono = tr[0]
+            monos[p] = mono
+        except Exception:
+            monos[p] = tr[0]
+    if len(monos) < 2:
+        return out
+
+    onsets: dict[str, float] = {}
+    for p, m in monos.items():
+        o = _detect_speech_onset_seconds(m, target_sr)
+        if o is None:
+            o = 0.0
+        onsets[p] = float(o)
+        out["onsets"][p] = float(o)
+
+    # anchor pair: cam1 (first source) vs lav1 (last source).
+    cam1 = srcs[0]
+    lav1 = srcs[-1]
+    if cam1 not in monos or lav1 not in monos:
+        return out
+    raw: dict[str, float] = {cam1: 0.0}
+    q: dict[str, dict] = {}
+    p1 = _estimate_pair_offset_voiced(monos[cam1], monos[lav1], target_sr, onsets.get(cam1, 0.0), onsets.get(lav1, 0.0))
+    q[f"{Path(cam1).name}->{Path(lav1).name}"] = dict(p1)
+    if p1.get("ok"):
+        raw[lav1] = float(p1.get("offset_s", 0.0))
+    else:
+        raw[lav1] = float(onsets.get(lav1, 0.0) - onsets.get(cam1, 0.0))
+
+    # other sources relative to cam1.
+    for p in srcs[1:-1]:
+        if p not in monos:
+            continue
+        pr = _estimate_pair_offset_voiced(monos[cam1], monos[p], target_sr, onsets.get(cam1, 0.0), onsets.get(p, 0.0))
+        q[f"{Path(cam1).name}->{Path(p).name}"] = dict(pr)
+        if pr.get("ok"):
+            raw[p] = float(pr.get("offset_s", 0.0))
+        else:
+            raw[p] = float(onsets.get(p, 0.0) - onsets.get(cam1, 0.0))
+
+    # fill any missing.
+    for p in srcs:
+        if p not in raw:
+            raw[p] = float(onsets.get(p, 0.0) - onsets.get(cam1, 0.0))
+
+    # normalize to earliest start.
+    mn = min(raw.values()) if raw else 0.0
+    norm = {p: float(max(0.0, float(v - mn))) for p, v in raw.items()}
+    # sanity clamp.
+    if any(v > 600.0 for v in norm.values()):
+        _emit("[otio] onset-anchor solve produced implausible offsets; forcing zero.")
+        norm = {p: 0.0 for p in srcs}
+    out["offsets"] = norm
+    out["quality"] = q
+    return out
+
+
+def _normalize_segments_strict(segments: list[dict], window_start: float, window_end: float, hold_cam: str) -> list[dict]:
+    sgs = []
+    for s in segments:
+        try:
+            s0 = float(s.get("start_s", 0.0))
+            e0 = float(s.get("end_s", s0))
+            cam = str(s.get("camera_path", hold_cam) or hold_cam)
+            if e0 <= s0:
+                continue
+            sgs.append({
+                "start_s": max(window_start, s0),
+                "end_s": min(window_end, e0),
+                "camera_path": cam,
+                "speaker_idx": int(s.get("speaker_idx", 0)),
+                "avg_conf": float(s.get("avg_conf", 0.0)),
+                "text": str(s.get("text", "") or ""),
+                "is_filtered": bool(s.get("is_filtered", False)),
+            })
+        except Exception:
+            continue
+    sgs = [x for x in sgs if x["end_s"] > x["start_s"]]
+    sgs.sort(key=lambda x: (x["start_s"], x["end_s"]))
+    out: list[dict] = []
+    cursor = float(window_start)
+    last_cam = hold_cam
+    for s in sgs:
+        ss = max(cursor, float(s["start_s"]))
+        ee = min(float(window_end), float(s["end_s"]))
+        if ee <= ss:
+            continue
+        if ss > cursor:
+            out.append({
+                "start_s": cursor,
+                "end_s": ss,
+                "camera_path": last_cam,
+                "speaker_idx": int(s.get("speaker_idx", 0)),
+                "avg_conf": 0.0,
+                "text": "",
+                "is_filtered": False,
+            })
+        out.append({**s, "start_s": ss, "end_s": ee})
+        cursor = ee
+        last_cam = str(s.get("camera_path", last_cam))
+    if cursor < float(window_end):
+        out.append({
+            "start_s": cursor,
+            "end_s": float(window_end),
+            "camera_path": last_cam,
+            "speaker_idx": 0,
+            "avg_conf": 0.0,
+            "text": "",
+            "is_filtered": False,
+        })
+    # merge adjacent same-camera.
+    merged: list[dict] = []
+    for s in out:
+        if not merged:
+            merged.append(s)
+            continue
+        p = merged[-1]
+        if str(p.get("camera_path")) == str(s.get("camera_path")) and abs(float(p["end_s"]) - float(s["start_s"])) < 1e-6:
+            p["end_s"] = float(s["end_s"])
+        else:
+            merged.append(s)
+    return merged
+
+
+def _estimate_source_offsets_audalign(source_paths: list[str], log=None) -> dict[str, float]:
+    solved = _solve_multisource_offsets_from_anchor(source_paths, target_sr=48000, log=log)
+    return dict(solved.get("offsets", {}))
+
+
+def _estimate_camera_offsets_audalign(camera_paths: list[str], log=None) -> dict[str, float]:
+    """Backwards-compatible wrapper; uses generic source-offset estimation."""
+    return _estimate_source_offsets_audalign(camera_paths, log=log)
+
+
+def _write_active_speaker_otio(
+    aligned_paths: list[Path],
+    switch_monos: list,
+    target_sr: int,
+    total_samples: int,
+    out_dir: Path,
+    stamp: str,
+    camera_roles: dict[str, str] | None,
+    clean_audio_path: str | Path | None,
+    timeline_name: str | None = None,
+    alignment_debug: bool = True,
+    alignment_mode: str = "speech_onset_anchor",
+    log=None,
+) -> tuple[str | None, str | None]:
+    def _emit(msg: str) -> None:
+        if log:
+            try:
+                log(msg)
+            except Exception:
+                pass
+    if not camera_roles:
+        _emit("[otio] camera roles not provided; skipping OTIO.")
+        return None, None
+    wide = str(camera_roles.get("wide", "")).strip()
+    if not wide:
+        _emit("[otio] wide camera is required; skipping OTIO.")
+        return None, None
+    clean_src = str(clean_audio_path or "").strip()
+    if not clean_src:
+        _emit("[otio] clean synced multichannel source not found; skipping OTIO.")
+        return None, None
+    clean_src_path = Path(clean_src)
+    try:
+        import opentimelineio as otio  # type: ignore[import-not-found]
+    except Exception as exc:
+        _emit(f"[otio] opentimelineio unavailable: {exc}")
+        return None, None
+
+    if len(switch_monos) < 2:
+        _emit("[otio] need >=2 clean channels for switching; skipping OTIO.")
+        return None, None
+
+    analysis = _analyze_speaker_activity(switch_monos, target_sr)
+    if not analysis:
+        _emit("[otio] speaker analysis unavailable; skipping OTIO.")
+        return None, None
+    winner_idx = analysis["winner_idx"]
+    conf = analysis["conf"]
+    hop_ms = float(analysis["hop_ms"])
+    n_switch_speakers = max(1, int(len(switch_monos)))
+    min_switch_turn_s = 10.0
+    base_min_turn_s = 0.8
+    turns = _build_speaker_turns(
+        winner_idx,
+        conf,
+        hop_ms=hop_ms,
+        n_speakers=n_switch_speakers,
+        min_conf=0.55,
+        min_dur_s=base_min_turn_s,
+    )
+    clean_total_samples = max([int(m.numel()) for m in switch_monos] + [max(1, int(total_samples))])
+    clean_duration_s = max(0.0, float(clean_total_samples / max(1, target_sr)))
+    if not turns:
+        turns = [{
+            "speaker_idx": 0,
+            "start_s": 0.0,
+            "end_s": max(0.1, float(clean_duration_s)),
+            "avg_conf": 0.0,
+            "text": "",
+            "is_filtered": False,
+        }]
+
+    _emit(f"[otio] audio-only switching enabled (transcription disabled, min_turn={min_switch_turn_s:.1f}s).")
+
+    intro_s = 15.0
+    # Deterministic mapping: clean channel 1 is host by default.
+    host_idx = 0
+
+    turns = sorted(turns, key=lambda t: float(t.get("start_s", 0.0)))
+    speaker_order: list[int] = []
+    for t in turns:
+        si = int(t.get("speaker_idx", 0))
+        if si not in speaker_order:
+            speaker_order.append(si)
+    guest_primary = next((s for s in speaker_order if s != host_idx), None)
+
+    def _pick_cam(spk: int) -> str:
+        if int(spk) == int(host_idx):
+            return _select_camera_for_speaker(int(spk), host_idx, wide, camera_roles)
+        if guest_primary is not None and int(spk) == int(guest_primary):
+            return _select_camera_for_speaker(int(spk), host_idx, wide, camera_roles)
+        return wide
+
+    for t in turns:
+        t["camera_path"] = _pick_cam(int(t.get("speaker_idx", 0)))
+    for t in turns:
+        if float(t.get("start_s", 0.0)) < intro_s:
+            t["camera_path"] = _select_camera_for_speaker(host_idx, host_idx, wide, camera_roles)
+            t["speaker_idx"] = host_idx
+    if not turns or float(turns[0].get("start_s", 0.0)) > 0.0:
+        turns.insert(0, {
+            "speaker_idx": host_idx,
+            "start_s": 0.0,
+            "end_s": min(intro_s, clean_duration_s),
+            "avg_conf": 0.0,
+            "text": "",
+            "is_filtered": False,
+            "camera_path": _select_camera_for_speaker(host_idx, host_idx, wide, camera_roles),
+        })
+
+    # Enforce camera switch threshold: candidate camera must remain active for
+    # min_switch_turn_s before we switch from the current camera.
+    turns = sorted(turns, key=lambda t: float(t.get("start_s", 0.0)))
+    current_cam = str(turns[0].get("camera_path", _select_camera_for_speaker(host_idx, host_idx, wide, camera_roles)))
+    pending_cam = ""
+    pending_acc = 0.0
+    thresholded: list[dict] = []
+    for t in turns:
+        s = max(0.0, float(t.get("start_s", 0.0)))
+        e = max(s, float(t.get("end_s", s)))
+        desired_cam = str(t.get("camera_path", wide) or wide)
+        base_payload = {
+            "speaker_idx": int(t.get("speaker_idx", host_idx)),
+            "avg_conf": float(t.get("avg_conf", 0.0)),
+            "text": str(t.get("text", "") or ""),
+            "is_filtered": bool(t.get("is_filtered", False)),
+        }
+        if desired_cam == current_cam:
+            pending_cam = ""
+            pending_acc = 0.0
+            thresholded.append({**base_payload, "start_s": s, "end_s": e, "camera_path": current_cam})
+            continue
+        if pending_cam != desired_cam:
+            pending_cam = desired_cam
+            pending_acc = 0.0
+        need = max(0.0, float(min_switch_turn_s) - pending_acc)
+        dur = max(0.0, e - s)
+        if dur <= 0.0:
+            continue
+        if dur < need:
+            pending_acc += dur
+            thresholded.append({**base_payload, "start_s": s, "end_s": e, "camera_path": current_cam})
+            continue
+        # Threshold crossed within this turn: split exactly at crossing point.
+        cross_s = s + need
+        if need > 1e-6:
+            thresholded.append({**base_payload, "start_s": s, "end_s": cross_s, "camera_path": current_cam})
+        current_cam = desired_cam
+        pending_cam = ""
+        pending_acc = 0.0
+        thresholded.append({**base_payload, "start_s": cross_s, "end_s": e, "camera_path": current_cam})
+    turns = thresholded or turns
+
+    # Turns are currently in clean-local time; we normalize to strict timeline
+    # segments after global offset solving.
+    merged: list[dict] = []
+
+    fps = _probe_video_fps(Path(wide), default_fps=25.0)
+    rate = float(max(1.0, fps))
+    timeline = otio.schema.Timeline(name=(timeline_name or f"ActiveSpeaker_{stamp}"))
+    stack = otio.schema.Stack(name="Video")
+    timeline.tracks = stack
+
+    def _cam_key(p: str) -> str:
+        try:
+            return os.path.normcase(os.path.normpath(str(Path(p).resolve(strict=False))))
+        except Exception:
+            return os.path.normcase(os.path.normpath(str(p)))
+
+    # Include all assigned camera roles (deduped) so expected camera tracks are
+    # always present, then include any segment-resolved camera path variants.
+    host_close = str(camera_roles.get("host_closeup", "")).strip()
+    guest_close = str(camera_roles.get("guest_closeup", "")).strip()
+    host_paths = [str(v).strip() for k, v in camera_roles.items() if str(k).lower().startswith("extra_host") and str(v).strip()]
+    guest_paths = [str(v).strip() for k, v in camera_roles.items() if str(k).lower().startswith("extra_guest") and str(v).strip()]
+    used_order = [str(wide), guest_close, host_close] + host_paths + guest_paths
+    used_order.extend([str(seg.get("camera_path", "") or "") for seg in merged])
+    cam_actual_by_key: dict[str, str] = {}
+    used_cam_keys: list[str] = []
+    for raw in used_order:
+        p = str(raw or "").strip()
+        if not p:
+            continue
+        k = _cam_key(p)
+        if k in cam_actual_by_key:
+            continue
+        cam_actual_by_key[k] = p
+        used_cam_keys.append(k)
+
+    cams: list[tuple[str, str]] = []
+    for cam_key in used_cam_keys:
+        cam = cam_actual_by_key[cam_key]
+        cams.append((cam_key, cam))
+    valid_cams: list[tuple[str, str]] = []
+    for cam_key, cam in cams:
+        try:
+            if Path(cam).exists():
+                valid_cams.append((cam_key, cam))
+            else:
+                _emit(f"[otio] camera source missing, excluding: {cam}")
+        except Exception:
+            _emit(f"[otio] camera source missing, excluding: {cam}")
+    cams = valid_cams
+    if not cams:
+        _emit("[otio] no valid camera sources available; skipping OTIO.")
+        return None, None
+
+    clean_monos_for_tracks = _load_audio_tracks_any(clean_src_path, target_sr=target_sr)
+    if len(clean_monos_for_tracks) < 2:
+        _emit("[otio] need >=2 clean channels for switching; skipping OTIO.")
+        return None, None
+
+    sync_sources = [str(cam) for _k, cam in cams] + [str(clean_src_path)]
+    solved = _solve_multisource_offsets_from_anchor(sync_sources, target_sr=target_sr, log=_emit)
+    source_offsets_by_path = {str(k): float(v) for k, v in (solved.get("offsets", {}) or {}).items()}
+    speech_onsets_seconds = {str(k): v for k, v in (solved.get("onsets", {}) or {}).items()}
+    alignment_quality = dict(solved.get("quality", {}) or {})
+    anchor_pair = {"cam1": Path(sync_sources[0]).name, "lav1": Path(sync_sources[-1]).name}
+
+    cam_offsets_by_path: dict[str, float] = {}
+    cam_offsets_by_key: dict[str, float] = {}
+    for cam_key, cam in cams:
+        off = float(source_offsets_by_path.get(str(cam), 0.0))
+        cam_offsets_by_path[str(cam)] = off
+        cam_offsets_by_key[cam_key] = off
+    clean_offset_s = float(source_offsets_by_path.get(str(clean_src_path), 0.0))
+
+    cam_durations: dict[str, float] = {}
+    for cam_key_iter, cam in cams:
+        d = _probe_media_duration(Path(cam))
+        if d is not None and d > 0:
+            cam_durations[str(cam)] = float(d)
+    clean_duration_probe = _probe_media_duration(clean_src_path)
+    if clean_duration_probe is None or clean_duration_probe <= 0.0:
+        clean_duration_probe = clean_duration_s
+
+    if not cam_durations:
+        _emit("[otio] could not probe camera durations; skipping OTIO.")
+        return None, None
+
+    window_start_s = max([0.0] + [float(cam_offsets_by_path.get(str(cam), 0.0)) for _k, cam in cams])
+    window_end_s = min([float(cam_offsets_by_path.get(str(cam), 0.0)) + float(cam_durations.get(str(cam), 0.0)) for _k, cam in cams])
+    window_end_s = min(window_end_s, float(clean_offset_s + max(0.0, float(clean_duration_probe))))
+    if window_end_s <= window_start_s + 0.25:
+        _emit("[otio] source overlap window too small after alignment; skipping OTIO.")
+        return None, None
+
+    valid_abs_onsets: list[float] = []
+    for src, onset in speech_onsets_seconds.items():
+        if onset is None:
+            continue
+        try:
+            valid_abs_onsets.append(float(source_offsets_by_path.get(str(src), 0.0)) + float(onset))
+        except Exception:
+            continue
+    common_anchor_s = min(valid_abs_onsets) if valid_abs_onsets else float(window_start_s)
+    pre_roll_s = 0.75
+    trim_start_s = max(float(window_start_s), float(common_anchor_s - pre_roll_s))
+    if trim_start_s >= window_end_s:
+        trim_start_s = float(window_start_s)
+    timeline_end_s = max(0.0, float(window_end_s - trim_start_s))
+    if timeline_end_s <= 0.25:
+        _emit("[otio] timeline duration too small after anchor trim; skipping OTIO.")
+        return None, None
+
+    turns_global: list[dict] = []
+    for t in turns:
+        s = max(0.0, float(t.get("start_s", 0.0)))
+        e = max(s, float(t.get("end_s", s)))
+        turns_global.append({
+            **t,
+            "start_s": float(clean_offset_s + s),
+            "end_s": float(clean_offset_s + e),
+        })
+    hold_cam = _select_camera_for_speaker(host_idx, host_idx, wide, camera_roles)
+    merged_global = _normalize_segments_strict(turns_global, window_start_s, window_end_s, hold_cam)
+    merged = []
+    for seg in merged_global:
+        s = float(seg.get("start_s", 0.0)) - float(trim_start_s)
+        e = float(seg.get("end_s", 0.0)) - float(trim_start_s)
+        if e <= s:
+            continue
+        merged.append({**seg, "start_s": max(0.0, s), "end_s": min(timeline_end_s, e)})
+    merged = _normalize_segments_strict(merged, 0.0, timeline_end_s, hold_cam)
+    if not merged:
+        _emit("[otio] no valid segments after normalization; skipping OTIO.")
+        return None, None
+
+    if alignment_debug:
+        try:
+            pretty = ", ".join(
+                [f"{Path(cam).name}={cam_offsets_by_key.get(k, 0.0):.3f}s" for k, cam in cams]
+                + [f"{clean_src_path.name}={clean_offset_s:.3f}s"]
+            )
+            _emit(f"[otio] alignment_mode={alignment_mode}; source offsets: {pretty}")
+            _emit(f"[otio] overlap window={window_start_s:.3f}s..{window_end_s:.3f}s, trim_start={trim_start_s:.3f}s, timeline={timeline_end_s:.3f}s")
+        except Exception:
+            pass
+
+    # Reuse one media reference per camera so NLEs can treat these as shared sources.
+    ref_cache: dict[str, object] = {}
+    clean_ref_key = "__clean__"
+    max_cam_offset = 0.0
+    try:
+        max_cam_offset = max([0.0] + [float(v) for v in source_offsets_by_path.values()])
+    except Exception:
+        max_cam_offset = 0.0
+    full_range = otio.opentime.TimeRange(
+        start_time=otio.opentime.RationalTime(0, rate),
+        duration=otio.opentime.RationalTime(float(max(1, int(round((timeline_end_s + max_cam_offset) * rate)))), rate),
+    )
+    for cam_key, cam in cams:
+        abs_path = os.path.abspath(os.path.normpath(str(cam)))
+        resolved_path = abs_path
+        try:
+            resolved_path = str(Path(cam).resolve(strict=False))
+        except Exception:
+            resolved_path = abs_path
+        file_uri = ""
+        try:
+            file_uri = Path(abs_path).as_uri()
+        except Exception:
+            file_uri = ""
+        target_url = file_uri or abs_path
+        ref_cache[cam_key] = otio.schema.ExternalReference(
+            target_url=target_url,
+            available_range=full_range,
+            metadata={
+                "resemble_enhance": {
+                    "absolute_path": abs_path,
+                    "resolved_path": resolved_path,
+                    "file_uri": file_uri,
+                },
+            },
+        )
+    clean_abs = os.path.abspath(os.path.normpath(str(clean_src_path)))
+    clean_uri = ""
+    try:
+        clean_uri = Path(clean_abs).as_uri()
+    except Exception:
+        clean_uri = ""
+    try:
+        import torchaudio
+    except Exception as exc:
+        _emit(f"[otio] clean channel isolation unavailable (torchaudio import failed): {exc}")
+        return None, None
+    # Keep parent clean source reference for diagnostics only.
+    ref_cache[clean_ref_key] = otio.schema.ExternalReference(
+        target_url=(clean_uri or clean_abs),
+        available_range=full_range,
+    )
+
+    # Split-only edit model: no time removal (no ripple). Every camera track is
+    # split at the same boundaries so all sources stay fully synced.
+    split_points = {0.0, float(timeline_end_s)}
+    for seg in merged:
+        try:
+            split_points.add(max(0.0, min(float(timeline_end_s), float(seg.get("start_s", 0.0)))))
+            split_points.add(max(0.0, min(float(timeline_end_s), float(seg.get("end_s", 0.0)))))
+        except Exception:
+            continue
+    pts = sorted(split_points)
+    split_segments: list[dict] = []
+    for i in range(max(0, len(pts) - 1)):
+        s = float(pts[i])
+        e = float(pts[i + 1])
+        if e <= s:
+            continue
+        # Find active speaker-selected camera for metadata at this split.
+        sel_cam = wide
+        for seg in merged:
+            ss = float(seg.get("start_s", 0.0))
+            ee = float(seg.get("end_s", ss))
+            if s >= ss - 1e-6 and s < ee - 1e-6:
+                sel_cam = str(seg.get("camera_path", wide) or wide)
+                break
+        split_segments.append({"start_s": s, "end_s": e, "selected_cam_key": _cam_key(sel_cam)})
+
+    video_tracks: list[tuple[str, str, object]] = []
+    for cam_key, cam in cams:
+        tr = otio.schema.Track(name=f"V_{Path(cam).stem}", kind=otio.schema.TrackKind.Video)
+        stack.append(tr)
+        video_tracks.append((cam_key, cam, tr))
+    audio_tracks: list[tuple[str, str, object]] = []
+    for cam_key, cam in cams:
+        tr = otio.schema.Track(name=f"A_CAM_{Path(cam).stem}", kind=otio.schema.TrackKind.Audio)
+        stack.append(tr)
+        audio_tracks.append((cam_key, cam, tr))
+    clean_audio_tracks: list[tuple[int, object]] = []
+    for ci in range(len(clean_monos_for_tracks)):
+        tr = otio.schema.Track(name=f"A_CLEAN_{ci + 1}", kind=otio.schema.TrackKind.Audio)
+        stack.append(tr)
+        clean_audio_tracks.append((ci, tr))
+
+    # Build importer-safe aligned audio proxies with offsets baked in.
+    aligned_audio_dir = out_dir / "_otio_sources" / f"aligned_audio_{stamp}"
+    aligned_audio_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        import torchaudio
+        import torch
+    except Exception as exc:
+        _emit(f"[otio] aligned audio proxy unavailable: {exc}")
+        return None, None
+
+    cam_audio_ref_by_key: dict[str, object] = {}
+    for cam_key, cam, _tr in audio_tracks:
+        tracks = _load_audio_tracks_any(cam, target_sr=target_sr)
+        if not tracks:
+            _emit(f"[otio] camera audio decode failed, excluding audio track: {cam}")
+            continue
+        mono = tracks[0]
+        off_s = float(cam_offsets_by_key.get(cam_key, 0.0))
+        off_samples = max(0, int(round(off_s * float(target_sr))))
+        aligned_global = torch.cat([torch.zeros(off_samples, dtype=mono.dtype), mono], dim=0)
+        trim_samples = max(0, int(round(float(trim_start_s) * float(target_sr))))
+        aligned = aligned_global[trim_samples:] if trim_samples < int(aligned_global.numel()) else aligned_global.new_zeros(1)
+        outp = aligned_audio_dir / f"A_CAM_{Path(cam).stem}.wav"
+        torchaudio.save(str(outp), aligned.unsqueeze(0), int(target_sr))
+        p_abs = os.path.abspath(os.path.normpath(str(outp)))
+        p_uri = ""
+        try:
+            p_uri = Path(p_abs).as_uri()
+        except Exception:
+            p_uri = ""
+        cam_audio_ref_by_key[cam_key] = otio.schema.ExternalReference(
+            target_url=(p_uri or p_abs),
+            available_range=otio.opentime.TimeRange(
+                start_time=otio.opentime.RationalTime(0, float(target_sr)),
+                duration=otio.opentime.RationalTime(float(max(1, int(aligned.numel()))), float(target_sr)),
+            ),
+            metadata={
+                "resemble_enhance": {
+                    "aligned_audio_proxy": True,
+                    "source_path": str(cam),
+                    "offset_seconds_applied": off_s,
+                    "trim_start_seconds": float(trim_start_s),
+                },
+            },
+        )
+
+    clean_audio_ref_by_idx: dict[int, object] = {}
+    for clean_idx, _tr in clean_audio_tracks:
+        mono = clean_monos_for_tracks[clean_idx]
+        off_samples = max(0, int(round(float(clean_offset_s) * float(target_sr))))
+        aligned_global = torch.cat([torch.zeros(off_samples, dtype=mono.dtype), mono], dim=0)
+        trim_samples = max(0, int(round(float(trim_start_s) * float(target_sr))))
+        aligned = aligned_global[trim_samples:] if trim_samples < int(aligned_global.numel()) else aligned_global.new_zeros(1)
+        outp = aligned_audio_dir / f"A_CLEAN_{clean_idx + 1}.wav"
+        torchaudio.save(str(outp), aligned.unsqueeze(0), int(target_sr))
+        p_abs = os.path.abspath(os.path.normpath(str(outp)))
+        p_uri = ""
+        try:
+            p_uri = Path(p_abs).as_uri()
+        except Exception:
+            p_uri = ""
+        clean_audio_ref_by_idx[clean_idx] = otio.schema.ExternalReference(
+            target_url=(p_uri or p_abs),
+            available_range=otio.opentime.TimeRange(
+                start_time=otio.opentime.RationalTime(0, float(target_sr)),
+                duration=otio.opentime.RationalTime(float(max(1, int(aligned.numel()))), float(target_sr)),
+            ),
+            metadata={
+                "resemble_enhance": {
+                    "aligned_audio_proxy": True,
+                    "source_path": str(clean_src_path),
+                    "clean_channel_index": int(clean_idx),
+                    "offset_seconds_applied": float(clean_offset_s),
+                    "trim_start_seconds": float(trim_start_s),
+                },
+            },
+        )
+
+    for cam_key, cam, tr in video_tracks:
+        for seg in split_segments:
+            dur_s = max(0.0, float(seg["end_s"]) - float(seg["start_s"]))
+            dur_f = max(1, int(round(dur_s * rate)))
+            is_selected = bool(str(seg.get("selected_cam_key", "")) == str(cam_key))
+            if is_selected:
+                cam_off_s = float(cam_offsets_by_key.get(cam_key, 0.0))
+                global_start_s = float(trim_start_s) + float(seg["start_s"])
+                src_start_s = max(0.0, float(global_start_s - cam_off_s))
+                clip = otio.schema.Clip(
+                    name=Path(cam).stem,
+                    media_reference=ref_cache.get(cam_key),
+                    source_range=otio.opentime.TimeRange(
+                        start_time=otio.opentime.RationalTime(float(src_start_s * rate), rate),
+                        duration=otio.opentime.RationalTime(float(dur_f), rate),
+                    ),
+                    metadata={
+                        "resemble_enhance": {
+                            "active_selected_camera": True,
+                        },
+                    },
+                )
+                tr.append(clip)
+            else:
+                tr.append(
+                    otio.schema.Gap(
+                        source_range=otio.opentime.TimeRange(
+                            start_time=otio.opentime.RationalTime(0, rate),
+                            duration=otio.opentime.RationalTime(float(dur_f), rate),
+                        )
+                    )
+                )
+
+    for cam_key, cam, tr in audio_tracks:
+        aref = cam_audio_ref_by_key.get(cam_key)
+        if aref is None:
+            continue
+        for seg in split_segments:
+            start_sample = max(0, int(round(float(seg["start_s"]) * float(target_sr))))
+            end_sample = max(start_sample + 1, int(round(float(seg["end_s"]) * float(target_sr))))
+            dur_samples = max(1, end_sample - start_sample)
+            clip = otio.schema.Clip(
+                name=Path(cam).stem,
+                media_reference=aref,
+                source_range=otio.opentime.TimeRange(
+                    start_time=otio.opentime.RationalTime(float(start_sample), float(target_sr)),
+                    duration=otio.opentime.RationalTime(float(dur_samples), float(target_sr)),
+                ),
+                metadata={
+                    "resemble_enhance": {
+                        "active_selected_camera": bool(str(seg.get("selected_cam_key", "")) == str(cam_key)),
+                    },
+                },
+            )
+            tr.append(clip)
+
+    for clean_idx, tr in clean_audio_tracks:
+        cref = clean_audio_ref_by_idx.get(clean_idx)
+        if cref is None:
+            continue
+        for seg in split_segments:
+            start_sample = max(0, int(round(float(seg["start_s"]) * float(target_sr))))
+            end_sample = max(start_sample + 1, int(round(float(seg["end_s"]) * float(target_sr))))
+            dur_samples = max(1, end_sample - start_sample)
+            clip = otio.schema.Clip(
+                name=f"CLEAN_{clean_idx + 1}",
+                media_reference=cref,
+                source_range=otio.opentime.TimeRange(
+                    start_time=otio.opentime.RationalTime(float(start_sample), float(target_sr)),
+                    duration=otio.opentime.RationalTime(float(dur_samples), float(target_sr)),
+                ),
+                metadata={
+                    "resemble_enhance": {
+                        "clean_channel_index": int(clean_idx),
+                    },
+                },
+            )
+            tr.append(clip)
+    _emit(f"[otio] camera references used: {len(used_cam_keys)}")
+    _emit(f"[otio] split segments: {len(split_segments)}")
+
+    out_otio = out_dir / f"CLEAN_Synced_Multichannel_{stamp}.otio"
+    out_turns = out_dir / f"CLEAN_Synced_Multichannel_{stamp}_turns.json"
+    try:
+        otio.adapters.write_to_file(timeline, str(out_otio))
+    except Exception as exc:
+        _emit(f"[otio] write failed: {exc}")
+        return None, None
+    try:
+        payload = {
+            "timeline_name": timeline_name or f"ActiveSpeaker_{stamp}",
+            "fps": rate,
+            "host_speaker_idx": host_idx,
+            "wide": wide,
+            "segments": merged,
+            "turn_count": len(merged),
+            "switch_source": "clean_only",
+            "alignment_mode": alignment_mode,
+            "anchor_pair": anchor_pair,
+            "speech_onsets_seconds": {Path(k).name: v for k, v in speech_onsets_seconds.items()},
+            "resolved_offsets_seconds": {Path(k).name: float(v) for k, v in source_offsets_by_path.items()},
+            "alignment_quality": alignment_quality,
+            "timeline_window_seconds": {
+                "window_start": float(window_start_s),
+                "window_end": float(window_end_s),
+                "trim_start": float(trim_start_s),
+                "timeline_duration": float(timeline_end_s),
+            },
+            "audio_tracks_written": [f"A_CAM_{Path(cam).stem}" for _k, cam in cams] + [f"A_CLEAN_{i + 1}" for i in range(len(clean_monos_for_tracks))],
+            "source_offsets_seconds": (
+                {Path(cam).name: float(cam_offsets_by_key.get(k, 0.0)) for k, cam in cams}
+                | {clean_src_path.name: float(clean_offset_s)}
+            ),
+            "camera_offsets_seconds": {Path(cam).name: float(cam_offsets_by_key.get(k, 0.0)) for k, cam in cams},
+        }
+        out_turns.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        out_turns = None
+    return str(out_otio), (str(out_turns) if out_turns else None)
+
+
 def _sync_and_export_multichannel_simple(
     file_paths: list[str],
     prefer_48k: bool = True,
@@ -3215,6 +5511,10 @@ def _sync_and_export_multichannel_simple(
     out_base_dir: str | None = None,
     flat_output: bool = False,
     enable_bleed_gate: bool = False,
+    write_otio: bool = False,
+    otio_camera_roles: dict[str, str] | None = None,
+    otio_timeline_name: str | None = None,
+    otio_out_dir: str | None = None,
 ) -> str | None:
     """Simplified Audalign-based alignment and multichannel export.
 
@@ -3448,6 +5748,39 @@ def _sync_and_export_multichannel_simple(
     out_wav = final_dir / f"CLEAN_Synced_Multichannel_{stamp}.wav"
     multich = _apply_peak_ceiling(multich, ceiling_db=-1.0)
     torchaudio.save(str(out_wav), multich, target_sr)
+    if write_otio:
+        try:
+            _emit("[otio] analyzing speaker activity...")
+            otio_dir = final_dir
+            if otio_out_dir:
+                try:
+                    od = Path(otio_out_dir)
+                    od.mkdir(parents=True, exist_ok=True)
+                    otio_dir = od
+                except Exception:
+                    otio_dir = final_dir
+            switch_monos = _load_audio_tracks_any(out_wav, target_sr=target_sr)
+            if len(switch_monos) < 2:
+                _emit("[otio] need >=2 clean channels for switching; skipping OTIO.")
+                switch_monos = []
+            otio_path, turns_path = _write_active_speaker_otio(
+                aligned_paths=aligned_paths,
+                switch_monos=switch_monos,
+                target_sr=target_sr,
+                total_samples=max_len,
+                out_dir=otio_dir,
+                stamp=stamp,
+                camera_roles=otio_camera_roles,
+                clean_audio_path=str(out_wav),
+                timeline_name=otio_timeline_name,
+                log=lambda m: _emit(m),
+            )
+            if otio_path:
+                _emit(f"[otio] timeline written: {otio_path}")
+            if turns_path:
+                _emit(f"[otio] turns diagnostics: {turns_path}")
+        except Exception as exc:
+            _emit(f"[otio] generation failed: {exc}", force_console=True)
 
     step(1, 'Assemble multichannel')
     _emit(f"Timing: assemble multichannel {_format_seconds(time.perf_counter() - assemble_t0)}")
@@ -3524,7 +5857,7 @@ def _sync_and_export_multichannel_simple(
     return str(out_wav)
 
 
-def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True, log=None, progress_cb=None, wav_only: bool = False, skip_fine_align: bool = False, force_fine_align: bool = False, force_drift_correction: bool = False, use_bw64: bool = True, out_base_dir: str | None = None, enable_bleed_gate: bool = False) -> str | None:
+def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True, log=None, progress_cb=None, wav_only: bool = False, skip_fine_align: bool = False, force_fine_align: bool = False, force_drift_correction: bool = False, use_bw64: bool = True, out_base_dir: str | None = None, enable_bleed_gate: bool = False, write_otio: bool = False, otio_camera_roles: dict[str, str] | None = None, otio_timeline_name: str | None = None, otio_out_dir: str | None = None) -> str | None:
     """Legacy alignment function retained for backwards compatibility.
 
     Currently unused by the GUI; kept so older scripts can still import it.
@@ -3538,6 +5871,10 @@ def _sync_and_export_multichannel(file_paths: list[str], prefer_48k: bool = True
         use_bw64=use_bw64,
         out_base_dir=out_base_dir,
         enable_bleed_gate=enable_bleed_gate,
+        write_otio=write_otio,
+        otio_camera_roles=otio_camera_roles,
+        otio_timeline_name=otio_timeline_name,
+        otio_out_dir=otio_out_dir,
     )
 
 
