@@ -5671,6 +5671,131 @@ def _select_camera_for_speaker(speaker_idx: int, host_idx: int, wide: str, camer
     return guest_paths[0] if guest_paths else wide
 
 
+def _infer_host_speaker_idx(turns: list[dict], intro_probe_s: float = 45.0, fallback_idx: int = 0) -> int:
+    """Infer host speaker from intro section where host is expected to dominate."""
+    scores: dict[int, float] = {}
+    for t in (turns or []):
+        try:
+            s = max(0.0, float(t.get("start_s", 0.0)))
+            e = max(s, float(t.get("end_s", s)))
+            if s >= float(intro_probe_s):
+                continue
+            ov = max(0.0, min(e, float(intro_probe_s)) - s)
+            if ov <= 0.0:
+                continue
+            spk = int(t.get("speaker_idx", fallback_idx))
+            conf = float(t.get("avg_conf", 0.0))
+            w = ov * (0.5 + max(0.0, min(1.0, conf)))
+            scores[spk] = float(scores.get(spk, 0.0) + w)
+        except Exception:
+            continue
+    if not scores:
+        return int(fallback_idx)
+    return int(max(scores.items(), key=lambda kv: kv[1])[0])
+
+
+def _normalize_phrase_text(s: str) -> str:
+    out = []
+    for ch in str(s or "").lower():
+        if ch.isalnum() or ch.isspace():
+            out.append(ch)
+        else:
+            out.append(" ")
+    return " ".join("".join(out).split())
+
+
+def _infer_host_from_intro_keywords(
+    words: list[dict],
+    turns: list[dict],
+    keyword_phrases: list[str] | None = None,
+    min_word_conf: float = 0.30,
+    fuzzy_threshold: float = 0.84,
+) -> dict:
+    """Infer host by first confident keyword phrase spoken in intro transcript."""
+    import difflib
+
+    phrases = keyword_phrases or [
+        "hello",
+        "viewers",
+        "welcome",
+        "tim poole",
+        "will underwood",
+        "rory calland",
+    ]
+    phrase_norm = [_normalize_phrase_text(p) for p in phrases if str(p or "").strip()]
+    if not phrase_norm or not words or not turns:
+        return {"ok": False, "host_idx": None, "match": None, "reason": "missing_data"}
+
+    # Build normalized word stream with timing.
+    ws: list[dict] = []
+    for w in words:
+        try:
+            txt = _normalize_phrase_text(str(w.get("word", "") or ""))
+            if not txt:
+                continue
+            st = float(w.get("start", 0.0))
+            en = float(w.get("end", st))
+            cf = float(w.get("confidence", 0.0))
+            if cf < float(min_word_conf):
+                continue
+            ws.append({"text": txt, "start": st, "end": max(st, en), "confidence": cf})
+        except Exception:
+            continue
+    if not ws:
+        return {"ok": False, "host_idx": None, "match": None, "reason": "no_confident_words"}
+
+    def _speaker_for_time(ts: float) -> int | None:
+        best: tuple[float, int] | None = None
+        for t in turns:
+            try:
+                s = float(t.get("start_s", 0.0))
+                e = float(t.get("end_s", s))
+                spk = int(t.get("speaker_idx", 0))
+                if ts >= s and ts <= e:
+                    return spk
+                # nearest fallback
+                d = min(abs(ts - s), abs(ts - e))
+                if best is None or d < best[0]:
+                    best = (d, spk)
+            except Exception:
+                continue
+        if best and best[0] <= 1.5:
+            return int(best[1])
+        return None
+
+    # Phrase matching over 1..4 token windows.
+    tokens = [x["text"] for x in ws]
+    for i in range(len(ws)):
+        for n in range(1, min(4, len(ws) - i) + 1):
+            phrase = " ".join(tokens[i:i + n]).strip()
+            if not phrase:
+                continue
+            for target in phrase_norm:
+                if not target:
+                    continue
+                # Robustness: exact contains or fuzzy similarity.
+                exact = (phrase == target) or (phrase in target) or (target in phrase)
+                ratio = float(difflib.SequenceMatcher(a=phrase, b=target).ratio())
+                if exact or ratio >= float(fuzzy_threshold):
+                    tmid = float(ws[i]["start"])
+                    spk = _speaker_for_time(tmid)
+                    if spk is None:
+                        continue
+                    return {
+                        "ok": True,
+                        "host_idx": int(spk),
+                        "match": {
+                            "heard": phrase,
+                            "target": target,
+                            "time_s": tmid,
+                            "confidence": float(ws[i].get("confidence", 0.0)),
+                            "ratio": ratio,
+                        },
+                        "reason": "keyword_match",
+                    }
+    return {"ok": False, "host_idx": None, "match": None, "reason": "no_keyword_match"}
+
+
 def _probe_media_duration(path: Path) -> float:
     ffprobe = shutil.which("ffprobe") or shutil.which("ffprobe.exe")
     if not ffprobe:
@@ -6062,6 +6187,150 @@ def _estimate_source_offsets_audalign(source_paths: list[str], log=None) -> dict
         return rel_pos
 
 
+def _estimate_clean_offset_to_cam_base(
+    cam_ref_path: str,
+    cam_ref_offset_s: float,
+    clean_path: str,
+    target_sr: int = 48000,
+    log=None,
+) -> dict:
+    def _emit(msg: str) -> None:
+        if log:
+            try:
+                log(msg)
+            except Exception:
+                pass
+
+    cam_ref = str(cam_ref_path or "").strip()
+    clean = str(clean_path or "").strip()
+    if not cam_ref or not clean:
+        return {"match_found": False, "offset_s": None, "best_lag_s": None, "cam_ref": cam_ref, "reason": "missing_path"}
+    try:
+        import numpy as np
+
+        def _apply_signed_offset_np(x: np.ndarray, off_s: float) -> np.ndarray:
+            off_samples = int(round(float(off_s) * float(target_sr)))
+            if off_samples >= 0:
+                return np.concatenate([np.zeros(off_samples, dtype=np.float32), x.astype(np.float32, copy=False)])
+            drop = min(len(x), int(-off_samples))
+            if drop >= len(x):
+                return np.zeros(1, dtype=np.float32)
+            return x[drop:].astype(np.float32, copy=False)
+
+        def _speech_overlap_score(cam_off: float, clean_off: float) -> float:
+            tt_cam = _load_audio_tracks_any(cam_ref, target_sr=target_sr)
+            tt_clean = _load_audio_tracks_any(clean, target_sr=target_sr)
+            if not tt_cam or not tt_clean:
+                return 0.0
+            cam_np = tt_cam[0].detach().cpu().float().numpy() if hasattr(tt_cam[0], "detach") else np.asarray(tt_cam[0], dtype=np.float32)
+            clean_np = tt_clean[0].detach().cpu().float().numpy() if hasattr(tt_clean[0], "detach") else np.asarray(tt_clean[0], dtype=np.float32)
+            ca = _apply_signed_offset_np(cam_np, cam_off)
+            la = _apply_signed_offset_np(clean_np, clean_off)
+            n = min(len(ca), len(la))
+            if n < int(target_sr * 20):
+                return 0.0
+            hop = max(1, int(round(float(target_sr) * 0.1)))
+            m = n // hop
+            if m < 32:
+                return 0.0
+            ca = ca[: m * hop].reshape(m, hop)
+            la = la[: m * hop].reshape(m, hop)
+            ce = np.sqrt(np.mean(ca * ca, axis=1) + 1e-12)
+            le = np.sqrt(np.mean(la * la, axis=1) + 1e-12)
+            ct = max(1e-6, float(np.quantile(ce, 0.65)))
+            lt = max(1e-6, float(np.quantile(le, 0.65)))
+            cv = ce >= ct
+            lv = le >= lt
+            inter = float(np.sum(cv & lv))
+            union = float(np.sum(cv | lv) + 1e-9)
+            return max(0.0, min(1.0, inter / union))
+
+        pair = _estimate_source_offsets_audalign([cam_ref, clean], log=log)
+        # pair result keeps clean at 0 and returns cam offset in that basis.
+        cam_in_pair = float(pair.get(cam_ref, 0.0))
+        # Keep cam fixed at cam_ref_offset_s, solve clean in global basis.
+        # Try both signs and pick the one with better pairwise residual.
+        cand_a = float(cam_ref_offset_s - cam_in_pair)
+        cand_b = float(cam_ref_offset_s + cam_in_pair)
+        qa_a = _validate_offsets_pairwise(
+            [cam_ref, clean],
+            {cam_ref: float(cam_ref_offset_s), clean: float(cand_a)},
+            target_sr=target_sr,
+            max_abs_lag_s=999.0,
+        )
+        qa_b = _validate_offsets_pairwise(
+            [cam_ref, clean],
+            {cam_ref: float(cam_ref_offset_s), clean: float(cand_b)},
+            target_sr=target_sr,
+            max_abs_lag_s=999.0,
+        )
+        wa = float(qa_a.get("max_abs_lag_s", 999.0))
+        wb = float(qa_b.get("max_abs_lag_s", 999.0))
+        va = bool(qa_a.get("has_evidence", False))
+        vb = bool(qa_b.get("has_evidence", False))
+        score_a = _speech_overlap_score(float(cam_ref_offset_s), float(cand_a))
+        score_b = _speech_overlap_score(float(cam_ref_offset_s), float(cand_b))
+        if va and vb:
+            # Primary: speech-overlap similarity. Secondary: residual lag.
+            if abs(score_a - score_b) >= 0.02:
+                pick = cand_a if score_a > score_b else cand_b
+                best = wa if score_a > score_b else wb
+            else:
+                if abs(wa - wb) <= 0.01:
+                    # When both candidates are effectively tied, prefer negative
+                    # clean shift so leading clean pre-roll is trimmed.
+                    pick = cand_a if cand_a <= cand_b else cand_b
+                    best = wa if pick == cand_a else wb
+                else:
+                    pick = cand_a if wa <= wb else cand_b
+                    best = wa if wa <= wb else wb
+            _emit(
+                "[otio] clean sign resolve: "
+                f"candA={cand_a:.3f}s lag={wa:.3f}s score={score_a:.3f}, "
+                f"candB={cand_b:.3f}s lag={wb:.3f}s score={score_b:.3f}"
+            )
+            return {
+                "match_found": True,
+                "offset_s": float(pick),
+                "best_lag_s": float(best),
+                "cam_ref": cam_ref,
+                "reason": "dual_candidate",
+                "score_a": float(score_a),
+                "score_b": float(score_b),
+            }
+        if va:
+            return {
+                "match_found": True,
+                "offset_s": float(cand_a),
+                "best_lag_s": float(wa),
+                "cam_ref": cam_ref,
+                "reason": "cand_a_only",
+                "score_a": float(score_a),
+                "score_b": float(score_b),
+            }
+        if vb:
+            return {
+                "match_found": True,
+                "offset_s": float(cand_b),
+                "best_lag_s": float(wb),
+                "cam_ref": cam_ref,
+                "reason": "cand_b_only",
+                "score_a": float(score_a),
+                "score_b": float(score_b),
+            }
+        # No evidence: keep deterministic baseline.
+        return {
+            "match_found": False,
+            "offset_s": float(cand_a),
+            "best_lag_s": None,
+            "cam_ref": cam_ref,
+            "reason": "no_evidence",
+        }
+    except Exception as exc:
+        _emit(f"[otio] clean-to-cam offset solve failed: {exc}")
+        return {"match_found": False, "offset_s": None, "best_lag_s": None, "cam_ref": cam_ref, "reason": f"error:{exc}"}
+
+
 def _estimate_camera_offsets_audalign(camera_paths: list[str], log=None) -> dict[str, float]:
     """Backwards-compatible wrapper; uses generic source-offset estimation."""
     return _estimate_source_offsets_audalign(camera_paths, log=log)
@@ -6219,8 +6488,39 @@ def _write_active_speaker_otio(
         }]
 
     intro_s = 15.0
-    # Deterministic mapping: clean channel 1 is host by default.
-    host_idx = 0
+    host_inference: dict = {"mode": "fallback_intro_dominance", "ok": False, "details": None}
+    # Primary host mapping: first confident keyword phrase in intro transcript.
+    intro_words: list[dict] = []
+    try:
+        intro_words = _transcribe_window_faster_whisper(
+            clean_src_path,
+            start_s=0.0,
+            dur_s=90.0,
+            language=str(language or "en"),
+            model_name="small",
+        )
+    except Exception:
+        intro_words = []
+    kw = _infer_host_from_intro_keywords(intro_words, turns)
+    if bool(kw.get("ok")) and (kw.get("host_idx") is not None):
+        host_idx = int(kw.get("host_idx"))
+        host_inference = {"mode": "keyword_intro", "ok": True, "details": kw.get("match")}
+    else:
+        host_idx = _infer_host_speaker_idx(turns, intro_probe_s=45.0, fallback_idx=0)
+        host_inference = {"mode": "fallback_intro_dominance", "ok": True, "details": {"reason": kw.get("reason", "fallback")}}
+    try:
+        _emit(f"[otio] inferred host speaker index: {host_idx}")
+        if host_inference.get("mode") == "keyword_intro":
+            d = host_inference.get("details") or {}
+            _emit(
+                "[otio] host keyword match: "
+                f"heard='{d.get('heard', '')}' target='{d.get('target', '')}' "
+                f"time={float(d.get('time_s', 0.0)):.2f}s ratio={float(d.get('ratio', 0.0)):.2f}"
+            )
+        else:
+            _emit("[otio] host keyword match not found; using intro dominance fallback.")
+    except Exception:
+        pass
 
     turns = sorted(turns, key=lambda t: float(t.get("start_s", 0.0)))
     speaker_order: list[int] = []
@@ -6424,6 +6724,35 @@ def _write_active_speaker_otio(
     source_offsets_by_path = {k: float(v - clean_anchor) for k, v in source_offsets_by_path.items()}
     if str(clean_src_path):
         source_offsets_by_path[str(clean_src_path)] = 0.0
+    # Scratch-first mode: cams are authoritative base; solve clean offset to that
+    # base without shifting any camera/scratch offsets.
+    clean_sync_result = {"match_found": False, "offset_s": None, "best_lag_s": None, "cam_ref": None, "reason": "not_attempted"}
+    if scratch_first and cam_sync_sources and str(clean_src_path):
+        cam_ref = str(cam_sync_sources[0])
+        cam_ref_off = float(source_offsets_by_path.get(cam_ref, 0.0))
+        clean_sync_result = _estimate_clean_offset_to_cam_base(
+            cam_ref_path=cam_ref,
+            cam_ref_offset_s=cam_ref_off,
+            clean_path=str(clean_src_path),
+            target_sr=target_sr,
+            log=_emit,
+        )
+        if bool(clean_sync_result.get("match_found")) and (clean_sync_result.get("offset_s") is not None):
+            clean_off = float(clean_sync_result.get("offset_s"))
+            source_offsets_by_path[str(clean_src_path)] = clean_off
+            _emit(
+                "[otio] clean aligned to scratch base: "
+                f"{Path(clean_src_path).name}={float(clean_off):.3f}s "
+                f"(cam_ref={Path(cam_ref).name}={cam_ref_off:.3f}s)"
+            )
+            _emit(
+                "[otio] clean-to-scratch match found: "
+                f"lag={float(clean_sync_result.get('best_lag_s', 0.0)):.3f}s"
+            )
+        else:
+            return _skip_with_reason(
+                "clean-to-scratch match not found; cannot place clean audio reliably in scratch-first mode."
+            )
     first_anchor_s = float(anchor_words[0].get("start", 0.0)) if anchor_words else 0.0
     speech_onsets_seconds = {str(p): max(0.0, first_anchor_s + float(source_offsets_by_path.get(str(p), 0.0))) for p in sync_sources}
     qcheck = _validate_alignment_quality(
@@ -6473,6 +6802,7 @@ def _write_active_speaker_otio(
         "paircheck_has_evidence": bool(paircheck.get("has_evidence", False)),
         "residual_evidence_count": int(qcheck.get("evidence_count", 0)),
         "residual_has_evidence": bool(qcheck.get("has_evidence", False)),
+        "scratch_first_mode": bool(scratch_first),
     }
     anchor_pair = {
         "cam1": (Path(cam_sync_sources[0]).name if cam_sync_sources else ""),
@@ -6890,53 +7220,88 @@ def _write_active_speaker_otio(
                     )
                 )
 
+    # Audio stays continuous in timeline (no split-based cutting).
+    timeline_samples = max(1, int(round(float(timeline_end_s) * float(target_sr))))
+
+    def _ref_available_samples(ref_obj) -> int:
+        try:
+            ar = getattr(ref_obj, "available_range", None)
+            if ar is None:
+                return timeline_samples
+            dur = getattr(ar, "duration", None)
+            if dur is None:
+                return timeline_samples
+            return max(1, int(round(float(dur.value))))
+        except Exception:
+            return timeline_samples
+
     for cam_key, cam, tr in audio_tracks:
         aref = cam_audio_ref_by_key.get(cam_key)
         if aref is None:
             continue
-        for seg in split_segments:
-            start_sample = max(0, int(round(float(seg["start_s"]) * float(target_sr))))
-            end_sample = max(start_sample + 1, int(round(float(seg["end_s"]) * float(target_sr))))
-            dur_samples = max(1, end_sample - start_sample)
-            clip = otio.schema.Clip(
+        avail = _ref_available_samples(aref)
+        use = max(1, min(int(timeline_samples), int(avail)))
+        tr.append(
+            otio.schema.Clip(
                 name=Path(cam).stem,
                 media_reference=aref,
                 source_range=otio.opentime.TimeRange(
-                    start_time=otio.opentime.RationalTime(float(start_sample), float(target_sr)),
-                    duration=otio.opentime.RationalTime(float(dur_samples), float(target_sr)),
+                    start_time=otio.opentime.RationalTime(0.0, float(target_sr)),
+                    duration=otio.opentime.RationalTime(float(use), float(target_sr)),
                 ),
                 metadata={
                     "resemble_enhance": {
-                        "active_selected_camera": bool(str(seg.get("selected_cam_key", "")) == str(cam_key)),
                         "audio_role": "scratch_reference",
                         "monitor_default": "off",
+                        "color_hint": "grey",
                     },
                 },
             )
-            tr.append(clip)
+        )
+        if use < timeline_samples:
+            tr.append(
+                otio.schema.Gap(
+                    source_range=otio.opentime.TimeRange(
+                        start_time=otio.opentime.RationalTime(0.0, float(target_sr)),
+                        duration=otio.opentime.RationalTime(float(timeline_samples - use), float(target_sr)),
+                    )
+                )
+            )
 
     for clean_idx, tr in clean_audio_tracks:
         cref = clean_audio_ref_by_idx.get(clean_idx)
         if cref is None:
             continue
-        for seg in split_segments:
-            start_sample = max(0, int(round(float(seg["start_s"]) * float(target_sr))))
-            end_sample = max(start_sample + 1, int(round(float(seg["end_s"]) * float(target_sr))))
-            dur_samples = max(1, end_sample - start_sample)
-            clip = otio.schema.Clip(
+        avail = _ref_available_samples(cref)
+        use = max(1, min(int(timeline_samples), int(avail)))
+        clean_role = "host_clean" if int(clean_idx) == int(host_idx) else "guest_clean"
+        clean_color = "pink" if clean_role == "host_clean" else "yellow"
+        tr.append(
+            otio.schema.Clip(
                 name=f"CLEAN_{clean_idx + 1}",
                 media_reference=cref,
                 source_range=otio.opentime.TimeRange(
-                    start_time=otio.opentime.RationalTime(float(start_sample), float(target_sr)),
-                    duration=otio.opentime.RationalTime(float(dur_samples), float(target_sr)),
+                    start_time=otio.opentime.RationalTime(0.0, float(target_sr)),
+                    duration=otio.opentime.RationalTime(float(use), float(target_sr)),
                 ),
                 metadata={
                     "resemble_enhance": {
                         "clean_channel_index": int(clean_idx),
+                        "audio_role": clean_role,
+                        "color_hint": clean_color,
                     },
                 },
             )
-            tr.append(clip)
+        )
+        if use < timeline_samples:
+            tr.append(
+                otio.schema.Gap(
+                    source_range=otio.opentime.TimeRange(
+                        start_time=otio.opentime.RationalTime(0.0, float(target_sr)),
+                        duration=otio.opentime.RationalTime(float(timeline_samples - use), float(target_sr)),
+                    )
+                )
+            )
     _emit(f"[otio] camera references used: {len(used_cam_keys)}")
     _emit(f"[otio] split segments: {len(split_segments)}")
 
@@ -6952,6 +7317,7 @@ def _write_active_speaker_otio(
             "timeline_name": timeline_name or f"ActiveSpeaker_{stamp}",
             "fps": rate,
             "host_speaker_idx": host_idx,
+            "host_inference": host_inference,
             "wide": wide,
             "segments": merged,
             "turn_count": len(merged),
@@ -6983,6 +7349,7 @@ def _write_active_speaker_otio(
             "resolved_offsets_seconds": {Path(k).name: float(v) for k, v in source_offsets_by_path.items()},
             "alignment_quality": alignment_quality,
             "audio_sync_qc": audio_qc,
+            "clean_sync": clean_sync_result,
             "scratch_audio_note": "A_CAM tracks are reference scratch audio; monitor A_CLEAN tracks for primary mix.",
             "alignment_confidence": {
                 "coarse": float(solve.get("confidence", 0.0)),
