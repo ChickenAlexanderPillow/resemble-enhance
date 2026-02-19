@@ -1,4 +1,5 @@
 import os
+import hashlib
 import json
 import re
 import shutil
@@ -44,6 +45,67 @@ MEDIA_AUDIO_RAW_FOLDER = "040_AUDIO_RAW"
 MEDIA_VIDEO_RAW_FOLDER = "020_VIDEO_RAW"
 LAST_MODEL_SR: int | None = None
 LAST_MODEL_SR_PATH: str | None = None
+_AUDIO_TRACKS_CACHE: dict[tuple[str, int, int, int], list] = {}
+_FASTER_WHISPER_MODEL_CACHE: dict[tuple[str, str], object] = {}
+_WHISPER_WINDOW_CACHE: dict[tuple[str, int, int, str, str, int, int], list[dict]] = {}
+_AUDALIGN_OFFSETS_CACHE: dict[tuple, dict[str, float]] = {}
+
+
+def _stable_offsets_cache_key(source_paths: list[str]) -> str:
+    parts: list[str] = []
+    for p in source_paths:
+        try:
+            pp = Path(p)
+            st = pp.stat()
+            parts.append(f"{str(pp.resolve(strict=False))}|{int(st.st_mtime)}|{int(st.st_size)}")
+        except Exception:
+            parts.append(str(p))
+    parts.sort()
+    return hashlib.sha1("||".join(parts).encode("utf-8")).hexdigest()
+
+
+def _load_persistent_audalign_offsets(cache_key: str) -> dict[str, float] | None:
+    try:
+        f = INPUT_TMP_ROOT / "cache" / "otio_audalign_offsets.json"
+        if not f.exists():
+            return None
+        data = json.loads(f.read_text(encoding="utf-8"))
+        row = (data.get("entries", {}) or {}).get(cache_key)
+        if not isinstance(row, dict):
+            return None
+        offs = row.get("offsets", {})
+        if not isinstance(offs, dict):
+            return None
+        return {str(k): float(v) for k, v in offs.items()}
+    except Exception:
+        return None
+
+
+def _save_persistent_audalign_offsets(cache_key: str, offsets: dict[str, float]) -> None:
+    try:
+        d = INPUT_TMP_ROOT / "cache"
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / "otio_audalign_offsets.json"
+        data = {"entries": {}}
+        if f.exists():
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    data = {"entries": {}}
+            except Exception:
+                data = {"entries": {}}
+        entries = data.get("entries", {})
+        if not isinstance(entries, dict):
+            entries = {}
+        entries[cache_key] = {"offsets": {str(k): float(v) for k, v in offsets.items()}, "ts": int(time.time())}
+        # Keep file bounded.
+        if len(entries) > 256:
+            items = sorted(entries.items(), key=lambda kv: int((kv[1] or {}).get("ts", 0)), reverse=True)[:256]
+            entries = {k: v for k, v in items}
+        data["entries"] = entries
+        f.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
 
 def _format_seconds(seconds: float) -> str:
     try:
@@ -927,6 +989,15 @@ def _load_audio_tracks_any(path: str | Path, target_sr: int = 48000):
     except Exception:
         return []
     p = Path(path)
+    try:
+        rp = str(p.resolve(strict=False))
+        st = p.stat()
+        ckey = (rp, int(target_sr), int(st.st_mtime), int(st.st_size))
+        cached = _AUDIO_TRACKS_CACHE.get(ckey)
+        if cached is not None:
+            return cached
+    except Exception:
+        ckey = None
 
     def _wav_to_tracks(wav, sr) -> list:
         if wav is None or sr is None:
@@ -949,6 +1020,8 @@ def _load_audio_tracks_any(path: str | Path, target_sr: int = 48000):
         wav, sr = torchaudio.load(str(p))
         tracks = _wav_to_tracks(wav, sr)
         if len(tracks) >= 2:
+            if ckey is not None:
+                _AUDIO_TRACKS_CACHE[ckey] = tracks
             return tracks
     except Exception:
         pass
@@ -1018,6 +1091,8 @@ def _load_audio_tracks_any(path: str | Path, target_sr: int = 48000):
                     if tracks_i:
                         extracted_tracks.append(tracks_i[0])
                 if len(extracted_tracks) >= 2:
+                    if ckey is not None:
+                        _AUDIO_TRACKS_CACHE[ckey] = extracted_tracks
                     return extracted_tracks
 
             # Strategy B: single stream with multiple channels -> split each channel.
@@ -1055,6 +1130,8 @@ def _load_audio_tracks_any(path: str | Path, target_sr: int = 48000):
                     if tracks_i:
                         extracted_tracks.append(tracks_i[0])
                 if len(extracted_tracks) >= 2:
+                    if ckey is not None:
+                        _AUDIO_TRACKS_CACHE[ckey] = extracted_tracks
                     return extracted_tracks
 
             # Final fallback: single decode (may be mono/stereo depending on container/decoder).
@@ -1076,7 +1153,10 @@ def _load_audio_tracks_any(path: str | Path, target_sr: int = 48000):
             proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if proc.returncode == 0 and tmp_wav.exists():
                 wav, sr = torchaudio.load(str(tmp_wav))
-                return _wav_to_tracks(wav, sr)
+                tracks = _wav_to_tracks(wav, sr)
+                if ckey is not None:
+                    _AUDIO_TRACKS_CACHE[ckey] = tracks
+                return tracks
     except Exception:
         return []
     return []
@@ -4204,6 +4284,8 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                                 camera_roles=otio_roles,
                                                 clean_audio_path=str(clean_src),
                                                 timeline_name=(otio_name or None),
+                                                asr_required=False,
+                                                alignment_strategy="cam_scratch_only",
                                                 log=lambda m: self.after(0, self._log, m),
                                             )
                                             if otio_path:
@@ -4572,6 +4654,953 @@ def _transcribe_words_openai(wav_path: Path) -> list[dict]:
         return []
 
 
+def _transcribe_words_faster_whisper(path: Path, language: str = "en", model_name: str = "small") -> list[dict]:
+    try:
+        from faster_whisper import WhisperModel  # type: ignore[import-not-found]
+    except Exception:
+        return []
+    # CUDA-only by requirement: no CPU fallback.
+    try:
+        mkey = (str(model_name), str(language or "en"))
+        model = _FASTER_WHISPER_MODEL_CACHE.get(mkey)
+        if model is None:
+            model = WhisperModel(str(model_name), device="cuda", compute_type="float16")
+            _FASTER_WHISPER_MODEL_CACHE[mkey] = model
+    except Exception:
+        return []
+    try:
+        segments, _info = model.transcribe(
+            str(path),
+            language=str(language or "en"),
+            word_timestamps=True,
+            vad_filter=True,
+            beam_size=5,
+        )
+    except Exception:
+        return []
+    out: list[dict] = []
+    try:
+        for seg in segments:
+            words = getattr(seg, "words", None) or []
+            for w in words:
+                txt = str(getattr(w, "word", "") or "").strip()
+                st = float(getattr(w, "start", 0.0) or 0.0)
+                en = float(getattr(w, "end", st) or st)
+                pr = getattr(w, "probability", None)
+                conf = float(pr) if pr is not None else 0.0
+                if not txt:
+                    continue
+                out.append({
+                    "word": txt,
+                    "start": st,
+                    "end": max(st, en),
+                    "confidence": conf,
+                })
+    except Exception:
+        return []
+    return out
+
+
+def _transcribe_window_faster_whisper(path: Path, start_s: float, dur_s: float, language: str = "en", model_name: str = "small") -> list[dict]:
+    import tempfile
+    ffmpeg = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+    if not ffmpeg:
+        return []
+    ss = max(0.0, float(start_s))
+    dd = max(0.5, float(dur_s))
+    try:
+        rp = str(path.resolve(strict=False))
+        st = path.stat()
+        wkey = (rp, int(round(ss * 1000.0)), int(round(dd * 1000.0)), str(language or "en"), str(model_name), int(st.st_mtime), int(st.st_size))
+        cached = _WHISPER_WINDOW_CACHE.get(wkey)
+        if cached is not None:
+            return cached
+    except Exception:
+        wkey = None
+    with tempfile.TemporaryDirectory(prefix="otio_asr_window_") as td:
+        tmp_wav = Path(td) / "window.wav"
+        try:
+            cmd = [
+                ffmpeg,
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-ss",
+                f"{ss:.3f}",
+                "-t",
+                f"{dd:.3f}",
+                "-i",
+                str(path),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                str(tmp_wav),
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if proc.returncode != 0 or not tmp_wav.exists():
+                if wkey is not None:
+                    _WHISPER_WINDOW_CACHE[wkey] = []
+                return []
+        except Exception:
+            return []
+        words = _transcribe_words_faster_whisper(tmp_wav, language=language, model_name=model_name)
+        out: list[dict] = []
+        for w in words:
+            try:
+                st = float(w.get("start", 0.0)) + ss
+                en = float(w.get("end", st)) + ss
+                out.append({
+                    **w,
+                    "start": st,
+                    "end": max(st, en),
+                })
+            except Exception:
+                continue
+        if wkey is not None:
+            _WHISPER_WINDOW_CACHE[wkey] = out
+        return out
+
+
+def _select_anchor_windows(duration_s: float, policy: str = "start_mid_end", window_s: float = 30.0, max_windows: int = 3) -> list[dict]:
+    dur = max(0.0, float(duration_s))
+    ws = max(5.0, float(window_s))
+    if dur <= 0.0:
+        return []
+    starts: list[tuple[str, float]] = []
+    if policy == "start_mid_end":
+        starts = [
+            ("start", 0.0),
+            ("middle", max(0.0, (dur * 0.5) - (ws * 0.5))),
+            ("end", max(0.0, dur - ws)),
+        ]
+    else:
+        starts = [("start", 0.0)]
+    out: list[dict] = []
+    seen: list[float] = []
+    for label, s in starts:
+        s = max(0.0, min(float(s), max(0.0, dur - ws)))
+        if any(abs(s - x) < 0.5 for x in seen):
+            continue
+        seen.append(s)
+        out.append({"label": label, "start_s": s, "dur_s": min(ws, max(0.5, dur - s))})
+        if len(out) >= int(max_windows):
+            break
+    return out
+
+
+def _window_transcript_quality(words: list[dict], min_words: int = 8) -> dict:
+    import numpy as np
+    cnt = int(len(words or []))
+    confs = [float(w.get("confidence", 0.0)) for w in (words or []) if isinstance(w, dict)]
+    med = float(np.median(np.asarray(confs, dtype=float))) if confs else 0.0
+    cov = 0.0
+    try:
+        if words:
+            s0 = float(min(float(w.get("start", 0.0)) for w in words))
+            s1 = float(max(float(w.get("end", 0.0)) for w in words))
+            total = max(0.001, s1 - s0)
+            voiced = 0.0
+            for w in words:
+                ws = float(w.get("start", 0.0))
+                we = float(w.get("end", ws))
+                voiced += max(0.0, we - ws)
+            cov = float(min(1.0, voiced / total))
+    except Exception:
+        cov = 0.0
+    ok = cnt >= int(min_words) and med >= 0.35
+    score = float((0.6 * med) + (0.4 * min(1.0, cnt / max(1.0, float(min_words * 3)))))
+    return {"ok": ok, "word_count": cnt, "median_confidence": med, "speech_coverage": cov, "score": score}
+
+
+def _find_best_content_match(clean_window: dict, scratch_signal, sr: int, max_lag_s: float) -> dict:
+    import numpy as np
+    out = {
+        "ok": False,
+        "reason": "no_match",
+        "source_start_s": 0.0,
+        "offset_s": 0.0,
+        "confidence": 0.0,
+        "peak_ratio": 0.0,
+        "residual_s": 0.0,
+        "window_start_s": float(clean_window.get("start_s", 0.0)),
+    }
+    try:
+        if hasattr(scratch_signal, "detach"):
+            src = scratch_signal.detach().cpu().float().numpy()
+        else:
+            src = np.asarray(scratch_signal, dtype=np.float32)
+        clean_wave = np.asarray(clean_window.get("clean_wave", []), dtype=np.float32)
+        words_local = list(clean_window.get("words_local", []) or [])
+        dur_s = max(1.0, float(clean_window.get("dur_s", 0.0)))
+        if src.ndim != 1 or src.size < int(sr * 5):
+            out["reason"] = "short_source"
+            return out
+        hop_s = 0.05
+        src_env = _build_signal_activity(src, sr, hop_s=hop_s)
+        if int(getattr(src_env, "size", 0)) < 16:
+            out["reason"] = "env_too_short"
+            return out
+
+        # Prefer transcript-derived template; fallback to clean waveform envelope.
+        template = None
+        if words_local:
+            template = _build_transcript_activity(words_local, hop_s=hop_s, duration_s=dur_s)
+        if template is None or int(getattr(template, "size", 0)) < 16:
+            if clean_wave.size < int(sr * 2):
+                out["reason"] = "no_template"
+                return out
+            template = _build_signal_activity(clean_wave, sr, hop_s=hop_s)
+        t = np.asarray(template, dtype=np.float32)
+        if t.ndim != 1 or t.size < 16:
+            out["reason"] = "template_too_short"
+            return out
+
+        n = int(t.size)
+        if int(src_env.size) < n + 4:
+            out["reason"] = "search_too_short"
+            return out
+        corr = np.correlate(src_env, t, mode="valid")
+        denom_t = float(np.sqrt(np.sum(t * t)) + 1e-9)
+        run = np.convolve(src_env * src_env, np.ones(n, dtype=np.float32), mode="valid")
+        denom_s = np.sqrt(np.maximum(run, 1e-9))
+        scores = corr / (denom_s * denom_t + 1e-9)
+
+        cw_start = max(0.0, float(clean_window.get("start_s", 0.0)))
+        cw_dur = max(1.0, dur_s)
+        src_total_s = float(src.size / max(1, sr))
+        min_start_s = max(0.0, cw_start - max(0.0, float(max_lag_s)))
+        max_start_s = min(max(0.0, src_total_s - cw_dur), cw_start + max(0.0, float(max_lag_s)))
+        i0 = max(0, int(round(min_start_s / hop_s)))
+        i1 = min(int(scores.size), max(i0 + 1, int(round(max_start_s / hop_s)) + 1))
+        if i1 <= i0:
+            out["reason"] = "lag_bounds_empty"
+            return out
+
+        view = scores[i0:i1]
+        rel = int(np.argmax(view))
+        idx = i0 + rel
+        best = float(scores[idx])
+        med = float(np.median(np.abs(view)) + 1e-6)
+        peak_ratio = float(best / med)
+        coarse_src_start_s = float(idx * hop_s)
+
+        # Local waveform refine.
+        lag_s = 0.0
+        if clean_wave.size >= int(sr * 2):
+            s0 = max(0, int(round(coarse_src_start_s * sr)))
+            s1 = min(src.size, s0 + clean_wave.size)
+            seg = src[s0:s1]
+            n2 = min(clean_wave.size, seg.size)
+            if n2 >= int(sr * 1):
+                lag_samples = int(_gcc_phat_lag(clean_wave[:n2], seg[:n2]))
+                lag_s = float(lag_samples / float(sr))
+        if abs(lag_s) > 1.0:
+            lag_s = 0.0
+        refined_src_start_s = max(0.0, coarse_src_start_s + lag_s)
+        offset_s = float(cw_start - refined_src_start_s)
+
+        base_score = float(max(0.0, min(1.0, best)))
+        ratio_score = float(max(0.0, min(1.0, (peak_ratio - 1.0) / 1.0)))
+        res_penalty = 1.0 if abs(lag_s) <= 0.25 else max(0.0, 1.0 - ((abs(lag_s) - 0.25) / 1.75))
+        conf = float(max(0.0, min(1.0, (0.25 * base_score) + (0.75 * ratio_score))) * res_penalty)
+        out.update({
+            "ok": True,
+            "reason": "ok",
+            "source_start_s": refined_src_start_s,
+            "offset_s": offset_s,
+            "confidence": conf,
+            "peak_ratio": peak_ratio,
+            "residual_s": float(lag_s),
+        })
+        return out
+    except Exception as exc:
+        out["reason"] = f"error:{exc}"
+        return out
+
+
+def _solve_offsets_from_content_matches(matches_by_source: dict[str, list[dict]]) -> dict:
+    import numpy as np
+    out = {"ok": False, "offsets": {}, "counts": {}, "confidence": 0.0}
+    if not matches_by_source:
+        return out
+    conf_all: list[float] = []
+    for src, matches in matches_by_source.items():
+        good = [m for m in (matches or []) if bool(m.get("ok"))]
+        out["counts"][src] = int(len(good))
+        if not good:
+            continue
+        offs = np.asarray([float(m.get("offset_s", 0.0)) for m in good], dtype=float)
+        # Robust outlier rejection before taking median.
+        if offs.size >= 3:
+            med = float(np.median(offs))
+            mad = float(np.median(np.abs(offs - med)) + 1e-9)
+            keep = np.abs(offs - med) <= (3.0 * max(0.25, 1.4826 * mad))
+            if np.any(keep):
+                offs = offs[keep]
+        out["offsets"][src] = float(np.median(offs))
+        conf_all.extend([float(m.get("confidence", 0.0)) for m in good])
+    if not out["offsets"]:
+        return out
+    # Normalize to earliest-start = 0 to keep downstream refinement stable.
+    vals = [float(v) for v in out["offsets"].values()]
+    mn = min(vals) if vals else 0.0
+    out["offsets"] = {k: float(v - mn) for k, v in out["offsets"].items()}
+    out["ok"] = True
+    out["confidence"] = float(np.median(np.asarray(conf_all, dtype=float))) if conf_all else 0.0
+    return out
+
+
+def _validate_alignment_quality(
+    refined: dict,
+    max_median_residual_ms: float = 120.0,
+    min_residual_pairs: int = 1,
+) -> dict:
+    import numpy as np
+    residuals = [abs(float(v)) for v in (refined.get("residuals", {}) or {}).values()]
+    evidence_count = int(len(residuals))
+    med_ms = float(np.median(np.asarray(residuals, dtype=float)) * 1000.0) if residuals else 0.0
+    has_evidence = bool(evidence_count >= int(max(1, min_residual_pairs)))
+    ok = bool(has_evidence and (med_ms <= float(max_median_residual_ms)))
+    return {
+        "ok": ok,
+        "median_residual_ms": med_ms,
+        "evidence_count": evidence_count,
+        "has_evidence": has_evidence,
+    }
+
+
+def _validate_offsets_against_clean(
+    source_paths: list[str],
+    offsets_by_path: dict[str, float],
+    clean_path: str,
+    target_sr: int = 48000,
+    max_abs_lag_s: float = 0.40,
+) -> dict:
+    """Validate final offsets by checking aligned residual lag vs clean."""
+    import numpy as np
+    out = {
+        "ok": False,
+        "pair_lag_s": {},
+        "max_abs_lag_s": 999.0,
+        "tested_pairs": 0,
+        "valid_pairs": 0,
+        "has_evidence": False,
+    }
+    clean_tracks = _load_audio_tracks_any(clean_path, target_sr=target_sr)
+    if not clean_tracks:
+        return out
+    clean = clean_tracks[0]
+    clean_np = clean.detach().cpu().float().numpy() if hasattr(clean, "detach") else np.asarray(clean, dtype=np.float32)
+    c_off = float(offsets_by_path.get(clean_path, 0.0))
+    c_dur_s = float(len(clean_np) / float(target_sr))
+    worst = 0.0
+    tested_pairs = 0
+    valid_pairs = 0
+    for sp in source_paths:
+        if str(sp) == str(clean_path):
+            continue
+        tested_pairs += 1
+        tt = _load_audio_tracks_any(sp, target_sr=target_sr)
+        if not tt:
+            continue
+        src = tt[0]
+        src_np = src.detach().cpu().float().numpy() if hasattr(src, "detach") else np.asarray(src, dtype=np.float32)
+        s_off = float(offsets_by_path.get(str(sp), 0.0))
+        s_dur_s = float(len(src_np) / float(target_sr))
+        ov_start = max(float(c_off), float(s_off))
+        ov_end = min(float(c_off + c_dur_s), float(s_off + s_dur_s))
+        ov_len = max(0.0, ov_end - ov_start)
+        if ov_len < 5.0:
+            continue
+        # Robust multi-window lag estimate to avoid single-window false matches.
+        win_s = 30.0
+        step_s = 15.0
+        lags: list[float] = []
+        max_windows = 40
+        n_steps = max(1, int((ov_len - win_s) / step_s) + 1)
+        checked = 0
+        for ii in range(n_steps):
+            if checked >= max_windows:
+                break
+            gs = ov_start + (ii * step_s)
+            if gs + win_s > ov_end:
+                gs = max(ov_start, ov_end - win_s)
+            c_i = int(round((gs - c_off) * float(target_sr)))
+            s_i = int(round((gs - s_off) * float(target_sr)))
+            n_i = int(round(win_s * float(target_sr)))
+            c_seg = clean_np[c_i:c_i + n_i]
+            s_seg = src_np[s_i:s_i + n_i]
+            n2 = min(len(c_seg), len(s_seg))
+            if n2 < int(target_sr * 8):
+                continue
+            c_use = c_seg[:n2]
+            s_use = s_seg[:n2]
+            c_rms = float(np.sqrt(np.mean(c_use * c_use) + 1e-12))
+            s_rms = float(np.sqrt(np.mean(s_use * s_use) + 1e-12))
+            if c_rms < 1e-4 or s_rms < 1e-4:
+                continue
+            checked += 1
+            lag_s = float(_gcc_phat_lag(c_use, s_use) / float(target_sr))
+            # Keep plausible local residuals only.
+            if abs(lag_s) <= 2.0:
+                lags.append(lag_s)
+        if not lags:
+            continue
+        med_lag = float(np.median(np.asarray(lags, dtype=float)))
+        out["pair_lag_s"][Path(sp).name] = med_lag
+        worst = max(worst, abs(med_lag))
+        valid_pairs += 1
+    out["tested_pairs"] = int(tested_pairs)
+    out["valid_pairs"] = int(valid_pairs)
+    out["has_evidence"] = bool(valid_pairs > 0)
+    out["max_abs_lag_s"] = float(worst if valid_pairs > 0 else 999.0)
+    out["ok"] = bool((valid_pairs > 0) and (worst <= float(max_abs_lag_s)))
+    return out
+
+
+def _qa_aligned_audio_sync(
+    audio_paths: dict[str, str | Path],
+    target_sr: int = 48000,
+    max_abs_median_lag_s: float = 0.25,
+) -> dict:
+    import numpy as np
+    out = {
+        "ok": False,
+        "pair_median_lag_s": {},
+        "max_abs_median_lag_s": 999.0,
+        "tested_pairs": 0,
+        "valid_pairs": 0,
+        "has_evidence": False,
+    }
+    names = list(audio_paths.keys())
+    waves: dict[str, np.ndarray] = {}
+    for name in names:
+        p = str(audio_paths.get(name, "") or "")
+        if not p:
+            continue
+        tt = _load_audio_tracks_any(p, target_sr=target_sr)
+        if not tt:
+            continue
+        x = tt[0]
+        x_np = x.detach().cpu().float().numpy() if hasattr(x, "detach") else np.asarray(x, dtype=np.float32)
+        waves[name] = x_np
+    pairs = []
+    if "cam1" in waves and "cam2" in waves:
+        pairs.append(("cam1", "cam2"))
+    if "cam1" in waves and "clean1" in waves:
+        pairs.append(("cam1", "clean1"))
+    if "cam2" in waves and "clean1" in waves:
+        pairs.append(("cam2", "clean1"))
+    worst = 0.0
+    tested_pairs = 0
+    valid_pairs = 0
+    for a, b in pairs:
+        tested_pairs += 1
+        xa = waves[a]
+        xb = waves[b]
+        ov = min(len(xa), len(xb))
+        if ov < int(target_sr * 20):
+            continue
+        win_s = 20.0
+        step_s = 10.0
+        lags: list[float] = []
+        wrms = []
+        for s in range(0, max(1, ov - int(win_s * target_sr)), int(step_s * target_sr)):
+            e = s + int(win_s * target_sr)
+            aa = xa[s:e]
+            bb = xb[s:e]
+            if len(aa) < int(target_sr * 8) or len(bb) < int(target_sr * 8):
+                continue
+            ar = float(np.sqrt(np.mean(aa * aa) + 1e-12))
+            br = float(np.sqrt(np.mean(bb * bb) + 1e-12))
+            wrms.append((ar, br))
+        if not wrms:
+            continue
+        a_thr = float(np.quantile(np.asarray([x[0] for x in wrms], dtype=float), 0.5))
+        b_thr = float(np.quantile(np.asarray([x[1] for x in wrms], dtype=float), 0.5))
+        for s in range(0, max(1, ov - int(win_s * target_sr)), int(step_s * target_sr)):
+            e = s + int(win_s * target_sr)
+            aa = xa[s:e]
+            bb = xb[s:e]
+            if len(aa) < int(target_sr * 8) or len(bb) < int(target_sr * 8):
+                continue
+            ar = float(np.sqrt(np.mean(aa * aa) + 1e-12))
+            br = float(np.sqrt(np.mean(bb * bb) + 1e-12))
+            if ar < a_thr or br < b_thr:
+                continue
+            lag = float(_gcc_phat_lag(aa, bb) / float(target_sr))
+            if abs(lag) <= 3.0:
+                lags.append(lag)
+        if not lags:
+            continue
+        med = float(np.median(np.asarray(lags, dtype=float)))
+        out["pair_median_lag_s"][f"{a}|{b}"] = med
+        worst = max(worst, abs(med))
+        valid_pairs += 1
+    out["tested_pairs"] = int(tested_pairs)
+    out["valid_pairs"] = int(valid_pairs)
+    out["has_evidence"] = bool(valid_pairs > 0)
+    out["max_abs_median_lag_s"] = float(worst if valid_pairs > 0 else 999.0)
+    out["ok"] = bool((valid_pairs > 0) and (worst <= float(max_abs_median_lag_s)))
+    return out
+
+
+def _validate_offsets_pairwise(
+    source_paths: list[str],
+    offsets_by_path: dict[str, float],
+    target_sr: int = 48000,
+    max_abs_lag_s: float = 0.40,
+) -> dict:
+    import numpy as np
+    out = {
+        "ok": False,
+        "pair_lag_s": {},
+        "max_abs_lag_s": 999.0,
+        "tested_pairs": 0,
+        "valid_pairs": 0,
+        "has_evidence": False,
+    }
+    srcs = [str(p).strip() for p in (source_paths or []) if str(p).strip()]
+    if len(srcs) < 2:
+        return out
+    waves: dict[str, np.ndarray] = {}
+    for sp in srcs:
+        tt = _load_audio_tracks_any(sp, target_sr=target_sr)
+        if not tt:
+            continue
+        x = tt[0]
+        waves[sp] = x.detach().cpu().float().numpy() if hasattr(x, "detach") else np.asarray(x, dtype=np.float32)
+    if len(waves) < 2:
+        return out
+
+    def _apply_signed_offset(x: np.ndarray, off_s: float) -> np.ndarray:
+        off_samples = int(round(float(off_s) * float(target_sr)))
+        if off_samples >= 0:
+            return np.concatenate([np.zeros(off_samples, dtype=np.float32), x.astype(np.float32, copy=False)])
+        drop = min(len(x), int(-off_samples))
+        if drop >= len(x):
+            return np.zeros(1, dtype=np.float32)
+        return x[drop:].astype(np.float32, copy=False)
+
+    worst = 0.0
+    tested = 0
+    valid = 0
+    for i in range(len(srcs)):
+        for j in range(i + 1, len(srcs)):
+            a = srcs[i]
+            b = srcs[j]
+            if a not in waves or b not in waves:
+                continue
+            tested += 1
+            aa = _apply_signed_offset(waves[a], float(offsets_by_path.get(a, 0.0)))
+            bb = _apply_signed_offset(waves[b], float(offsets_by_path.get(b, 0.0)))
+            ov = min(len(aa), len(bb))
+            if ov < int(target_sr * 20):
+                continue
+            win_s = 20.0
+            step_s = 10.0
+            lags: list[float] = []
+            for s in range(0, max(1, ov - int(win_s * target_sr)), int(step_s * target_sr)):
+                e = s + int(win_s * target_sr)
+                xa = aa[s:e]
+                xb = bb[s:e]
+                if len(xa) < int(target_sr * 8) or len(xb) < int(target_sr * 8):
+                    continue
+                ar = float(np.sqrt(np.mean(xa * xa) + 1e-12))
+                br = float(np.sqrt(np.mean(xb * xb) + 1e-12))
+                if ar < 1e-4 or br < 1e-4:
+                    continue
+                lag = float(_gcc_phat_lag(xa, xb) / float(target_sr))
+                if abs(lag) <= 3.0:
+                    lags.append(lag)
+            if not lags:
+                continue
+            med = float(np.median(np.asarray(lags, dtype=float)))
+            out["pair_lag_s"][f"{Path(a).name}|{Path(b).name}"] = med
+            worst = max(worst, abs(med))
+            valid += 1
+    out["tested_pairs"] = int(tested)
+    out["valid_pairs"] = int(valid)
+    out["has_evidence"] = bool(valid > 0)
+    out["max_abs_lag_s"] = float(worst if valid > 0 else 999.0)
+    out["ok"] = bool((valid > 0) and (worst <= float(max_abs_lag_s)))
+    return out
+
+
+def _estimate_global_offsets_from_envelopes(
+    source_paths: list[str],
+    clean_path: str,
+    target_sr: int = 48000,
+    max_lag_s: float = 1200.0,
+) -> dict[str, float]:
+    srcs = [str(p).strip() for p in (source_paths or []) if str(p).strip()]
+    out: dict[str, float] = {p: 0.0 for p in srcs}
+    if not srcs or not clean_path:
+        return out
+    hop_s = 0.02
+    clean_tracks = _load_audio_tracks_any(clean_path, target_sr=target_sr)
+    if not clean_tracks:
+        return out
+    try:
+        if len(clean_tracks) > 1:
+            import torch
+            clean_mono = torch.mean(torch.stack(clean_tracks, dim=0), dim=0)
+        else:
+            clean_mono = clean_tracks[0]
+    except Exception:
+        clean_mono = clean_tracks[0]
+    clean_env = _build_signal_activity(clean_mono, target_sr, hop_s=hop_s)
+    out[str(clean_path)] = 0.0
+    max_lag_frames = int(max(1, round(float(max_lag_s) / hop_s)))
+    for sp in srcs:
+        if str(sp) == str(clean_path):
+            continue
+        tt = _load_audio_tracks_any(sp, target_sr=target_sr)
+        if not tt:
+            continue
+        src_env = _build_signal_activity(tt[0], target_sr, hop_s=hop_s)
+        try:
+            lag_frames = int(_gcc_phat_lag(clean_env, src_env))
+        except Exception:
+            continue
+        if abs(lag_frames) > max_lag_frames:
+            continue
+        lag_s = float(lag_frames * hop_s)
+        # clean is anchor (0): positive source offset means source starts later.
+        out[str(sp)] = float(-lag_s)
+    # Keep clean anchored at zero and preserve signed offsets for others.
+    c0 = float(out.get(str(clean_path), 0.0))
+    out = {k: float(v - c0) for k, v in out.items()}
+    out[str(clean_path)] = 0.0
+    return out
+
+
+def _build_word_anchors(words: list[dict], min_word_dur_s: float = 0.08) -> list[dict]:
+    anchors: list[dict] = []
+    for w in (words or []):
+        try:
+            txt = str(w.get("word", "") or "").strip()
+            st = float(w.get("start", 0.0))
+            en = float(w.get("end", st))
+            conf = float(w.get("confidence", 0.0))
+            if not txt:
+                continue
+            dur = max(0.0, en - st)
+            if dur < float(min_word_dur_s):
+                continue
+            if conf < 0.15:
+                continue
+            anchors.append({"word": txt, "start": st, "end": en, "confidence": conf})
+        except Exception:
+            continue
+    anchors.sort(key=lambda x: float(x.get("start", 0.0)))
+    return anchors
+
+
+def _build_transcript_activity(words: list[dict], hop_s: float, duration_s: float) -> object:
+    import numpy as np
+    n = max(1, int(round(max(0.1, float(duration_s)) / float(hop_s))))
+    act = np.zeros(n, dtype=np.float32)
+    for w in (words or []):
+        try:
+            s = max(0.0, float(w.get("start", 0.0)))
+            e = max(s, float(w.get("end", s)))
+            c = float(w.get("confidence", 0.0))
+            v = max(0.2, min(1.0, c if c > 0 else 0.6))
+            i0 = max(0, int(round(s / hop_s)))
+            i1 = min(n, max(i0 + 1, int(round(e / hop_s))))
+            act[i0:i1] = np.maximum(act[i0:i1], v)
+        except Exception:
+            continue
+    return act
+
+
+def _build_signal_activity(mono, sr: int, hop_s: float) -> object:
+    import numpy as np
+    if hasattr(mono, "detach"):
+        x = mono.detach().cpu().float().numpy()
+    else:
+        x = np.asarray(mono, dtype=np.float32)
+    if x.ndim != 1 or x.size < 2:
+        return np.zeros(1, dtype=np.float32)
+    hop = max(1, int(round(float(sr) * float(hop_s))))
+    n = max(1, int(x.size // hop))
+    z = x[: n * hop].reshape(n, hop)
+    env = np.sqrt(np.mean(z * z, axis=1) + 1e-12).astype(np.float32)
+    if env.size > 2:
+        p20 = float(np.quantile(env, 0.2))
+        env = np.maximum(0.0, env - p20)
+    m = float(np.max(env) or 0.0)
+    if m > 1e-9:
+        env = env / m
+    return env
+
+
+def _align_sources_from_word_anchors(source_paths: list[str], anchor_words: list[dict], target_sr: int = 48000) -> dict:
+    import numpy as np
+    srcs = [str(p).strip() for p in (source_paths or []) if str(p).strip()]
+    out = {"ok": False, "offsets": {p: 0.0 for p in srcs}, "confidence": 0.0, "anchor_count": int(len(anchor_words))}
+    if len(srcs) < 2 or not anchor_words:
+        return out
+    hop_s = 0.05
+    clean_path = srcs[-1]
+    duration_s = max([float(w.get("end", 0.0)) for w in anchor_words] + [1.0]) + 2.0
+    transcript_act = _build_transcript_activity(anchor_words, hop_s=hop_s, duration_s=duration_s)
+    if transcript_act is None or int(getattr(transcript_act, "size", 0)) < 4:
+        return out
+    raw_offsets: dict[str, float] = {}
+    qvals: list[float] = []
+    for p in srcs:
+        tracks = _load_audio_tracks_any(p, target_sr=target_sr)
+        if not tracks:
+            continue
+        try:
+            if len(tracks) > 1:
+                import torch
+                mono = torch.mean(torch.stack(tracks, dim=0), dim=0)
+            else:
+                mono = tracks[0]
+        except Exception:
+            mono = tracks[0]
+        sact = _build_signal_activity(mono, target_sr, hop_s=hop_s)
+        if int(getattr(sact, "size", 0)) < 4:
+            continue
+        n = min(int(sact.size), int(transcript_act.size))
+        if n < 8:
+            continue
+        lag_frames = int(_gcc_phat_lag(transcript_act[:n], sact[:n]))
+        off = float(-lag_frames * hop_s)
+        raw_offsets[p] = off
+        try:
+            c = np.correlate(transcript_act[:n], sact[:n], mode="valid")
+            q = float(np.max(c) / (np.mean(np.abs(c)) + 1e-6))
+            qvals.append(q)
+        except Exception:
+            pass
+    if clean_path in raw_offsets:
+        raw_offsets[clean_path] = 0.0
+    if len(raw_offsets) < 2:
+        return out
+    for p in srcs:
+        raw_offsets.setdefault(p, 0.0)
+    mn = min(raw_offsets.values()) if raw_offsets else 0.0
+    norm = {p: float(max(0.0, raw_offsets.get(p, 0.0) - mn)) for p in srcs}
+    if any(v > 600.0 for v in norm.values()):
+        return out
+    out["ok"] = True
+    out["offsets"] = norm
+    out["confidence"] = float(np.median(np.asarray(qvals, dtype=float))) if qvals else 0.0
+    return out
+
+
+def _refine_offsets_waveform(local_offsets: dict[str, float], source_paths: list[str], target_sr: int = 48000) -> dict:
+    srcs = [str(p).strip() for p in (source_paths or []) if str(p).strip()]
+    out = {
+        "offsets": {p: float(local_offsets.get(p, 0.0)) for p in srcs},
+        "residuals": {},
+        "confidence": 0.0,
+    }
+    if len(srcs) < 2:
+        return out
+    clean_path = srcs[-1]
+    clean_tracks = _load_audio_tracks_any(clean_path, target_sr=target_sr)
+    if not clean_tracks:
+        return out
+    try:
+        if len(clean_tracks) > 1:
+            import torch
+            clean = torch.mean(torch.stack(clean_tracks, dim=0), dim=0)
+        else:
+            clean = clean_tracks[0]
+    except Exception:
+        clean = clean_tracks[0]
+    if hasattr(clean, "detach"):
+        clean_np = clean.detach().cpu().float().numpy()
+    else:
+        import numpy as np
+        clean_np = np.asarray(clean, dtype=np.float32)
+    qvals: list[float] = []
+
+    def _apply_signed_offset(x, off_s: float):
+        import numpy as np
+        off_samples = int(round(float(off_s) * float(target_sr)))
+        if off_samples >= 0:
+            return np.concatenate([np.zeros(off_samples, dtype=np.float32), x.astype(np.float32, copy=False)])
+        drop = min(len(x), int(-off_samples))
+        if drop >= len(x):
+            return np.zeros(1, dtype=np.float32)
+        return x[drop:].astype(np.float32, copy=False)
+
+    for p in srcs[:-1]:
+        tracks = _load_audio_tracks_any(p, target_sr=target_sr)
+        if not tracks:
+            continue
+        mono = tracks[0]
+        if hasattr(mono, "detach"):
+            src_np = mono.detach().cpu().float().numpy()
+        else:
+            import numpy as np
+            src_np = np.asarray(mono, dtype=np.float32)
+        c_off = float(out["offsets"].get(clean_path, 0.0))
+        s_off = float(out["offsets"].get(p, 0.0))
+        try:
+            ca = _apply_signed_offset(clean_np, c_off)
+            sa = _apply_signed_offset(src_np, s_off)
+        except Exception:
+            continue
+        n = min(len(ca), len(sa), int(target_sr * 300))
+        if n < int(target_sr * 10):
+            continue
+        lag = float(_gcc_phat_lag(ca[:n], sa[:n]) / float(target_sr))
+        residual = float(-lag)
+        if abs(residual) > 2.0:
+            # Treat large residuals as correlation failures instead of applying
+            # destructive global shifts.
+            continue
+        out["offsets"][p] = float(out["offsets"].get(p, 0.0)) + residual
+        out["residuals"][p] = residual
+        qvals.append(abs(residual))
+    # Anchor normalization: keep clean at 0, preserve signed deltas for others.
+    clean_off = float(out["offsets"].get(clean_path, 0.0))
+    out["offsets"] = {k: float(v - clean_off) for k, v in out["offsets"].items()}
+    out["offsets"][clean_path] = 0.0
+    out["confidence"] = float(1.0 / (1.0 + (sum(qvals) / max(1, len(qvals))))) if qvals else 0.0
+    return out
+
+
+def _build_turns_from_transcript(words: list[dict], clean_offset_s: float) -> list[dict]:
+    ww = []
+    for w in (words or []):
+        try:
+            txt = str(w.get("word", "") or "").strip()
+            st = float(w.get("start", 0.0))
+            en = float(w.get("end", st))
+            spk = int(w.get("speaker_idx", 0))
+            conf = float(w.get("speaker_conf", w.get("confidence", 0.0)))
+            if not txt or en <= st:
+                continue
+            ww.append({"word": txt, "start": st, "end": en, "speaker_idx": spk, "speaker_conf": conf})
+        except Exception:
+            continue
+    ww.sort(key=lambda x: float(x["start"]))
+    if not ww:
+        return []
+    max_gap_s = 0.6
+    turns: list[dict] = []
+    cur = None
+    for w in ww:
+        if cur is None:
+            cur = {
+                "speaker_idx": int(w["speaker_idx"]),
+                "start_s": float(w["start"] + clean_offset_s),
+                "end_s": float(w["end"] + clean_offset_s),
+                "avg_conf": float(w["speaker_conf"]),
+                "text_words": [str(w["word"])],
+                "n": 1,
+            }
+            continue
+        gap = float(w["start"] + clean_offset_s) - float(cur["end_s"])
+        if int(w["speaker_idx"]) == int(cur["speaker_idx"]) and gap <= max_gap_s:
+            cur["end_s"] = float(w["end"] + clean_offset_s)
+            cur["avg_conf"] = float((float(cur["avg_conf"]) * float(cur["n"]) + float(w["speaker_conf"])) / float(cur["n"] + 1))
+            cur["n"] = int(cur["n"]) + 1
+            cur["text_words"].append(str(w["word"]))
+        else:
+            txt = " ".join(cur["text_words"]).strip()
+            turns.append({
+                "speaker_idx": int(cur["speaker_idx"]),
+                "start_s": float(cur["start_s"]),
+                "end_s": float(cur["end_s"]),
+                "avg_conf": float(cur["avg_conf"]),
+                "text": txt,
+                "is_filtered": bool(_is_low_info_text(txt)) if txt else False,
+            })
+            cur = {
+                "speaker_idx": int(w["speaker_idx"]),
+                "start_s": float(w["start"] + clean_offset_s),
+                "end_s": float(w["end"] + clean_offset_s),
+                "avg_conf": float(w["speaker_conf"]),
+                "text_words": [str(w["word"])],
+                "n": 1,
+            }
+    if cur is not None:
+        txt = " ".join(cur["text_words"]).strip()
+        turns.append({
+            "speaker_idx": int(cur["speaker_idx"]),
+            "start_s": float(cur["start_s"]),
+            "end_s": float(cur["end_s"]),
+            "avg_conf": float(cur["avg_conf"]),
+            "text": txt,
+            "is_filtered": bool(_is_low_info_text(txt)) if txt else False,
+        })
+    return turns
+
+
+def _filter_short_acks_from_turns(turns: list[dict], min_hold_s: float = 10.0) -> list[dict]:
+    seq = sorted(list(turns or []), key=lambda t: float(t.get("start_s", 0.0)))
+    if not seq:
+        return []
+    # Drop low-info short acknowledgements first.
+    pre: list[dict] = []
+    for t in seq:
+        s = float(t.get("start_s", 0.0))
+        e = max(s, float(t.get("end_s", s)))
+        txt = str(t.get("text", "") or "")
+        if (e - s) < 2.0 and _is_low_info_text(txt):
+            continue
+        pre.append({**t, "start_s": s, "end_s": e})
+    if not pre:
+        return []
+    current_spk = int(pre[0].get("speaker_idx", 0))
+    pending_spk = None
+    pending_acc = 0.0
+    out: list[dict] = []
+    for t in pre:
+        s = float(t.get("start_s", 0.0))
+        e = max(s, float(t.get("end_s", s)))
+        desired = int(t.get("speaker_idx", current_spk))
+        base = dict(t)
+        if desired == current_spk:
+            pending_spk = None
+            pending_acc = 0.0
+            out.append({**base, "speaker_idx": current_spk, "start_s": s, "end_s": e})
+            continue
+        if pending_spk != desired:
+            pending_spk = desired
+            pending_acc = 0.0
+        need = max(0.0, float(min_hold_s) - float(pending_acc))
+        dur = max(0.0, e - s)
+        if dur < need:
+            pending_acc += dur
+            out.append({**base, "speaker_idx": current_spk, "start_s": s, "end_s": e})
+            continue
+        cross_s = s + need
+        if need > 1e-6:
+            out.append({**base, "speaker_idx": current_spk, "start_s": s, "end_s": cross_s})
+        current_spk = desired
+        pending_spk = None
+        pending_acc = 0.0
+        out.append({**base, "speaker_idx": current_spk, "start_s": cross_s, "end_s": e})
+    # Merge adjacent same-speaker segments.
+    merged: list[dict] = []
+    for t in out:
+        if not merged:
+            merged.append(t)
+            continue
+        p = merged[-1]
+        if int(p.get("speaker_idx", -1)) == int(t.get("speaker_idx", -2)) and abs(float(p.get("end_s", 0.0)) - float(t.get("start_s", 0.0))) < 1e-6:
+            p["end_s"] = float(t.get("end_s", p.get("end_s", 0.0)))
+            p["text"] = (str(p.get("text", "") or "") + " " + str(t.get("text", "") or "")).strip()
+            p["avg_conf"] = float((float(p.get("avg_conf", 0.0)) + float(t.get("avg_conf", 0.0))) * 0.5)
+        else:
+            merged.append(t)
+    return merged
+
+
 def _attach_turn_text(turns: list[dict], words_by_speaker: dict[int, list[dict]]) -> None:
     for t in turns:
         si = int(t.get("speaker_idx", -1))
@@ -4899,8 +5928,138 @@ def _normalize_segments_strict(segments: list[dict], window_start: float, window
 
 
 def _estimate_source_offsets_audalign(source_paths: list[str], log=None) -> dict[str, float]:
-    solved = _solve_multisource_offsets_from_anchor(source_paths, target_sr=48000, log=log)
-    return dict(solved.get("offsets", {}))
+    def _emit(msg: str) -> None:
+        if log:
+            try:
+                log(msg)
+            except Exception:
+                pass
+
+    srcs = [str(p).strip() for p in (source_paths or []) if str(p).strip()]
+    out: dict[str, float] = {p: 0.0 for p in srcs}
+    if len(srcs) < 2:
+        return out
+    persistent_key = _stable_offsets_cache_key(srcs)
+    persistent = _load_persistent_audalign_offsets(persistent_key)
+    if persistent:
+        _emit("[otio] reuse persistent audalign offsets.")
+        return {p: float(persistent.get(p, persistent.get(str(Path(p).name), 0.0))) for p in srcs}
+    try:
+        cache_sig = []
+        for p in srcs:
+            pp = Path(p)
+            st = pp.stat()
+            cache_sig.append((str(pp.resolve(strict=False)), int(st.st_mtime), int(st.st_size)))
+        ckey = tuple(sorted(cache_sig))
+        cached = _AUDALIGN_OFFSETS_CACHE.get(ckey)
+        if cached:
+            _emit("[otio] reuse cached audalign offsets.")
+            # Return exactly for requested paths.
+            return {p: float(cached.get(p, 0.0)) for p in srcs}
+    except Exception:
+        ckey = None
+    try:
+        import importlib
+        ad = importlib.import_module("audalign")
+    except Exception as exc:
+        _emit(f"[otio] audalign unavailable for source offsets: {exc}")
+        return out
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    tmp_dir = Path.cwd() / ".enhancer_runs_gui" / "tmp_otio_align" / stamp
+    try:
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return out
+
+    def _make_recognizer(name: str):
+        try:
+            rec_cls = getattr(ad, name)
+            rec = rec_cls()
+        except Exception:
+            return None
+        try:
+            cfg = getattr(rec, "config", None)
+            if cfg is not None:
+                setattr(cfg, "multiprocessing", False)
+                setattr(cfg, "num_processors", 1)
+                try:
+                    setattr(cfg, "n_jobs", 1)
+                except Exception:
+                    pass
+                try:
+                    setattr(cfg, "workers", 1)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return rec
+
+    results = None
+    primary = _make_recognizer("FingerprintRecognizer")
+    fallback = _make_recognizer("CorrelationSpectrogramRecognizer") or _make_recognizer("CorrelationRecognizer")
+    align_fn = getattr(ad, "align_files", None)
+    if not callable(align_fn):
+        _emit("[otio] audalign.align_files missing; using zero offsets.")
+        return out
+    try:
+        for rec in (primary, fallback, None):
+            try:
+                kwargs = {"destination_path": str(tmp_dir)}
+                if rec is not None:
+                    kwargs["recognizer"] = rec
+                with _suppress_stdout_stderr():
+                    results = align_fn(*srcs, **kwargs)
+            except Exception:
+                results = None
+            if isinstance(results, dict) and results:
+                break
+    finally:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    if not isinstance(results, dict):
+        _emit("[otio] audalign source offset solve failed; using zero offsets.")
+        return out
+
+    # audalign values are "delay to apply". Build both sign conventions and select
+    # the one with better residual sync vs clean to avoid sign mistakes.
+    delays: dict[str, float] = {}
+    for p in srcs:
+        delays[p] = float(results.get(Path(p).name, results.get(p, 0.0)) or 0.0)
+    clean_key = srcs[-1]
+    clean_delay = float(delays.get(clean_key, 0.0))
+    rel_pos = {p: float(delays.get(p, 0.0) - clean_delay) for p in srcs}
+    rel_neg = {p: float(-(delays.get(p, 0.0) - clean_delay)) for p in srcs}
+    rel_pos[clean_key] = 0.0
+    rel_neg[clean_key] = 0.0
+    # Soft sanity clamp only for clearly invalid solves.
+    if any(abs(v) > 7200.0 for v in rel_pos.values()) or any(abs(v) > 7200.0 for v in rel_neg.values()):
+        _emit("[otio] audalign returned implausible offsets; using zero offsets.")
+        return out
+    try:
+        vp = _validate_offsets_against_clean(srcs, rel_pos, clean_path=clean_key, target_sr=48000, max_abs_lag_s=999.0)
+        vn = _validate_offsets_against_clean(srcs, rel_neg, clean_path=clean_key, target_sr=48000, max_abs_lag_s=999.0)
+        wp = float(vp.get("max_abs_lag_s", 999.0))
+        wn = float(vn.get("max_abs_lag_s", 999.0))
+        if wn + 1e-6 < wp:
+            _emit(f"[otio] audalign sign selected: negative (max_lag={wn:.3f}s vs {wp:.3f}s)")
+            if ckey is not None:
+                _AUDALIGN_OFFSETS_CACHE[ckey] = dict(rel_neg)
+            _save_persistent_audalign_offsets(persistent_key, rel_neg)
+            return rel_neg
+        _emit(f"[otio] audalign sign selected: positive (max_lag={wp:.3f}s vs {wn:.3f}s)")
+        if ckey is not None:
+            _AUDALIGN_OFFSETS_CACHE[ckey] = dict(rel_pos)
+        _save_persistent_audalign_offsets(persistent_key, rel_pos)
+        return rel_pos
+    except Exception:
+        if ckey is not None:
+            _AUDALIGN_OFFSETS_CACHE[ckey] = dict(rel_pos)
+        _save_persistent_audalign_offsets(persistent_key, rel_pos)
+        return rel_pos
 
 
 def _estimate_camera_offsets_audalign(camera_paths: list[str], log=None) -> dict[str, float]:
@@ -4919,7 +6078,14 @@ def _write_active_speaker_otio(
     clean_audio_path: str | Path | None,
     timeline_name: str | None = None,
     alignment_debug: bool = True,
-    alignment_mode: str = "speech_onset_anchor",
+    alignment_mode: str = "whisper_anchor_refine",
+    transcript_mode: str = "local_faster_whisper",
+    language: str = "en",
+    asr_required: bool = True,
+    alignment_strategy: str = "adaptive_content_anchor",
+    max_lag_search_seconds: int = 1200,
+    min_anchor_match_confidence: float = 0.55,
+    min_anchor_matches_required: int = 2,
     log=None,
 ) -> tuple[str | None, str | None]:
     def _emit(msg: str) -> None:
@@ -4945,31 +6111,103 @@ def _write_active_speaker_otio(
     except Exception as exc:
         _emit(f"[otio] opentimelineio unavailable: {exc}")
         return None, None
+    try:
+        import numpy as np
+    except Exception:
+        np = None  # type: ignore[assignment]
+
+    def _skip_with_reason(reason: str) -> tuple[str | None, str | None]:
+        _emit(f"[otio] {reason}")
+        out_turns = out_dir / f"CLEAN_Synced_Multichannel_{stamp}_turns.json"
+        try:
+            payload = {
+                "timeline_name": timeline_name or f"ActiveSpeaker_{stamp}",
+                "switch_source": "transcript_whisper",
+                "transcript_mode": transcript_mode,
+                "whisper_model": "small",
+                "language": language,
+                "asr_required": bool(asr_required),
+                "alignment_strategy": alignment_strategy,
+                "max_lag_search_seconds": int(max_lag_search_seconds),
+                "otio_skip_reason": reason,
+            }
+            out_turns.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            return None, str(out_turns)
+        except Exception:
+            return None, None
 
     if len(switch_monos) < 2:
-        _emit("[otio] need >=2 clean channels for switching; skipping OTIO.")
-        return None, None
+        return _skip_with_reason("need >=2 clean channels for switching; skipping OTIO.")
 
-    analysis = _analyze_speaker_activity(switch_monos, target_sr)
-    if not analysis:
-        _emit("[otio] speaker analysis unavailable; skipping OTIO.")
-        return None, None
-    winner_idx = analysis["winner_idx"]
-    conf = analysis["conf"]
-    hop_ms = float(analysis["hop_ms"])
-    n_switch_speakers = max(1, int(len(switch_monos)))
-    min_switch_turn_s = 10.0
-    base_min_turn_s = 0.8
-    turns = _build_speaker_turns(
-        winner_idx,
-        conf,
-        hop_ms=hop_ms,
-        n_speakers=n_switch_speakers,
-        min_conf=0.55,
-        min_dur_s=base_min_turn_s,
-    )
+    scratch_first = str(alignment_strategy or "").strip().lower() == "cam_scratch_only"
+    if scratch_first:
+        _emit("[otio] alignment strategy: cam_scratch_only (scratch-first sync)")
+    else:
+        _emit(f"[otio] transcription mode: {transcript_mode} small {language}")
     clean_total_samples = max([int(m.numel()) for m in switch_monos] + [max(1, int(total_samples))])
     clean_duration_s = max(0.0, float(clean_total_samples / max(1, target_sr)))
+    # Keep ASR overhead bounded: alignment is audalign-driven, ASR is only a quality anchor.
+    window_seconds = 15.0
+    max_windows = 1
+    anchor_windows: list[dict] = []
+    anchor_quality_per_window: list[dict] = []
+    anchor_words: list[dict] = []
+    if not scratch_first:
+        anchor_windows = _select_anchor_windows(clean_duration_s, policy="start_mid_end", window_s=window_seconds, max_windows=max_windows)
+        # Prefer speech-rich windows using clean-channel VAD proxy energy.
+        try:
+            import numpy as _np
+            probe = switch_monos[0]
+            x = probe.detach().cpu().float().numpy() if hasattr(probe, "detach") else _np.asarray(probe, dtype=_np.float32)
+            scored = []
+            for w in anchor_windows:
+                ws = float(w.get("start_s", 0.0))
+                wd = float(w.get("dur_s", window_seconds))
+                i0 = max(0, int(round(ws * float(target_sr))))
+                i1 = min(int(x.size), max(i0 + 1, int(round((ws + wd) * float(target_sr)))))
+                seg = x[i0:i1]
+                e = float(_np.sqrt(_np.mean(seg * seg) + 1e-12)) if seg.size else 0.0
+                scored.append((e, w))
+            anchor_windows = [w for _e, w in sorted(scored, key=lambda t: t[0], reverse=True)]
+        except Exception:
+            pass
+        all_window_words: list[dict] = []
+        for w in anchor_windows:
+            ws = float(w.get("start_s", 0.0))
+            wd = float(w.get("dur_s", window_seconds))
+            words_win = _transcribe_window_faster_whisper(
+                clean_src_path,
+                start_s=ws,
+                dur_s=wd,
+                language=str(language or "en"),
+                model_name="small",
+            )
+            q = _window_transcript_quality(words_win, min_words=8)
+            anchor_quality_per_window.append({
+                "label": str(w.get("label", "")),
+                "start_s": ws,
+                "dur_s": wd,
+                **q,
+            })
+            if q.get("ok"):
+                all_window_words.extend(words_win)
+        anchor_words = _build_word_anchors(all_window_words, min_word_dur_s=0.08)
+        if not anchor_words and asr_required:
+            return _skip_with_reason("low_anchor_confidence: no usable word anchors; skipping OTIO.")
+
+    # Build full-length turns from clean audio activity; transcript is used for alignment anchors.
+    min_switch_turn_s = 10.0
+    analysis = _analyze_speaker_activity(switch_monos, target_sr)
+    if not analysis:
+        return _skip_with_reason("speaker analysis unavailable; skipping OTIO.")
+    turns = _build_speaker_turns(
+        analysis["winner_idx"],
+        analysis["conf"],
+        hop_ms=float(analysis["hop_ms"]),
+        n_speakers=max(1, int(len(switch_monos))),
+        min_conf=0.55,
+        min_dur_s=0.8,
+    )
     if not turns:
         turns = [{
             "speaker_idx": 0,
@@ -4979,8 +6217,6 @@ def _write_active_speaker_otio(
             "text": "",
             "is_filtered": False,
         }]
-
-    _emit(f"[otio] audio-only switching enabled (transcription disabled, min_turn={min_switch_turn_s:.1f}s).")
 
     intro_s = 15.0
     # Deterministic mapping: clean channel 1 is host by default.
@@ -5018,47 +6254,43 @@ def _write_active_speaker_otio(
             "camera_path": _select_camera_for_speaker(host_idx, host_idx, wide, camera_roles),
         })
 
-    # Enforce camera switch threshold: candidate camera must remain active for
-    # min_switch_turn_s before we switch from the current camera.
+    # Enforce minimum speaker-run threshold for camera change:
+    # if the candidate run is >= min_switch_turn_s, switch immediately at run start.
     turns = sorted(turns, key=lambda t: float(t.get("start_s", 0.0)))
     current_cam = str(turns[0].get("camera_path", _select_camera_for_speaker(host_idx, host_idx, wide, camera_roles)))
-    pending_cam = ""
-    pending_acc = 0.0
     thresholded: list[dict] = []
-    for t in turns:
-        s = max(0.0, float(t.get("start_s", 0.0)))
-        e = max(s, float(t.get("end_s", s)))
-        desired_cam = str(t.get("camera_path", wide) or wide)
-        base_payload = {
-            "speaker_idx": int(t.get("speaker_idx", host_idx)),
-            "avg_conf": float(t.get("avg_conf", 0.0)),
-            "text": str(t.get("text", "") or ""),
-            "is_filtered": bool(t.get("is_filtered", False)),
-        }
-        if desired_cam == current_cam:
-            pending_cam = ""
-            pending_acc = 0.0
-            thresholded.append({**base_payload, "start_s": s, "end_s": e, "camera_path": current_cam})
-            continue
-        if pending_cam != desired_cam:
-            pending_cam = desired_cam
-            pending_acc = 0.0
-        need = max(0.0, float(min_switch_turn_s) - pending_acc)
-        dur = max(0.0, e - s)
-        if dur <= 0.0:
-            continue
-        if dur < need:
-            pending_acc += dur
-            thresholded.append({**base_payload, "start_s": s, "end_s": e, "camera_path": current_cam})
-            continue
-        # Threshold crossed within this turn: split exactly at crossing point.
-        cross_s = s + need
-        if need > 1e-6:
-            thresholded.append({**base_payload, "start_s": s, "end_s": cross_s, "camera_path": current_cam})
-        current_cam = desired_cam
-        pending_cam = ""
-        pending_acc = 0.0
-        thresholded.append({**base_payload, "start_s": cross_s, "end_s": e, "camera_path": current_cam})
+    i = 0
+    n_turns = len(turns)
+    while i < n_turns:
+        t0 = turns[i]
+        run_cam = str(t0.get("camera_path", wide) or wide)
+        j = i
+        run_start = max(0.0, float(turns[i].get("start_s", 0.0)))
+        run_end = max(run_start, float(turns[i].get("end_s", run_start)))
+        while (j + 1) < n_turns:
+            nxt = turns[j + 1]
+            c = str(nxt.get("camera_path", wide) or wide)
+            if c != run_cam:
+                break
+            run_end = max(run_end, float(nxt.get("end_s", run_end)))
+            j += 1
+        run_dur = max(0.0, run_end - run_start)
+        if run_cam != current_cam and run_dur >= float(min_switch_turn_s):
+            current_cam = run_cam
+        for k in range(i, j + 1):
+            tk = turns[k]
+            s = max(0.0, float(tk.get("start_s", 0.0)))
+            e = max(s, float(tk.get("end_s", s)))
+            thresholded.append({
+                "speaker_idx": int(tk.get("speaker_idx", host_idx)),
+                "avg_conf": float(tk.get("avg_conf", 0.0)),
+                "text": str(tk.get("text", "") or ""),
+                "is_filtered": bool(tk.get("is_filtered", False)),
+                "start_s": s,
+                "end_s": e,
+                "camera_path": current_cam,
+            })
+        i = j + 1
     turns = thresholded or turns
 
     # Turns are currently in clean-local time; we normalize to strict timeline
@@ -5120,12 +6352,132 @@ def _write_active_speaker_otio(
         _emit("[otio] need >=2 clean channels for switching; skipping OTIO.")
         return None, None
 
-    sync_sources = [str(cam) for _k, cam in cams] + [str(clean_src_path)]
-    solved = _solve_multisource_offsets_from_anchor(sync_sources, target_sr=target_sr, log=_emit)
-    source_offsets_by_path = {str(k): float(v) for k, v in (solved.get("offsets", {}) or {}).items()}
-    speech_onsets_seconds = {str(k): v for k, v in (solved.get("onsets", {}) or {}).items()}
-    alignment_quality = dict(solved.get("quality", {}) or {})
-    anchor_pair = {"cam1": Path(sync_sources[0]).name, "lav1": Path(sync_sources[-1]).name}
+    cam_sync_sources = [str(cam) for _k, cam in cams]
+    sync_sources = list(cam_sync_sources)
+    if (not scratch_first) and clean_src_path:
+        sync_sources.append(str(clean_src_path))
+    # Adaptive content-anchor matching across broad lag search.
+    source_mono: dict[str, object] = {}
+    for sp in sync_sources:
+        tt = _load_audio_tracks_any(sp, target_sr=target_sr)
+        if tt:
+            source_mono[sp] = tt[0]
+    clean_mono = source_mono.get(str(clean_src_path))
+    if clean_mono is None and asr_required:
+        return _skip_with_reason("clean source decode failed for content-anchor alignment; skipping OTIO.")
+
+    matches_by_source: dict[str, list[dict]] = {sp: [] for sp in sync_sources}
+    match_confidence_per_window: list[dict] = []
+    if clean_mono is not None:
+        try:
+            clean_np = clean_mono.detach().cpu().float().numpy() if hasattr(clean_mono, "detach") else np.asarray(clean_mono, dtype=np.float32)
+        except Exception:
+            clean_np = None
+        if clean_np is not None:
+            for aw in anchor_windows:
+                ws = float(aw.get("start_s", 0.0))
+                wd = float(aw.get("dur_s", window_seconds))
+                i0 = max(0, int(round(ws * float(target_sr))))
+                i1 = min(int(clean_np.size), max(i0 + 1, int(round((ws + wd) * float(target_sr)))))
+                if i1 <= i0:
+                    continue
+                # Alignment solve is waveform-first; transcript anchors select windows only.
+                words_local = []
+                cwin = {
+                    "start_s": ws,
+                    "dur_s": wd,
+                    "clean_wave": clean_np[i0:i1],
+                    "words_local": words_local,
+                }
+                wdiag = {"window_start_s": ws, "window_dur_s": wd, "per_source": {}}
+                for sp in sync_sources:
+                    if sp == str(clean_src_path):
+                        continue
+                    mono = source_mono.get(sp)
+                    if mono is None:
+                        continue
+                    m = _find_best_content_match(cwin, mono, sr=target_sr, max_lag_s=float(max_lag_search_seconds))
+                    matches_by_source.setdefault(sp, []).append(m)
+                    wdiag["per_source"][Path(sp).name] = {
+                        "ok": bool(m.get("ok")),
+                        "confidence": float(m.get("confidence", 0.0)),
+                        "peak_ratio": float(m.get("peak_ratio", 0.0)),
+                        "residual_s": float(m.get("residual_s", 0.0)),
+                        "reason": str(m.get("reason", "")),
+                    }
+                match_confidence_per_window.append(wdiag)
+
+    solve = _solve_offsets_from_content_matches(matches_by_source)
+    # Deterministic source offsets from audalign over cams + clean as one unit.
+    coarse_offsets = _estimate_source_offsets_audalign(sync_sources, log=_emit)
+    coarse_offsets = {str(sp): float(coarse_offsets.get(str(sp), 0.0)) for sp in sync_sources}
+    if str(clean_src_path):
+        coarse_offsets[str(clean_src_path)] = 0.0
+    # Small local waveform refinement around audalign offsets.
+    refined = _refine_offsets_waveform(coarse_offsets, sync_sources, target_sr=target_sr)
+    source_offsets_by_path = {str(sp): float(coarse_offsets.get(str(sp), 0.0)) for sp in sync_sources}
+    for k, v in (refined.get("offsets", {}) or {}).items():
+        if str(k) in source_offsets_by_path:
+            source_offsets_by_path[str(k)] = float(v)
+    # Re-anchor to clean=0 and preserve signed source offsets.
+    clean_anchor = float(source_offsets_by_path.get(str(clean_src_path), 0.0)) if str(clean_src_path) else 0.0
+    source_offsets_by_path = {k: float(v - clean_anchor) for k, v in source_offsets_by_path.items()}
+    if str(clean_src_path):
+        source_offsets_by_path[str(clean_src_path)] = 0.0
+    first_anchor_s = float(anchor_words[0].get("start", 0.0)) if anchor_words else 0.0
+    speech_onsets_seconds = {str(p): max(0.0, first_anchor_s + float(source_offsets_by_path.get(str(p), 0.0))) for p in sync_sources}
+    qcheck = _validate_alignment_quality(
+        refined,
+        max_median_residual_ms=120.0,
+        min_residual_pairs=max(1, len(cam_sync_sources) - 1),
+    )
+    if scratch_first:
+        paircheck = _validate_offsets_pairwise(
+            cam_sync_sources,
+            source_offsets_by_path,
+            target_sr=target_sr,
+            max_abs_lag_s=0.40,
+        )
+    else:
+        paircheck = _validate_offsets_against_clean(
+            sync_sources,
+            source_offsets_by_path,
+            clean_path=str(clean_src_path),
+            target_sr=target_sr,
+            max_abs_lag_s=0.40,
+        )
+    if asr_required and (not bool(paircheck.get("ok"))):
+        reason = (
+            "alignment quality failed against clean "
+            f"(valid_pairs={int(paircheck.get('valid_pairs', 0))}, "
+            f"max_abs_pair_lag_s={float(paircheck.get('max_abs_lag_s', 999.0)):.3f}); skipping OTIO."
+        )
+        return _skip_with_reason(reason)
+    if asr_required and bool(qcheck.get("has_evidence")) and (not bool(qcheck.get("ok"))):
+        return _skip_with_reason(
+            "alignment residual quality failed "
+            f"(median_residual_ms={float(qcheck.get('median_residual_ms', 0.0)):.2f}); skipping OTIO."
+        )
+    alignment_quality = {
+        "coarse_confidence": float(solve.get("confidence", 0.0)),
+        "refine_confidence": float(refined.get("confidence", 0.0)),
+        "residuals_seconds": dict(refined.get("residuals", {}) or {}),
+        "audalign_offsets_seconds": {Path(k).name: float(v) for k, v in (coarse_offsets or {}).items()},
+        "median_residual_ms": float(qcheck.get("median_residual_ms", 0.0)),
+        "pair_lag_s": dict(paircheck.get("pair_lag_s", {}) or {}),
+        "max_abs_pair_lag_s": float(paircheck.get("max_abs_lag_s", 0.0)),
+        "quality_gate_passed": bool(paircheck.get("ok")) and (bool(qcheck.get("ok")) or (not bool(qcheck.get("has_evidence", False)))),
+        "quality_gate_reason": ("paircheck_then_residual"),
+        "paircheck_tested_pairs": int(paircheck.get("tested_pairs", 0)),
+        "paircheck_valid_pairs": int(paircheck.get("valid_pairs", 0)),
+        "paircheck_has_evidence": bool(paircheck.get("has_evidence", False)),
+        "residual_evidence_count": int(qcheck.get("evidence_count", 0)),
+        "residual_has_evidence": bool(qcheck.get("has_evidence", False)),
+    }
+    anchor_pair = {
+        "cam1": (Path(cam_sync_sources[0]).name if cam_sync_sources else ""),
+        "cam2": (Path(cam_sync_sources[1]).name if len(cam_sync_sources) > 1 else ""),
+    }
 
     cam_offsets_by_path: dict[str, float] = {}
     cam_offsets_by_key: dict[str, float] = {}
@@ -5148,9 +6500,9 @@ def _write_active_speaker_otio(
         _emit("[otio] could not probe camera durations; skipping OTIO.")
         return None, None
 
-    window_start_s = max([0.0] + [float(cam_offsets_by_path.get(str(cam), 0.0)) for _k, cam in cams])
-    window_end_s = min([float(cam_offsets_by_path.get(str(cam), 0.0)) + float(cam_durations.get(str(cam), 0.0)) for _k, cam in cams])
-    window_end_s = min(window_end_s, float(clean_offset_s + max(0.0, float(clean_duration_probe))))
+    # Keep full clean timeline; unavailable camera ranges become gaps.
+    window_start_s = 0.0
+    window_end_s = float(max(0.0, float(clean_offset_s + max(0.0, float(clean_duration_probe)))))
     if window_end_s <= window_start_s + 0.25:
         _emit("[otio] source overlap window too small after alignment; skipping OTIO.")
         return None, None
@@ -5163,11 +6515,8 @@ def _write_active_speaker_otio(
             valid_abs_onsets.append(float(source_offsets_by_path.get(str(src), 0.0)) + float(onset))
         except Exception:
             continue
-    common_anchor_s = min(valid_abs_onsets) if valid_abs_onsets else float(window_start_s)
-    pre_roll_s = 0.75
-    trim_start_s = max(float(window_start_s), float(common_anchor_s - pre_roll_s))
-    if trim_start_s >= window_end_s:
-        trim_start_s = float(window_start_s)
+    # Do not cut timeline time: keep full aligned window from 0.
+    trim_start_s = 0.0
     timeline_end_s = max(0.0, float(window_end_s - trim_start_s))
     if timeline_end_s <= 0.25:
         _emit("[otio] timeline duration too small after anchor trim; skipping OTIO.")
@@ -5219,6 +6568,12 @@ def _write_active_speaker_otio(
         start_time=otio.opentime.RationalTime(0, rate),
         duration=otio.opentime.RationalTime(float(max(1, int(round((timeline_end_s + max_cam_offset) * rate)))), rate),
     )
+    ffmpeg_bin = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+    video_proxy_dir = out_dir / "_otio_sources" / "video_only_cache"
+    try:
+        video_proxy_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     for cam_key, cam in cams:
         abs_path = os.path.abspath(os.path.normpath(str(cam)))
         resolved_path = abs_path
@@ -5226,12 +6581,41 @@ def _write_active_speaker_otio(
             resolved_path = str(Path(cam).resolve(strict=False))
         except Exception:
             resolved_path = abs_path
+        proxy_path: Path | None = None
+        if ffmpeg_bin:
+            try:
+                st = Path(abs_path).stat()
+                cache_key = f"{Path(cam).stem}_{int(st.st_mtime)}_{int(st.st_size)}"
+                proxy_path = video_proxy_dir / f"{cache_key}.mov"
+                if not proxy_path.exists():
+                    cmd = [
+                        ffmpeg_bin,
+                        "-nostdin",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-i",
+                        abs_path,
+                        "-map",
+                        "0:v:0",
+                        "-c:v",
+                        "copy",
+                        "-an",
+                        str(proxy_path),
+                    ]
+                    proc = subprocess.run(cmd, check=False)
+                    if proc.returncode != 0 or not proxy_path.exists():
+                        proxy_path = None
+            except Exception:
+                proxy_path = None
+        target_path = str(proxy_path) if proxy_path is not None else abs_path
         file_uri = ""
         try:
-            file_uri = Path(abs_path).as_uri()
+            file_uri = Path(target_path).as_uri()
         except Exception:
             file_uri = ""
-        target_url = file_uri or abs_path
+        target_url = file_uri or target_path
         ref_cache[cam_key] = otio.schema.ExternalReference(
             target_url=target_url,
             available_range=full_range,
@@ -5240,6 +6624,8 @@ def _write_active_speaker_otio(
                     "absolute_path": abs_path,
                     "resolved_path": resolved_path,
                     "file_uri": file_uri,
+                    "video_only_proxy": bool(proxy_path is not None),
+                    "video_only_proxy_path": (str(proxy_path) if proxy_path is not None else None),
                 },
             },
         )
@@ -5303,7 +6689,7 @@ def _write_active_speaker_otio(
         clean_audio_tracks.append((ci, tr))
 
     # Build importer-safe aligned audio proxies with offsets baked in.
-    aligned_audio_dir = out_dir / "_otio_sources" / f"aligned_audio_{stamp}"
+    aligned_audio_dir = out_dir / "_otio_sources" / "aligned_audio_cache"
     aligned_audio_dir.mkdir(parents=True, exist_ok=True)
     try:
         import torchaudio
@@ -5313,6 +6699,18 @@ def _write_active_speaker_otio(
         return None, None
 
     cam_audio_ref_by_key: dict[str, object] = {}
+    cam_audio_proxy_by_key: dict[str, str] = {}
+
+    def _cache_token_for_source(path_like: str | Path, extra: str = "") -> str:
+        try:
+            p = Path(path_like)
+            rp = str(p.resolve(strict=False))
+            st = p.stat()
+            raw = f"{rp}|{int(st.st_mtime)}|{int(st.st_size)}|{extra}"
+        except Exception:
+            raw = f"{str(path_like)}|{extra}"
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
     for cam_key, cam, _tr in audio_tracks:
         tracks = _load_audio_tracks_any(cam, target_sr=target_sr)
         if not tracks:
@@ -5320,12 +6718,24 @@ def _write_active_speaker_otio(
             continue
         mono = tracks[0]
         off_s = float(cam_offsets_by_key.get(cam_key, 0.0))
-        off_samples = max(0, int(round(off_s * float(target_sr))))
-        aligned_global = torch.cat([torch.zeros(off_samples, dtype=mono.dtype), mono], dim=0)
+        off_samples = int(round(off_s * float(target_sr)))
+        if off_samples >= 0:
+            aligned_global = torch.cat([torch.zeros(off_samples, dtype=mono.dtype), mono], dim=0)
+        else:
+            drop = min(int(mono.numel()), int(-off_samples))
+            aligned_global = mono[drop:] if drop < int(mono.numel()) else mono.new_zeros(1)
         trim_samples = max(0, int(round(float(trim_start_s) * float(target_sr))))
         aligned = aligned_global[trim_samples:] if trim_samples < int(aligned_global.numel()) else aligned_global.new_zeros(1)
-        outp = aligned_audio_dir / f"A_CAM_{Path(cam).stem}.wav"
-        torchaudio.save(str(outp), aligned.unsqueeze(0), int(target_sr))
+        token = _cache_token_for_source(
+            cam,
+            extra=f"cam|off={off_s:.6f}|trim={float(trim_start_s):.6f}|sr={int(target_sr)}",
+        )
+        outp = aligned_audio_dir / f"A_CAM_{Path(cam).stem}_{token}.wav"
+        if not outp.exists():
+            torchaudio.save(str(outp), aligned.unsqueeze(0), int(target_sr))
+        else:
+            _emit(f"[otio] reuse cached audio proxy: {outp.name}")
+        cam_audio_proxy_by_key[cam_key] = str(outp)
         p_abs = os.path.abspath(os.path.normpath(str(outp)))
         p_uri = ""
         try:
@@ -5349,14 +6759,30 @@ def _write_active_speaker_otio(
         )
 
     clean_audio_ref_by_idx: dict[int, object] = {}
+    clean_audio_proxy_by_idx: dict[int, str] = {}
     for clean_idx, _tr in clean_audio_tracks:
         mono = clean_monos_for_tracks[clean_idx]
-        off_samples = max(0, int(round(float(clean_offset_s) * float(target_sr))))
-        aligned_global = torch.cat([torch.zeros(off_samples, dtype=mono.dtype), mono], dim=0)
+        off_samples = int(round(float(clean_offset_s) * float(target_sr)))
+        if off_samples >= 0:
+            aligned_global = torch.cat([torch.zeros(off_samples, dtype=mono.dtype), mono], dim=0)
+        else:
+            drop = min(int(mono.numel()), int(-off_samples))
+            aligned_global = mono[drop:] if drop < int(mono.numel()) else mono.new_zeros(1)
         trim_samples = max(0, int(round(float(trim_start_s) * float(target_sr))))
         aligned = aligned_global[trim_samples:] if trim_samples < int(aligned_global.numel()) else aligned_global.new_zeros(1)
-        outp = aligned_audio_dir / f"A_CLEAN_{clean_idx + 1}.wav"
-        torchaudio.save(str(outp), aligned.unsqueeze(0), int(target_sr))
+        token = _cache_token_for_source(
+            clean_src_path,
+            extra=(
+                f"clean_ch={int(clean_idx)}|off={float(clean_offset_s):.6f}|"
+                f"trim={float(trim_start_s):.6f}|sr={int(target_sr)}"
+            ),
+        )
+        outp = aligned_audio_dir / f"A_CLEAN_{clean_idx + 1}_{token}.wav"
+        if not outp.exists():
+            torchaudio.save(str(outp), aligned.unsqueeze(0), int(target_sr))
+        else:
+            _emit(f"[otio] reuse cached audio proxy: {outp.name}")
+        clean_audio_proxy_by_idx[clean_idx] = str(outp)
         p_abs = os.path.abspath(os.path.normpath(str(outp)))
         p_uri = ""
         try:
@@ -5380,7 +6806,25 @@ def _write_active_speaker_otio(
             },
         )
 
+    # Strict audio QA on aligned proxies before OTIO write.
+    try:
+        qa_paths: dict[str, str | Path] = {}
+        if cams:
+            qa_paths["cam1"] = cam_audio_proxy_by_key.get(cams[0][0], "")
+        if len(cams) > 1:
+            qa_paths["cam2"] = cam_audio_proxy_by_key.get(cams[1][0], "")
+        if (not scratch_first) and clean_audio_proxy_by_idx:
+            qa_paths["clean1"] = clean_audio_proxy_by_idx.get(0, "")
+        audio_qc = _qa_aligned_audio_sync(qa_paths, target_sr=target_sr, max_abs_median_lag_s=0.25)
+        if not bool(audio_qc.get("ok")) and asr_required:
+            return _skip_with_reason(
+                f"aligned audio QA failed (max median lag {float(audio_qc.get('max_abs_median_lag_s', 0.0)):.3f}s); skipping OTIO."
+            )
+    except Exception:
+        audio_qc = {"ok": False, "pair_median_lag_s": {}, "max_abs_median_lag_s": 999.0}
+
     for cam_key, cam, tr in video_tracks:
+        cam_dur_s = float(cam_durations.get(str(cam), 0.0) or 0.0)
         for seg in split_segments:
             dur_s = max(0.0, float(seg["end_s"]) - float(seg["start_s"]))
             dur_f = max(1, int(round(dur_s * rate)))
@@ -5388,21 +6832,54 @@ def _write_active_speaker_otio(
             if is_selected:
                 cam_off_s = float(cam_offsets_by_key.get(cam_key, 0.0))
                 global_start_s = float(trim_start_s) + float(seg["start_s"])
-                src_start_s = max(0.0, float(global_start_s - cam_off_s))
-                clip = otio.schema.Clip(
-                    name=Path(cam).stem,
-                    media_reference=ref_cache.get(cam_key),
-                    source_range=otio.opentime.TimeRange(
-                        start_time=otio.opentime.RationalTime(float(src_start_s * rate), rate),
-                        duration=otio.opentime.RationalTime(float(dur_f), rate),
-                    ),
-                    metadata={
-                        "resemble_enhance": {
-                            "active_selected_camera": True,
-                        },
-                    },
-                )
-                tr.append(clip)
+                src_start_s = float(global_start_s - cam_off_s)
+                remain_s = float(dur_s)
+                # If source starts before camera media starts, insert a gap first.
+                if src_start_s < 0.0 and remain_s > 0.0:
+                    pre_gap_s = min(remain_s, float(-src_start_s))
+                    pre_gap_f = max(1, int(round(pre_gap_s * rate)))
+                    tr.append(
+                        otio.schema.Gap(
+                            source_range=otio.opentime.TimeRange(
+                                start_time=otio.opentime.RationalTime(0, rate),
+                                duration=otio.opentime.RationalTime(float(pre_gap_f), rate),
+                            )
+                        )
+                    )
+                    src_start_s = 0.0
+                    remain_s = max(0.0, remain_s - pre_gap_s)
+                # Clip only available source span; trailing unavailable span becomes gap.
+                if remain_s > 0.0:
+                    avail_s = remain_s
+                    if cam_dur_s > 0.0:
+                        avail_s = max(0.0, min(remain_s, cam_dur_s - src_start_s))
+                    if avail_s > 1e-6:
+                        avail_f = max(1, int(round(avail_s * rate)))
+                        clip = otio.schema.Clip(
+                            name=Path(cam).stem,
+                            media_reference=ref_cache.get(cam_key),
+                            source_range=otio.opentime.TimeRange(
+                                start_time=otio.opentime.RationalTime(float(src_start_s * rate), rate),
+                                duration=otio.opentime.RationalTime(float(avail_f), rate),
+                            ),
+                            metadata={
+                                "resemble_enhance": {
+                                    "active_selected_camera": True,
+                                },
+                            },
+                        )
+                        tr.append(clip)
+                        remain_s = max(0.0, remain_s - avail_s)
+                if remain_s > 1e-6:
+                    post_gap_f = max(1, int(round(remain_s * rate)))
+                    tr.append(
+                        otio.schema.Gap(
+                            source_range=otio.opentime.TimeRange(
+                                start_time=otio.opentime.RationalTime(0, rate),
+                                duration=otio.opentime.RationalTime(float(post_gap_f), rate),
+                            )
+                        )
+                    )
             else:
                 tr.append(
                     otio.schema.Gap(
@@ -5431,6 +6908,8 @@ def _write_active_speaker_otio(
                 metadata={
                     "resemble_enhance": {
                         "active_selected_camera": bool(str(seg.get("selected_cam_key", "")) == str(cam_key)),
+                        "audio_role": "scratch_reference",
+                        "monitor_default": "off",
                     },
                 },
             )
@@ -5476,18 +6955,46 @@ def _write_active_speaker_otio(
             "wide": wide,
             "segments": merged,
             "turn_count": len(merged),
-            "switch_source": "clean_only",
+            "switch_source": "transcript_whisper",
             "alignment_mode": alignment_mode,
+            "alignment_strategy": alignment_strategy,
+            "max_lag_search_seconds": int(max_lag_search_seconds),
+            "transcript_mode": transcript_mode,
+            "whisper_model": "small",
+            "language": language,
+            "asr_required": bool(asr_required),
+            "anchor_windows": anchor_windows,
+            "matches_per_source": {Path(k).name: int(v) for k, v in (solve.get("counts", {}) or {}).items()},
+            "match_confidence_per_window": match_confidence_per_window,
+            "word_anchor_count": int(len(anchor_words)),
+            "word_anchors_preview": [
+                {
+                    "word": str(w.get("word", "") or ""),
+                    "start": float(w.get("start", 0.0)),
+                    "end": float(w.get("end", 0.0)),
+                    "confidence": float(w.get("confidence", 0.0)),
+                }
+                for w in anchor_words[:24]
+            ],
             "anchor_pair": anchor_pair,
             "speech_onsets_seconds": {Path(k).name: v for k, v in speech_onsets_seconds.items()},
+            "coarse_offsets_seconds": {Path(k).name: float(v) for k, v in coarse_offsets.items()},
+            "refined_offsets_seconds": {Path(k).name: float(v) for k, v in source_offsets_by_path.items()},
             "resolved_offsets_seconds": {Path(k).name: float(v) for k, v in source_offsets_by_path.items()},
             "alignment_quality": alignment_quality,
+            "audio_sync_qc": audio_qc,
+            "scratch_audio_note": "A_CAM tracks are reference scratch audio; monitor A_CLEAN tracks for primary mix.",
+            "alignment_confidence": {
+                "coarse": float(solve.get("confidence", 0.0)),
+                "refine": float(refined.get("confidence", 0.0)),
+            },
             "timeline_window_seconds": {
                 "window_start": float(window_start_s),
                 "window_end": float(window_end_s),
                 "trim_start": float(trim_start_s),
                 "timeline_duration": float(timeline_end_s),
             },
+            "otio_skip_reason": None,
             "audio_tracks_written": [f"A_CAM_{Path(cam).stem}" for _k, cam in cams] + [f"A_CLEAN_{i + 1}" for i in range(len(clean_monos_for_tracks))],
             "source_offsets_seconds": (
                 {Path(cam).name: float(cam_offsets_by_key.get(k, 0.0)) for k, cam in cams}
@@ -5773,6 +7280,8 @@ def _sync_and_export_multichannel_simple(
                 camera_roles=otio_camera_roles,
                 clean_audio_path=str(out_wav),
                 timeline_name=otio_timeline_name,
+                asr_required=False,
+                alignment_strategy="cam_scratch_only",
                 log=lambda m: _emit(m),
             )
             if otio_path:

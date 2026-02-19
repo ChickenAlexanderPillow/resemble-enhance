@@ -24,3 +24,5 @@ ttkbootstrap>=1.10.1
 sounddevice>=0.4.6
 openai>=1.51.0
 opentimelineio>=0.16.0
+faster-whisper>=1.0.3
+ctranslate2>=4.4.0
