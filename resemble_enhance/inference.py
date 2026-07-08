@@ -302,8 +302,14 @@ def inference(
     report = os.environ.get("RESEMBLE_PROGRESS", "0") == "1"
     cur_file = os.environ.get("RESEMBLE_FILE", "")
     n_chunks = max(1, math.ceil(dwav.shape[-1] / hop_length))
+
+    def _emit_progress(message: str) -> None:
+        if report:
+            print(message, flush=True)
+
     if report:
-        print(f"PROGRESS START file={cur_file} n={n_chunks}")
+        _emit_progress(f"PROGRESS START file={cur_file} n={n_chunks}")
+        _emit_progress(f"PROGRESS STAGE file={cur_file} stage=chunking detail=Preparing {n_chunks} chunks")
     if progress_cb is not None:
         try:
             progress_cb("start", cur_file, 0, n_chunks)
@@ -311,6 +317,7 @@ def inference(
             pass
 
     for i, start in enumerate(trange(0, dwav.shape[-1], hop_length), start=1):
+        _emit_progress(f"PROGRESS STAGE file={cur_file} stage=chunk detail=Processing chunk {i}/{n_chunks}")
         chunks.append(inference_chunk(model, dwav[start : start + chunk_length], sr, device))
         # Proactive GPU cache trim to reduce fragmentation on long files
         try:
@@ -320,13 +327,14 @@ def inference(
         except Exception:
             pass
         if report:
-            print(f"PROGRESS CHUNK file={cur_file} i={i} n={n_chunks}")
+            _emit_progress(f"PROGRESS CHUNK file={cur_file} i={i} n={n_chunks}")
         if progress_cb is not None:
             try:
                 progress_cb("chunk", cur_file, i, n_chunks)
             except Exception:
                 pass
 
+    _emit_progress(f"PROGRESS STAGE file={cur_file} stage=merge detail=Merging {n_chunks} chunks")
     hwav = merge_chunks(
         chunks,
         chunk_length,
@@ -339,6 +347,7 @@ def inference(
 
     # Optional strict sanitizer to avoid NaN/Inf and extreme spikes
     try:
+        _emit_progress(f"PROGRESS STAGE file={cur_file} stage=sanitize detail=Checking output samples")
         import os as _os
         import torch as _t
         if not _t.isfinite(hwav).all():
@@ -362,6 +371,7 @@ def inference(
 
     # Optional transient bypass: replace small windows with original to avoid choppy artifacts
     try:
+        _emit_progress(f"PROGRESS STAGE file={cur_file} stage=transients detail=Checking transient windows")
         import os as _os
         import torch as _t
 
@@ -445,6 +455,7 @@ def inference(
 
     try:
         if os.environ.get("RESEMBLE_NS_SUPPRESS", "1") == "1":
+            _emit_progress(f"PROGRESS STAGE file={cur_file} stage=suppress detail=Suppressing non-speech residuals")
             hwav = _apply_non_speech_residual_suppress(
                 hwav,
                 sr,
@@ -459,6 +470,7 @@ def inference(
 
     try:
         if os.environ.get("RESEMBLE_DENOISE_AGGRESSIVE", "0") == "1":
+            _emit_progress(f"PROGRESS STAGE file={cur_file} stage=gate detail=Applying ambience gate")
             hwav = _apply_aggressive_ambience_gate(hwav, sr)
     except Exception:
         pass
@@ -469,7 +481,8 @@ def inference(
     elapsed_time = time.perf_counter() - start_time
     logger.info(f"Elapsed time: {elapsed_time:.3f} s, {hwav.shape[-1] / elapsed_time / 1000:.3f} kHz")
     if report:
-        print(f"PROGRESS END file={cur_file}")
+        _emit_progress(f"PROGRESS STAGE file={cur_file} stage=complete detail=Enhancement complete")
+        _emit_progress(f"PROGRESS END file={cur_file}")
     if progress_cb is not None:
         try:
             progress_cb("end", cur_file, n_chunks, n_chunks)

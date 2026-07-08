@@ -3,6 +3,11 @@
 /scripts
 /dist
 /build
+/.installer_smoke/
+/vendor/
+/installer/iexpress/*.zip
+/installer/iexpress/*.sed
+/dist/installer/
 /*.egg-info
 /flagged
 version.py

@@ -2,12 +2,15 @@ import os
 import hashlib
 import importlib
 import json
+import multiprocessing
 import re
+import runpy
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 from collections import deque
 from dataclasses import dataclass
@@ -145,6 +148,43 @@ def _show_single_instance_notice() -> None:
         print(msg, flush=True)
     except Exception:
         pass
+
+
+def _dispatch_frozen_module_invocation() -> None:
+    """Support subprocess calls like `<frozen exe> -m module ...`.
+
+    PyInstaller one-dir builds use the app executable as sys.executable. The GUI
+    launches the enhancer CLI with `sys.executable -m resemble_enhance.enhancer`,
+    so route that form before enforcing the single-instance GUI mutex.
+    """
+    try:
+        if len(sys.argv) >= 3 and sys.argv[1] == "-m":
+            module_name = str(sys.argv[2]).strip()
+            if not module_name:
+                return
+            sys.argv = [module_name, *sys.argv[3:]]
+            if module_name == "resemble_enhance.enhancer":
+                from resemble_enhance.enhancer.__main__ import main as enhancer_main
+                enhancer_main()
+                sys.exit(0)
+            runpy.run_module(module_name, run_name="__main__", alter_sys=True)
+            sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        try:
+            log_path = APP_ROOT / "module_dispatch_error.log"
+            log_path.write_text(
+                f"argv={sys.argv!r}\n\n{traceback.format_exc()}",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+        try:
+            print(f"Module dispatch failed: {exc}", flush=True)
+        except Exception:
+            pass
+        sys.exit(1)
 
 
 def _stable_offsets_cache_key(source_paths: list[str]) -> str:
@@ -1869,7 +1909,7 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
     if denoise_only:
         # Denoise-only safety profile for CLI path (same intent as in-process path).
         try:
-            cs_eff = max(45.0, float(cs))
+            cs_eff = max(20.0, float(cs))
         except Exception:
             cs_eff = 45.0
         try:
@@ -1928,6 +1968,7 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
         start_re = re.compile(r"PROGRESS START file=(.*) n=(\d+)")
         chunk_re = re.compile(r"PROGRESS CHUNK file=(.*) i=(\d+) n=(\d+)")
         end_re = re.compile(r"PROGRESS END file=(.*)")
+        stage_re = re.compile(r"PROGRESS STAGE file=(.*?) stage=([^ ]+) detail=(.*)")
         for line in proc.stdout:  # type: ignore[attr-defined]
             line = line.rstrip()
             _record_log(line)
@@ -1944,6 +1985,18 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
                     pass
                 if chunk_progress_cb:
                     chunk_progress_cb(current_file or "", 0, cur_n)
+                continue
+            m = stage_re.search(line)
+            if m:
+                name = m.group(1) or current_file or ""
+                detail = m.group(3).strip()
+                if detail:
+                    try:
+                        print(f"PROGRESS STAGE file={name} detail={detail}", flush=True)
+                    except Exception:
+                        pass
+                    if chunk_progress_cb:
+                        chunk_progress_cb(f"{name}|{detail}", 0, cur_n)
                 continue
             m = chunk_re.search(line)
             if m:
@@ -1980,6 +2033,17 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
     try:
         # Poll for outputs while the process runs
         while proc.poll() is None:
+            if control is not None and (control.cancel_now.is_set() or control.stop_after_chunk.is_set()):
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                raise _Cancelled()
+
             def _has_out(fpath: str) -> bool:
                 p = Path(fpath)
                 cand1 = out_dir / p.name
@@ -2343,9 +2407,48 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         pw.bind('<Button-1>', _maybe_block_pane_drag)
         pw.bind('<B1-Motion>', _maybe_block_pane_drag)
 
-        # Left column uses a dedicated bottom action row so run controls stay pinned.
-        left_body = ttk.Frame(left, style='Card.TFrame')
-        left_body.pack(fill='both', expand=True)
+        # Left column is scrollable so expanded option groups never get clipped.
+        left_canvas = tk.Canvas(left, bg=self._panel, highlightthickness=0, bd=0)
+        left_scrollbar = ttk.Scrollbar(left, orient='vertical', command=left_canvas.yview)
+        left_canvas.configure(yscrollcommand=left_scrollbar.set)
+        left_canvas.pack(side='left', fill='both', expand=True)
+        left_scrollbar.pack(side='right', fill='y')
+        left_body = ttk.Frame(left_canvas, style='Card.TFrame')
+        self._left_canvas = left_canvas
+        self._left_scrollbar = left_scrollbar
+        self._left_body = left_body
+        self._left_body_window = left_canvas.create_window((0, 0), window=left_body, anchor='nw')
+
+        def _sync_left_scrollregion(event=None):
+            try:
+                left_canvas.configure(scrollregion=left_canvas.bbox('all'))
+            except Exception:
+                pass
+
+        def _sync_left_body_width(event):
+            try:
+                left_canvas.itemconfigure(self._left_body_window, width=max(1, event.width))
+            except Exception:
+                pass
+
+        def _on_left_mousewheel(event):
+            try:
+                delta = getattr(event, 'delta', 0)
+                if delta:
+                    left_canvas.yview_scroll(int(-1 * (delta / 120)), 'units')
+                elif getattr(event, 'num', None) == 4:
+                    left_canvas.yview_scroll(-3, 'units')
+                elif getattr(event, 'num', None) == 5:
+                    left_canvas.yview_scroll(3, 'units')
+            except Exception:
+                pass
+            return 'break'
+
+        left_body.bind('<Configure>', _sync_left_scrollregion)
+        left_canvas.bind('<Configure>', _sync_left_body_width)
+        left_canvas.bind_all('<MouseWheel>', _on_left_mousewheel, add='+')
+        left_canvas.bind_all('<Button-4>', _on_left_mousewheel, add='+')
+        left_canvas.bind_all('<Button-5>', _on_left_mousewheel, add='+')
 
         # Left column: title, buttons, options, queue list
         title = "Drop or select audio files to enhance" if DND_AVAILABLE else "Select audio files to enhance"
@@ -2502,17 +2605,19 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             ).pack(anchor='w')
         else:
             self.var_reduce_gpu.set(False)
-        if not self._force_sync_export:
-            sync_box = ttk.Frame(self._adv_wrap, style='Section.TFrame')
-            sync_box.pack(fill='x', pady=(0, 8))
-            ttk.Checkbutton(
-                sync_box,
-                text='Sync takes and export multichannel\n(uncheck for cleanup-only per file)',
-                variable=self.var_sync_export,
-                style='Opt.TCheckbutton',
-            ).pack(anchor='w')
-        else:
+        sync_box = ttk.Frame(self._adv_wrap, style='Section.TFrame')
+        sync_box.pack(fill='x', pady=(0, 8))
+        if self._force_sync_export:
             self.var_sync_export.set(True)
+        sync_check = ttk.Checkbutton(
+            sync_box,
+            text='Sync takes and export multichannel\n(uncheck for cleanup-only per file)',
+            variable=self.var_sync_export,
+            style='Opt.TCheckbutton',
+        )
+        sync_check.pack(anchor='w')
+        if self._force_sync_export:
+            sync_check.state(['disabled'])
         if not self._hide_otio_ui:
             otio_box = ttk.Frame(self._adv_wrap, style='Section.TFrame')
             otio_box.pack(fill='x', pady=(0, 8))
@@ -2556,7 +2661,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             self.var_generate_otio.set(False)
 
         queue_card = ttk.Frame(left_body, style='Section.TFrame', padding=10)
-        queue_card.pack(fill='both', expand=True, pady=(0, 0))
+        queue_card.pack(fill='x', pady=(0, 0))
         ttk.Label(queue_card, text='Queue', style='SectionTitle.TLabel').pack(anchor='w', pady=(0, 6))
 
         # Queue controls: filter + actions
@@ -2570,15 +2675,15 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self.trash_btn = ttk.Button(ctl, text='', width=3, command=self._remove_selected)
         self.trash_btn.pack(side='right')
         self._bind_hover(self.trash_btn)
-        self.clear_processed_btn = ttk.Button(ctl, text='', width=3, command=self._clear_processed)
-        self.clear_processed_btn.pack(side='right', padx=(0, 6))
-        self._bind_hover(self.clear_processed_btn)
+        self.clear_queue_btn = ttk.Button(ctl, text='', width=3, command=self.clear_files)
+        self.clear_queue_btn.pack(side='right', padx=(0, 6))
+        self._bind_hover(self.clear_queue_btn)
         self._set_button_icon(self.trash_btn, 'trash-2')
-        self._set_button_icon(self.clear_processed_btn, 'x')
+        self._set_button_icon(self.clear_queue_btn, 'x')
 
         # Queue tree: grouped folders with child files; multi-select enabled
-        self.queue_tree = ttk.Treeview(queue_card, show='tree', selectmode='extended', height=14)
-        self.queue_tree.pack(fill='both', expand=True)
+        self.queue_tree = ttk.Treeview(queue_card, show='tree', selectmode='extended', height=12)
+        self.queue_tree.pack(fill='x', expand=False)
         # Drag-to-reorder support (when filter is 'All')
         self._drag_iid = None
         self._drag_line = None
@@ -2756,6 +2861,10 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self.queue_tree.bind('<ButtonPress-1>', _q_on_press)
         self.queue_tree.bind('<B1-Motion>', _q_on_motion)
         self.queue_tree.bind('<ButtonRelease-1>', _q_on_release)
+        self.queue_tree.bind('<BackSpace>', lambda e: (self._remove_selected(), 'break')[1])
+        self.queue_tree.bind('<Delete>', lambda e: (self._remove_selected(), 'break')[1])
+        self.bind('<BackSpace>', self._queue_key_remove, add='+')
+        self.bind('<Delete>', self._queue_key_remove, add='+')
         # Cleanup on escape, focus-out, or pointer leaving the widget while dragging
         self.queue_tree.bind('<Leave>', lambda e: (_drag_cleanup()))
         self.bind('<Escape>', lambda e: (_drag_cleanup()))
@@ -2781,6 +2890,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         # Context menu for queue actions
         self._q_menu = tk.Menu(self, tearoff=0)
         self._q_menu.add_command(label='Remove Selected', command=self._remove_selected)
+        self._q_menu.add_command(label='Clear Queue', command=self.clear_files)
         self._q_menu.add_command(label='Clear Processed', command=self._clear_processed)
         def _q_menu_popup(e):
             try:
@@ -3454,26 +3564,8 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         return roles
 
     def clear_files(self):
-        self.files.clear()
-        self.client_mode_active = False
-        self.client_queue.clear()
-        self.client_meta.clear()
-        self.client_order.clear()
-        self.client_camera_roles.clear()
-        self.var_otio_client.set("")
-        self.file_to_client.clear()
-        try:
-            self.folders.clear()
-        except Exception:
-            self.folders = set()
-        try:
-            self.file_status.clear()
-        except Exception:
-            pass
-        self.run_btn["state"] = "disabled"
-        self.progress["value"] = 0
+        self._clear_queue()
         self._log_clear()
-        self._refresh_queue_tree()
         self._refresh_otio_client_dropdown()
 
     # Removed the old modal preview dialog in favor of inline media preview
@@ -4123,7 +4215,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         except Exception:
             pass
 
-    def _clear_queue(self):
+    def _clear_queue(self, reset_progress: bool = True):
         self.files.clear()
         self.client_mode_active = False
         self.client_queue.clear()
@@ -4139,10 +4231,10 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self.file_status.clear()
         self._refresh_queue_tree()
         self._enable_run()
-        # Reset progress indicators
-        self.progress["value"] = 0
-        self.overall_label["text"] = '0 of 0 files'
-        self._set_status('')
+        if reset_progress:
+            self.progress["value"] = 0
+            self.overall_label["text"] = '0 of 0 files'
+            self._set_status('')
 
     def _append_history(self, results: list[tuple[str,str]]):
         # results: list of (src, out)
@@ -4163,13 +4255,47 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             self._refresh_queue_tree()
 
     # --- Queue actions ---
+    def _queue_key_remove(self, event=None):
+        try:
+            focus = self.focus_get()
+        except Exception:
+            focus = None
+        if focus is not self.queue_tree:
+            return None
+        self._remove_selected()
+        return 'break'
+
     def _selected_paths(self) -> list[str]:
         iids = list(self.queue_tree.selection())
+        if not iids:
+            focused = self.queue_tree.focus()
+            if focused:
+                iids = [focused]
         out: list[str] = []
+        seen: set[str] = set()
         for iid in iids:
             p = self._iid_to_path.get(iid)
             if p:
-                out.append(p)
+                if p not in seen:
+                    out.append(p)
+                    seen.add(p)
+                continue
+            folder = self._iid_to_folder.get(iid)
+            if folder:
+                if self.client_mode_active:
+                    for f in self.files:
+                        if self.file_to_client.get(f) == folder and f not in seen:
+                            out.append(f)
+                            seen.add(f)
+                    for f in self.client_queue.get(folder, []):
+                        if f in self.files and f not in seen:
+                            out.append(f)
+                            seen.add(f)
+                    continue
+                for f in self.files:
+                    if str(Path(f).parent) == folder and f not in seen:
+                        out.append(f)
+                        seen.add(f)
         return out
 
     def _remove_selected(self):
@@ -4283,22 +4409,69 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self._group_done = 0
         self._group_total = 0
         self._group_start_time = None
+        self._job_done = 0
+        self._job_total = max(len(self.files), 1)
+        self._job_start_time = time.time()
+        self._chunk_last = {}
+        self._chunk_active = False
+        self._last_progress_pct = 1.0
         self.run_btn["state"] = "disabled"
         self.pause_btn.config(state='normal', text='Pause')
         self.cancel_btn.config(state='normal')
-        self.progress["value"] = 0
+        self.progress["maximum"] = 100
+        self.progress["value"] = 1
+        self.overall_label["text"] = f"Starting enhancement job: 0 of {self._job_total} files"
+
+        def set_progress_if_current(pct, label=None, *, allow_decrease=False, update_label_on_decrease=False):
+            pct = max(0.0, min(100.0, float(pct)))
+            try:
+                current = float(self.progress["value"] or 0)
+            except Exception:
+                current = 0.0
+            if not allow_decrease and pct + 0.001 < current:
+                if update_label_on_decrease and label is not None:
+                    self.overall_label["text"] = label
+                return False
+            self.progress["maximum"] = 100
+            self.progress["value"] = pct
+            self._last_progress_pct = pct
+            if label is not None:
+                self.overall_label["text"] = label
+            return True
 
         def update_prog(done, total):
             total = max(total, 1)
-            pct = int(done * 100 / total)
-            self.progress["maximum"] = 100
-            self.progress["value"] = pct
-            self.overall_label["text"] = f"{done} of {total} files ({pct}%)"
+            job_total = int(getattr(self, '_job_total', 0) or total or 1)
+            job_done = min(job_total, int(getattr(self, '_job_done', 0) or 0) + int(done or 0))
+            pct = job_done * 100.0 / job_total
+            set_progress_if_current(pct, f"Job: {job_done} of {job_total} files ({int(pct)}%)")
 
         def update_chunk(name, i, n):
             n = max(n or 0, 1)
+            stage_detail = ""
+            raw_name = name or ""
+            if "|" in raw_name:
+                raw_name, stage_detail = raw_name.split("|", 1)
+                stage_detail = stage_detail.strip()
+            if stage_detail:
+                try:
+                    if not hasattr(self, "_chunk_last"):
+                        self._chunk_last = {}
+                    last_i, last_n = self._chunk_last.get(raw_name, (0, n))
+                    i = max(int(i or 0), int(last_i or 0))
+                    n = max(int(n or 0), int(last_n or 0), 1)
+                except Exception:
+                    pass
+            else:
+                try:
+                    if not hasattr(self, "_chunk_last"):
+                        self._chunk_last = {}
+                    self._chunk_last[raw_name] = (int(i or 0), int(n or 0))
+                except Exception:
+                    pass
             pct = int((i * 100) / n)
-            base = Path(name).name if name else "-"
+            base = Path(raw_name).name if raw_name else "-"
+            self._chunk_active = True
             # Start time and ETA
             now = time.time()
             if i == 0:
@@ -4316,33 +4489,35 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                     eta_txt = ''
             # Update per-item status
             try:
-                if name in self.file_status:
+                if raw_name in self.file_status:
                     if i >= n:
-                        self._set_file_status(name, 'done')
+                        self._set_file_status(raw_name, 'done')
                     else:
-                        self._set_file_status(name, 'running')
+                        self._set_file_status(raw_name, 'running')
             except Exception:
                 pass
             # Smooth overall: include current file fraction + ETA + throughput
             try:
-                done_files = int(getattr(self, '_group_done', 0) or 0)
-                total_files = int(getattr(self, '_group_total', 0) or 0) or 1
+                job_done_base = int(getattr(self, '_job_done', 0) or 0)
+                group_done = int(getattr(self, '_group_done', 0) or 0)
+                done_files = job_done_base + group_done
+                total_files = int(getattr(self, '_job_total', 0) or 0) or int(getattr(self, '_group_total', 0) or 0) or 1
                 frac = min(1.0, max(0.0, (i or 0) / float(n)))
                 overall = (done_files + frac) * 100.0 / total_files
-                self.progress["maximum"] = 100
-                self.progress["value"] = overall
-                gst = getattr(self, '_group_start_time', None)
-                label = f"File {min(done_files+1, total_files)}/{total_files}: {base} - {pct}%{eta_txt}"
-                if gst:
-                    gelapsed = max(0.001, now - gst)
+                jst = getattr(self, '_job_start_time', None)
+                label = f"Job file {min(done_files+1, total_files)}/{total_files}: {base} - {pct}%{eta_txt}"
+                if stage_detail:
+                    label += f" | {stage_detail}"
+                if jst:
+                    gelapsed = max(0.001, now - jst)
                     units = done_files + frac
                     rate = units / gelapsed
                     eta_total = max(0.0, (total_files - units) / max(rate, 1e-9))
                     gmm = int(eta_total // 60)
                     gss = int(eta_total % 60)
                     fpm = rate * 60.0
-                    label += f" | Group ETA {gmm:02d}:{gss:02d} | {fpm:.2f} files/min"
-                self.overall_label["text"] = label
+                    label += f" | Job ETA {gmm:02d}:{gss:02d} | {fpm:.2f} files/min"
+                set_progress_if_current(overall, label, update_label_on_decrease=True)
             except Exception:
                 pass
 
@@ -4458,6 +4633,16 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                     groups = [("(all)", files_all)]
 
                 total_groups = len(groups)
+                self._job_done = 0
+                self._job_total = max(sum(len(gfiles) for _, gfiles in groups), 1)
+                self._job_start_time = time.time()
+                self.after(
+                    0,
+                    lambda total=self._job_total: set_progress_if_current(
+                        1.0,
+                        f"Starting enhancement job: 0 of {total} files",
+                    ),
+                )
                 for gi, (gname, gfiles) in enumerate(groups, start=1):
                     if not gfiles:
                         continue
@@ -4491,12 +4676,24 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                     # group-specific progress wrapper
                     def update_prog_group(done, total, gi=gi, total_groups=total_groups):
                         total = max(total, 1)
-                        pct = int(done * 100 / total)
-                        self.progress["maximum"] = 100
-                        self.progress["value"] = pct
                         self._group_done = done
                         self._group_total = total
-                        self.overall_label["text"] = f"Group {gi}/{total_groups}: {done} of {total} files ({pct}%)"
+                        job_total = int(getattr(self, '_job_total', 0) or total or 1)
+                        job_done = min(job_total, int(getattr(self, '_job_done', 0) or 0) + int(done or 0))
+                        pct = job_done * 100.0 / job_total
+                        label = f"Job: {job_done} of {job_total} files ({int(pct)}%) | Group {gi}/{total_groups}: {done} of {total}"
+                        set_progress_if_current(pct, label)
+
+                    def finish_group_progress(gi=gi, total_groups=total_groups, group_count=len(gfiles)):
+                        self._chunk_active = False
+                        self._chunk_last = {}
+                        self._group_done = group_count
+                        self._group_total = max(group_count, 1)
+                        self._job_done = min(int(getattr(self, '_job_total', group_count) or group_count), int(getattr(self, '_job_done', 0) or 0) + group_count)
+                        job_total = int(getattr(self, '_job_total', 0) or group_count or 1)
+                        pct = self._job_done * 100.0 / job_total
+                        label = f"Job: {self._job_done} of {job_total} files ({int(pct)}%) | Group {gi}/{total_groups} complete"
+                        self.after(0, lambda pct=pct, label=label: set_progress_if_current(pct, label))
 
                     use_files = list(gfiles)
                     # Group-level fallback: if a synced CLEAN MOV exists, map all files to it
@@ -4548,7 +4745,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                             progress_cb=lambda d, t: self.after(0, update_prog_group, d, t),
                             chunk_progress_cb=lambda name, i, n: self.after(0, update_chunk, name, i, n),
                             seam_safe=self.var_seam_safe.get(),
-                            control=(self._control if reduce_gpu else (None if self.var_diag_minimal.get() else self._control)),
+                            control=self._control,
                             denoise_only=self.var_denoise_only.get(),
                             prefer_cli=prefer_cli,
                             noise_only=self.var_noise_only.get(),
@@ -4630,6 +4827,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         except Exception as exc:
                             self.after(0, lambda gi=gi, exc=exc: self._log(f"Group {gi}: all-clean skip path error: {exc}"))
                         processed_groups = gi
+                        finish_group_progress()
                         if self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set():
                             break
                         group_dt = time.perf_counter() - group_t0
@@ -4769,6 +4967,8 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         finally:
                             sync_dt = time.perf_counter() - sync_t0
                             self.after(0, lambda gi=gi, dt=sync_dt: self._log(f"Timing: group {gi} sync/export {_format_seconds(dt)}"))
+                    if not (self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set()):
+                        finish_group_progress()
                     group_dt = time.perf_counter() - group_t0
                     self.after(0, lambda gi=gi, dt=group_dt: self._log(f"Timing: group {gi} total {_format_seconds(dt)}"))
                 if run_snapshot is not None:
@@ -4779,7 +4979,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                         status = 'cancelled'
                     run_snapshot["run_status"] = status
                 # Clear the queue after successful enhance
-                self.after(0, self._clear_queue)
+                self.after(0, lambda: self._clear_queue(reset_progress=False))
                 # Auto-prune old staging after a successful run
                 try:
                     pruned = _prune_staging_dirs(max_age_hours=24.0)
@@ -4830,9 +5030,15 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
     def _cancel_graceful(self):
         if not hasattr(self, '_control'):
             return
+        self._control.cancel_now.set()
         self._control.stop_after_chunk.set()
         self.cancel_btn.config(state='disabled')
-        self._log('Will stop after current chunk...')
+        self._set_status('Cancelling...')
+        self._log('Cancellation requested. Stopping active processing...')
+        try:
+            _terminate_live_subprocesses(timeout_s=1.0)
+        except Exception:
+            pass
 
     def _on_close(self):
         if self._closing:
@@ -8551,6 +8757,8 @@ def _postprocess_level_shape(paths: list[str], target_rms_db: float = -16.0, max
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    _dispatch_frozen_module_invocation()
     _mutex_handle = _acquire_single_instance_mutex(_SINGLE_INSTANCE_MUTEX_NAME)
     if _mutex_handle is None:
         _show_single_instance_notice()

@@ -84,6 +84,36 @@ Notes
 - The first run downloads the default model to `resemble_enhance/model_repo/enhancer_stage2`.
 - For custom checkpoints, pass `--run_dir <your_run_dir>` containing `hparams.yaml` and `ds/G/default/mp_rank_00_model_states.pt`.
 
+## Windows Standalone Build
+
+This repo includes a standalone desktop build and installer flow for Windows:
+
+1. Build the frozen app bundle:
+
+```bat
+build_enhancer_gui.cmd
+```
+
+This vendors `ffmpeg` into `vendor/ffmpeg_bin` and builds a self-contained app directory at:
+
+```text
+dist\ResembleEnhanceGUI
+```
+
+2. Build the installer:
+
+```bat
+build_installer.cmd
+```
+
+This creates an Inno Setup installer in:
+
+```text
+dist\installer
+```
+
+Because the app bundle is large, the installer may be split into multiple files. Send every file in `dist\installer` together. The installer deploys the bundled app to `%LOCALAPPDATA%\ResembleEnhanceGUI`, includes the frozen Python dependencies and vendored `ffmpeg`, creates Start Menu/Desktop shortcuts, and registers a normal Windows uninstall entry for the current user.
+
 ## Train your own model
 
 ### Data Preparation
