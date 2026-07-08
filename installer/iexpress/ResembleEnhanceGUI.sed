@@ -1,0 +1,30 @@
+[Version]
+Class=IEXPRESS
+SEDVersion=3
+[Options]
+PackagePurpose=InstallApp
+ShowInstallProgramWindow=0
+HideExtractAnimation=1
+UseLongFileName=1
+InsideCompressed=0
+CAB_FixedSize=0
+CAB_ResvCodeSigning=0
+RebootMode=N
+InstallPrompt=
+DisplayLicense=
+FinishMessage=Resemble Enhance has been installed.
+TargetName=C:\Coding\resemble-enhance\dist\installer\ResembleEnhanceGUI-Setup.exe
+FriendlyName=Resemble Enhance Setup
+AppLaunched=install_app.cmd
+PostInstallCmd=<None>
+AdminQuietInstCmd=install_app.cmd
+UserQuietInstCmd=install_app.cmd
+SourceFiles=SourceFiles
+[SourceFiles]
+SourceFiles0=C:\Coding\resemble-enhance\installer\iexpress\
+[SourceFiles0]
+%FILE0%=
+%FILE1%=
+[Strings]
+FILE0=install_app.cmd
+FILE1=ResembleEnhanceGUI.exe

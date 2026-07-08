@@ -349,6 +349,14 @@ def main():
             wins = _parse_bypass_env()
             if wins:
                 hwav = _bypass_time_windows(hwav, base, sr, wins)
+
+            try:
+                wet = float(os.environ.get("RESEMBLE_WET", "1.0") or 1.0)
+            except Exception:
+                wet = 1.0
+            wet = max(0.0, min(1.0, wet))
+            if wet < 1.0:
+                hwav = wet * hwav + (1.0 - wet) * base
         except Exception:
             pass
 

@@ -1,5 +1,6 @@
 import os
 import hashlib
+import importlib
 import json
 import re
 import shutil
@@ -35,6 +36,8 @@ except Exception:  # noqa: BLE001
 
 
 BASE = Path.cwd()
+APP_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+ICON_ROOT = APP_ROOT / "assets" / "icons"
 INPUT_TMP_ROOT = BASE / ".enhancer_runs_gui"
 OUTPUT_ROOT = BASE / "output_audio"
 MIN_AUDIO_SAMPLES = 2048
@@ -43,12 +46,105 @@ MEDIA_ROOT_FOLDER = "01_MEDIA"
 MEDIA_CLEAN_FOLDER = "030_AUDIO_CLEAN"
 MEDIA_AUDIO_RAW_FOLDER = "040_AUDIO_RAW"
 MEDIA_VIDEO_RAW_FOLDER = "020_VIDEO_RAW"
+VIDEO_FILE_EXTENSIONS = {".mp4", ".mov", ".mxf", ".mkv", ".avi", ".mts", ".m2ts"}
+AI_SYNTHESIS_DEFAULT_WET = 0.35
+AI_SYNTHESIS_DEFAULT_LAMBD = 0.35
+AI_SYNTHESIS_DEFAULT_TAU = 0.25
+AI_SYNTHESIS_DEFAULT_NFE = 32
 LAST_MODEL_SR: int | None = None
 LAST_MODEL_SR_PATH: str | None = None
 _AUDIO_TRACKS_CACHE: dict[tuple[str, int, int, int], list] = {}
 _FASTER_WHISPER_MODEL_CACHE: dict[tuple[str, str], object] = {}
 _WHISPER_WINDOW_CACHE: dict[tuple[str, int, int, str, str, int, int], list[dict]] = {}
 _AUDALIGN_OFFSETS_CACHE: dict[tuple, dict[str, float]] = {}
+_LIVE_SUBPROCS: set[subprocess.Popen] = set()
+_LIVE_SUBPROCS_LOCK = threading.Lock()
+_SINGLE_INSTANCE_MUTEX_NAME = r"Global\ResembleEnhanceGUI_SingleInstance"
+
+
+def _register_live_subprocess(proc: subprocess.Popen) -> None:
+    try:
+        with _LIVE_SUBPROCS_LOCK:
+            _LIVE_SUBPROCS.add(proc)
+    except Exception:
+        pass
+
+
+def _unregister_live_subprocess(proc: subprocess.Popen) -> None:
+    try:
+        with _LIVE_SUBPROCS_LOCK:
+            _LIVE_SUBPROCS.discard(proc)
+    except Exception:
+        pass
+
+
+def _terminate_live_subprocesses(timeout_s: float = 2.0) -> None:
+    try:
+        with _LIVE_SUBPROCS_LOCK:
+            procs = list(_LIVE_SUBPROCS)
+    except Exception:
+        procs = []
+    for proc in procs:
+        try:
+            if proc.poll() is not None:
+                _unregister_live_subprocess(proc)
+                continue
+            proc.terminate()
+            try:
+                proc.wait(timeout=max(0.1, float(timeout_s)))
+            except Exception:
+                proc.kill()
+        except Exception:
+            pass
+        finally:
+            _unregister_live_subprocess(proc)
+
+
+def _acquire_single_instance_mutex(name: str) -> int | None:
+    if os.name != "nt":
+        return 1
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.GetLastError.argtypes = []
+        kernel32.GetLastError.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.CreateMutexW(None, False, str(name))
+        if not handle:
+            return None
+        err = int(kernel32.GetLastError() or 0)
+        if err == 183:  # ERROR_ALREADY_EXISTS
+            kernel32.CloseHandle(handle)
+            return None
+        return int(handle)
+    except Exception:
+        return None
+
+
+def _release_single_instance_mutex(handle: int | None) -> None:
+    if os.name != "nt" or not handle:
+        return
+    try:
+        ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(handle))
+    except Exception:
+        pass
+
+
+def _show_single_instance_notice() -> None:
+    msg = "Resemble Enhance is already running.\nOnly one instance can be opened at a time."
+    if os.name == "nt":
+        try:
+            user32 = ctypes.windll.user32
+            user32.MessageBoxW(None, msg, "Resemble Enhance", 0x00000030)  # MB_ICONWARNING
+            return
+        except Exception:
+            pass
+    try:
+        print(msg, flush=True)
+    except Exception:
+        pass
 
 
 def _stable_offsets_cache_key(source_paths: list[str]) -> str:
@@ -161,6 +257,13 @@ def _build_output_dest_dir(src_path: Path, output_base: Path | None, stamp: str)
     except Exception:
         pass
     return src_path.parent / f"Enhanced_{stamp}"
+
+
+def _is_video_file(path: str | Path) -> bool:
+    try:
+        return Path(path).suffix.lower() in VIDEO_FILE_EXTENSIONS
+    except Exception:
+        return False
 
 def _has_clean_output_in_media(src_path: Path) -> bool:
     try:
@@ -1498,7 +1601,7 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
                         if fast or str(cur_device).lower() == "cpu":
                             # Prefer a faster configuration to avoid stalls in diagnostics or on CPU
                             if str(cur_device).lower() == "cuda":
-                                extra.update(nfe=16, solver="midpoint")
+                                extra.update(nfe=AI_SYNTHESIS_DEFAULT_NFE, solver="midpoint")
                             else:
                                 extra.update(nfe=8, solver="euler")
                         hwav, model_sr = enhance(
@@ -1506,6 +1609,8 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
                             sr=sr,
                             device=cur_device,
                             run_dir=run_dir,
+                            lambd=AI_SYNTHESIS_DEFAULT_LAMBD,
+                            tau=AI_SYNTHESIS_DEFAULT_TAU,
                             progress_cb=lambda evt, nm, i, n, p=p: on_chunk(evt, str(p), i, n),
                             **cur_kwargs,
                             **extra,
@@ -1738,6 +1843,13 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
     try:
         if (not denoise_only) and (str(device).lower() == 'cpu'):
             cmd += ["--nfe", "8", "--solver", "euler"]
+        elif not denoise_only:
+            cmd += [
+                "--nfe", str(AI_SYNTHESIS_DEFAULT_NFE),
+                "--solver", "midpoint",
+                "--lambd", str(AI_SYNTHESIS_DEFAULT_LAMBD),
+                "--tau", str(AI_SYNTHESIS_DEFAULT_TAU),
+            ]
     except Exception:
         pass
     # Seam handling
@@ -1805,6 +1917,7 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
         bufsize=1,
         env=env,
     )
+    _register_live_subprocess(proc)
 
     # Read and parse progress output
     def reader():
@@ -1864,28 +1977,31 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
 
     expected = len(files)
     completed = 0
-    # Poll for outputs while the process runs
-    while proc.poll() is None:
-        def _has_out(fpath: str) -> bool:
-            p = Path(fpath)
-            cand1 = out_dir / p.name
-            cand2 = out_dir / (p.stem + ".wav")
-            cand3 = out_dir / (p.stem + ".mov")
-            return any(c.exists() and c.stat().st_size > 44 for c in (cand1, cand2, cand3))
-        completed = sum(1 for f in files if _has_out(f))
+    try:
+        # Poll for outputs while the process runs
+        while proc.poll() is None:
+            def _has_out(fpath: str) -> bool:
+                p = Path(fpath)
+                cand1 = out_dir / p.name
+                cand2 = out_dir / (p.stem + ".wav")
+                cand3 = out_dir / (p.stem + ".mov")
+                return any(c.exists() and c.stat().st_size > 44 for c in (cand1, cand2, cand3))
+            completed = sum(1 for f in files if _has_out(f))
+            if progress_cb:
+                progress_cb(completed, expected)
+            time.sleep(0.5)
+
+        # Final progress update
+        completed = sum(1 for f in files if (out_dir / Path(f).name).exists())
         if progress_cb:
             progress_cb(completed, expected)
-        time.sleep(0.5)
 
-    # Final progress update
-    completed = sum(1 for f in files if (out_dir / Path(f).name).exists())
-    if progress_cb:
-        progress_cb(completed, expected)
-
-    try:
-        t.join(timeout=1.0)
-    except Exception:
-        pass
+        try:
+            t.join(timeout=1.0)
+        except Exception:
+            pass
+    finally:
+        _unregister_live_subprocess(proc)
 
     rc = proc.returncode
     if rc != 0:
@@ -2064,9 +2180,15 @@ def _install_win_dnd(widget, on_files):
 class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
     def __init__(self):
         super().__init__()
+        self._packaged_ui_mode = bool(getattr(sys, "frozen", False))
+        hide_otio_env = os.environ.get("RESEMBLE_HIDE_OTIO")
+        self._hide_otio_ui = (hide_otio_env.strip() == "1") if hide_otio_env is not None else self._packaged_ui_mode
+        self._force_sync_export = self._packaged_ui_mode
+        self._hide_reduce_gpu_ui = self._packaged_ui_mode
+        self._reuse_existing_outputs = not self._packaged_ui_mode
         self.title("Resemble Enhance")
         self.geometry("980x620")
-        self.minsize(1000, 640)
+        self.minsize(920, 660)
 
         self.files = []
         self.history: list[tuple[str, str]] = []
@@ -2093,16 +2215,16 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 style = ttk.Style()
             # Map palette from ttkbootstrap colors when available
             cols = getattr(style, 'colors', None)
-            self._bg = getattr(cols, 'bg', '#0f1115') if cols is not None else '#0f1115'
-            # Prefer input background or a neutral secondary for panels
-            self._panel = (
-                getattr(cols, 'inputbg', None) or
-                getattr(cols, 'secondary', None) or
-                '#151923'
-            ) if cols is not None else '#151923'
+            self._bg = '#0b1016'
+            self._panel = '#141b24'
+            self._panel_alt = '#1b2430'
+            self._button_bg = '#202938'
+            self._button_hover = '#2a3647'
+            self._border = '#2b3746'
             self._text = getattr(cols, 'fg', '#e5e7eb') if cols is not None else '#e5e7eb'
-            self._muted = getattr(cols, 'secondary', '#9aa4b2') if cols is not None else '#9aa4b2'
-            self._accent = getattr(cols, 'primary', '#3b82f6') if cols is not None else '#3b82f6'
+            self._muted = '#94a3b8'
+            self._accent = '#4f8ff7'
+            self._accent_hover = '#6aa3ff'
             self._success = getattr(cols, 'success', '#22c55e') if cols is not None else '#22c55e'
         else:
             style = ttk.Style()
@@ -2111,34 +2233,45 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             except Exception:
                 pass
             # Fallback dark palette
-            self._bg = "#0f1115"
-            self._panel = "#151923"
-            self._text = "#e5e7eb"
-            self._muted = "#9aa4b2"
-            self._accent = "#3b82f6"
-            self._success = "#22c55e"
+            self._bg = '#0b1016'
+            self._panel = '#141b24'
+            self._panel_alt = '#1b2430'
+            self._button_bg = '#202938'
+            self._button_hover = '#2a3647'
+            self._border = '#2b3746'
+            self._text = '#e5e7eb'
+            self._muted = '#94a3b8'
+            self._accent = '#4f8ff7'
+            self._accent_hover = '#6aa3ff'
+            self._success = '#22c55e'
         self.configure(bg=self._bg)
         style.configure('.', background=self._bg, foreground=self._text)
         style.configure('TFrame', background=self._bg)
+        style.configure('Card.TFrame', background=self._panel, bordercolor=self._border, relief='solid')
+        style.configure('Section.TFrame', background=self._panel_alt, bordercolor=self._border, relief='solid')
         style.configure('Title.TLabel', background=self._bg, foreground=self._text, font=('Segoe UI', 13, 'bold'))
+        style.configure('CardTitle.TLabel', background=self._panel, foreground=self._text, font=('Segoe UI', 13, 'bold'))
+        style.configure('SectionTitle.TLabel', background=self._panel_alt, foreground=self._text, font=('Segoe UI', 11, 'bold'))
         style.configure('Info.TLabel', background=self._bg, foreground=self._muted)
-        style.configure('TButton', padding=8, background=self._panel, foreground=self._text)
-        style.map('TButton', background=[('active', "#1f2937")])
-        style.configure('Drop.TFrame', background=self._panel, bordercolor='#1f2937', relief='solid')
-        style.configure('Horizontal.TProgressbar', troughcolor='#0b0f16', background=self._accent, bordercolor=self._panel, lightcolor=self._accent, darkcolor=self._accent)
+        style.configure('CardInfo.TLabel', background=self._panel, foreground=self._muted)
+        style.configure('SectionInfo.TLabel', background=self._panel_alt, foreground=self._muted)
+        style.configure('TButton', padding=9, background=self._button_bg, foreground=self._text, bordercolor=self._border)
+        style.map('TButton', background=[('active', self._button_hover)])
+        style.configure('Drop.TFrame', background=self._panel_alt, bordercolor=self._border, relief='solid')
+        style.configure('Horizontal.TProgressbar', troughcolor='#101722', background=self._accent, bordercolor=self._panel_alt, lightcolor=self._accent, darkcolor=self._accent)
         # Tree grid/separators slightly lighter so columns are clearly divided
-        style.configure('Treeview', background=self._panel, fieldbackground=self._panel, foreground=self._text, bordercolor='#222833')
-        style.map('Treeview', background=[('selected', '#1e293b')], foreground=[('selected', self._text)])
+        style.configure('Treeview', background=self._panel_alt, fieldbackground=self._panel_alt, foreground=self._text, bordercolor=self._border)
+        style.map('Treeview', background=[('selected', '#273244')], foreground=[('selected', self._text)])
         # Treeview heading styling (neutral grey shade)
-        style.configure('Treeview.Heading', background='#1f1f1f', foreground=self._text, bordercolor='#2a2a2a')
-        style.map('Treeview.Heading', background=[('active', '#1e293b')])
+        style.configure('Treeview.Heading', background='#202a36', foreground=self._text, bordercolor=self._border)
+        style.map('Treeview.Heading', background=[('active', '#2a3647')])
         # Accent button styles
         style.configure('Accent.TButton', background=self._accent, foreground="#ffffff")
-        style.configure('AccentHover.TButton', background="#60a5fa", foreground="#ffffff")
+        style.configure('AccentHover.TButton', background=self._accent_hover, foreground="#ffffff")
         # Standard hover style for normal buttons
-        style.configure('Hover.TButton', background='#1e293b', foreground=self._text)
+        style.configure('Hover.TButton', background=self._button_hover, foreground=self._text)
         # Option checkbuttons
-        style.configure('Opt.TCheckbutton', background=self._panel, foreground=self._text, padding=4)
+        style.configure('Opt.TCheckbutton', background=self._panel_alt, foreground=self._text, padding=4)
 
         # Helper to apply a simple hover effect to any ttk.Button
         def _bind_hover(b: ttk.Button, base_style: str = 'TButton', hover_style: str = 'Hover.TButton'):
@@ -2149,13 +2282,39 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             except Exception:
                 pass
         self._bind_hover = _bind_hover
+        self._ui_icons: dict[str, tk.PhotoImage] = {}
+
+        def _load_ui_icon(name: str) -> tk.PhotoImage | None:
+            cached = self._ui_icons.get(name)
+            if cached is not None:
+                return cached
+            try:
+                path = ICON_ROOT / f"{name}.png"
+                if not path.exists():
+                    return None
+                img = tk.PhotoImage(file=str(path))
+                self._ui_icons[name] = img
+                return img
+            except Exception:
+                return None
+
+        def _set_button_icon(button: ttk.Button, icon_name: str) -> None:
+            img = _load_ui_icon(icon_name)
+            if img is None:
+                return
+            try:
+                button.configure(image=img, compound='left')
+                button.image = img
+            except Exception:
+                pass
+        self._set_button_icon = _set_button_icon
 
         # Main paned layout
         pw = ttk.Panedwindow(self, orient='horizontal')
         pw.pack(fill='both', expand=True, padx=12, pady=12)
 
-        left = ttk.Frame(pw, width=360)
-        right = ttk.Frame(pw)
+        left = ttk.Frame(pw, width=360, style='Card.TFrame', padding=(16, 16))
+        right = ttk.Frame(pw, style='Card.TFrame', padding=(16, 16))
         # Fix left column width for consistent visibility
         pw.add(left, weight=0)
         pw.add(right, weight=1)
@@ -2185,32 +2344,43 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         pw.bind('<B1-Motion>', _maybe_block_pane_drag)
 
         # Left column uses a dedicated bottom action row so run controls stay pinned.
-        left_body = ttk.Frame(left)
+        left_body = ttk.Frame(left, style='Card.TFrame')
         left_body.pack(fill='both', expand=True)
 
         # Left column: title, buttons, options, queue list
         title = "Drop or select audio files to enhance" if DND_AVAILABLE else "Select audio files to enhance"
-        ttk.Label(left_body, text=title, style='Title.TLabel').pack(anchor='w')
+        ttk.Label(left_body, text=title, style='CardTitle.TLabel').pack(anchor='w', pady=(0, 10))
 
         # (Removed dedicated drop zone; drag-and-drop works on the list below.)
 
-        btns = ttk.Frame(left_body)
-        btns.pack(fill='x', pady=(0, 6))
-        btn_add = ttk.Button(btns, text='Add Files', command=self.add_files)
-        btn_add.pack(side='left')
-        self._bind_hover(btn_add)
-        btn_add_folder = ttk.Button(btns, text='Add Folder', command=self.add_folder)
-        btn_add_folder.pack(side='left', padx=6)
-        self._bind_hover(btn_add_folder)
-        btn_project = ttk.Button(btns, text='Select Project', command=self._select_project_folder)
-        btn_project.pack(side='left', padx=6)
-        self._bind_hover(btn_project)
-        btn_client = ttk.Button(btns, text='Select Client', command=self._select_single_client_folder)
-        btn_client.pack(side='left', padx=6)
-        self._bind_hover(btn_client)
-        btn_clear = ttk.Button(btns, text='Clear', command=self.clear_files)
-        btn_clear.pack(side='left', padx=6)
+        btns = ttk.Frame(left_body, style='Section.TFrame', padding=10)
+        btns.pack(fill='x', pady=(0, 10))
+        btns_hdr = ttk.Frame(btns, style='Section.TFrame')
+        btns_hdr.pack(fill='x', pady=(0, 8))
+        ttk.Label(btns_hdr, text='Sources', style='SectionTitle.TLabel').pack(side='left')
+        btn_clear = ttk.Button(btns_hdr, text='', width=3, command=self.clear_files)
+        btn_clear.pack(side='right')
         self._bind_hover(btn_clear)
+        btn_grid = ttk.Frame(btns, style='Section.TFrame')
+        btn_grid.pack(fill='x')
+        btn_grid.grid_columnconfigure(0, weight=1)
+        btn_grid.grid_columnconfigure(1, weight=1)
+        btn_add = ttk.Button(btn_grid, text='Add Files', command=self.add_files)
+        btn_add.grid(row=0, column=0, sticky='ew', padx=(0, 6), pady=(0, 6))
+        self._bind_hover(btn_add)
+        btn_add_folder = ttk.Button(btn_grid, text='Add Folder', command=self.add_folder)
+        btn_add_folder.grid(row=0, column=1, sticky='ew', pady=(0, 6))
+        self._bind_hover(btn_add_folder)
+        btn_project = ttk.Button(btn_grid, text='Select Project', command=self._select_project_folder)
+        btn_project.grid(row=1, column=0, sticky='ew', padx=(0, 6))
+        self._bind_hover(btn_project)
+        btn_client = ttk.Button(btn_grid, text='Select Client', command=self._select_single_client_folder)
+        btn_client.grid(row=1, column=1, sticky='ew')
+        self._bind_hover(btn_client)
+        self._set_button_icon(btn_add_folder, 'folder-open')
+        self._set_button_icon(btn_project, 'folder-open')
+        self._set_button_icon(btn_client, 'folder-open')
+        self._set_button_icon(btn_clear, 'x')
 
         # Diagnostics configuration (advanced controls hidden, but vars remain for logic)
         self.var_profile = tk.BooleanVar(value=True)
@@ -2226,6 +2396,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self.var_wet = tk.DoubleVar(value=1.0)
         self.var_lead_guard = tk.BooleanVar(value=False)
         self.var_noise_only = tk.BooleanVar(value=False)
+        self.var_ai_synthesis = tk.BooleanVar(value=False)
         self.var_denoise_only = tk.BooleanVar(value=True)
         self.var_diag_minimal = tk.BooleanVar(value=True)
         self.var_device = tk.StringVar(value='cuda')
@@ -2233,7 +2404,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self.var_recursive_folders = tk.BooleanVar(value=True)
         self.var_output_dir = tk.StringVar(value="")
         self.var_output_media_clean = tk.BooleanVar(value=True)
-        self.var_reduce_gpu = tk.BooleanVar(value=True)
+        self.var_reduce_gpu = tk.BooleanVar(value=False)
         self.var_generate_otio = tk.BooleanVar(value=False)
         self.var_otio_client = tk.StringVar(value="")
         self.var_otio_wide = tk.StringVar(value="")
@@ -2246,9 +2417,16 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self._otio_label_to_path: dict[str, str] = {}
         self._otio_path_to_label: dict[str, str] = {}
         self._otio_thumb_images: dict[str, tk.PhotoImage] = {}
+        self.cmb_otio_client = None
+        self.cmb_otio_wide = None
+        self.cmb_otio_guest = None
+        self.cmb_otio_host = None
+        self.lbl_thumb_wide = None
+        self.lbl_thumb_guest = None
+        self.lbl_thumb_host = None
 
-        folder_opts = ttk.Frame(left_body)
-        folder_opts.pack(fill='x', pady=(0, 6))
+        folder_opts = ttk.Frame(left_body, style='Section.TFrame', padding=10)
+        folder_opts.pack(fill='x', pady=(0, 10))
         ttk.Checkbutton(
             folder_opts,
             text='Search subfolders when adding folders',
@@ -2256,19 +2434,22 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             style='Opt.TCheckbutton',
         ).pack(anchor='w')
 
-        out_box = ttk.Frame(left_body)
-        out_box.pack(fill='x', pady=(0, 8))
-        ttk.Label(out_box, text='Output folder (optional):', style='Info.TLabel').pack(anchor='w')
-        out_row = ttk.Frame(out_box)
+        out_box = ttk.Frame(left_body, style='Section.TFrame', padding=10)
+        out_box.pack(fill='x', pady=(0, 10))
+        ttk.Label(out_box, text='Output folder (optional):', style='SectionTitle.TLabel').pack(anchor='w', pady=(0, 4))
+        out_row = ttk.Frame(out_box, style='Section.TFrame')
         out_row.pack(fill='x', pady=(2, 0))
+        self._output_dir_row = out_row
         out_entry = ttk.Entry(out_row, textvariable=self.var_output_dir)
         out_entry.pack(side='left', fill='x', expand=True)
-        btn_out = ttk.Button(out_row, text='Browse', command=self._choose_output_dir)
+        btn_out = ttk.Button(out_row, text='', width=3, command=self._choose_output_dir)
         btn_out.pack(side='left', padx=4)
         self._bind_hover(btn_out)
-        btn_out_clear = ttk.Button(out_row, text='Clear', command=self._clear_output_dir)
+        btn_out_clear = ttk.Button(out_row, text='', width=3, command=self._clear_output_dir)
         btn_out_clear.pack(side='left')
         self._bind_hover(btn_out_clear)
+        self._set_button_icon(btn_out, 'folder-open')
+        self._set_button_icon(btn_out_clear, 'x')
         self._output_dir_widgets = (out_entry, btn_out, btn_out_clear)
         ttk.Checkbutton(
             out_box,
@@ -2279,89 +2460,124 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         ).pack(anchor='w', pady=(4, 0))
         self._toggle_media_clean_output()
 
-        # Diagnostics mode notice (advanced controls disabled)
-        diag_box = ttk.Frame(left_body)
-        diag_box.pack(fill='x', pady=(4, 6))
-        ttk.Label(diag_box, text='Diagnostics alignment mode is locked. Advanced options are temporarily removed.', wraplength=260, justify='left').pack(fill='x')
-        noise_box = ttk.Frame(left_body)
-        noise_box.pack(fill='x', pady=(0, 6))
+        adv_hdr = ttk.Frame(left_body, style='Section.TFrame', padding=10)
+        adv_hdr.pack(fill='x', pady=(0, 10))
+        self._adv_hdr = adv_hdr
+        self._adv_btn = ttk.Button(adv_hdr, text='Processing & OTIO Options [+]', command=self._toggle_advanced)
+        self._adv_btn.pack(side='left')
+        self._bind_hover(self._adv_btn)
+
+        self._adv_open = False
+        self._adv_wrap = ttk.Frame(left_body, style='Section.TFrame', padding=12)
+
+        # Diagnostics mode notice and advanced controls (collapsed by default)
+        diag_box = ttk.Frame(self._adv_wrap, style='Section.TFrame')
+        diag_box.pack(fill='x', pady=(0, 8))
+        ttk.Label(diag_box, text='Diagnostics alignment mode is locked. Advanced options are temporarily removed.', style='SectionInfo.TLabel', wraplength=260, justify='left').pack(fill='x')
+        synthesis_box = ttk.Frame(self._adv_wrap, style='Section.TFrame')
+        synthesis_box.pack(fill='x', pady=(0, 8))
+        ttk.Checkbutton(
+            synthesis_box,
+            text='Use AI enhancement / synthesis (slower)',
+            variable=self.var_ai_synthesis,
+            style='Opt.TCheckbutton',
+            command=self._on_ai_synthesis_toggle,
+        ).pack(anchor='w')
+        noise_box = ttk.Frame(self._adv_wrap, style='Section.TFrame')
+        noise_box.pack(fill='x', pady=(0, 8))
         ttk.Checkbutton(
             noise_box,
             text='Output background/noise only (invert denoise)',
             variable=self.var_noise_only,
             style='Opt.TCheckbutton'
         ).pack(anchor='w')
-        gpu_box = ttk.Frame(left_body)
-        gpu_box.pack(fill='x', pady=(0, 6))
-        ttk.Checkbutton(
-            gpu_box,
-            text='Reduce GPU pressure (slower)',
-            variable=self.var_reduce_gpu,
-            style='Opt.TCheckbutton'
-        ).pack(anchor='w')
-        sync_box = ttk.Frame(left_body)
-        sync_box.pack(fill='x', pady=(0, 6))
-        ttk.Checkbutton(
-            sync_box,
-            text='Sync takes and export multichannel\n(uncheck for cleanup-only per file)',
-            variable=self.var_sync_export,
-            style='Opt.TCheckbutton',
-        ).pack(anchor='w')
-        otio_box = ttk.Frame(left_body)
-        otio_box.pack(fill='x', pady=(0, 6))
-        ttk.Checkbutton(
-            otio_box,
-            text='Generate OTIO active-speaker timeline',
-            variable=self.var_generate_otio,
-            style='Opt.TCheckbutton',
-        ).pack(anchor='w')
-        ttk.Label(otio_box, text='Client for camera assignment:', style='Info.TLabel').pack(anchor='w')
-        self.cmb_otio_client = ttk.Combobox(otio_box, textvariable=self.var_otio_client, state='readonly')
-        self.cmb_otio_client.pack(fill='x', pady=(1, 2))
-        self.cmb_otio_client.bind('<<ComboboxSelected>>', lambda e: self._on_otio_client_selected())
-        ttk.Label(otio_box, text='Wide Camera (required for OTIO):', style='Info.TLabel').pack(anchor='w')
-        row_w = ttk.Frame(otio_box)
-        row_w.pack(fill='x', pady=(1, 2))
-        self.cmb_otio_wide = ttk.Combobox(row_w, textvariable=self.var_otio_wide, state='readonly')
-        self.cmb_otio_wide.pack(side='left', fill='x', expand=True)
-        self.lbl_thumb_wide = ttk.Label(row_w, text='No thumb', style='Info.TLabel')
-        self.lbl_thumb_wide.pack(side='left', padx=(6, 0))
-        self.cmb_otio_wide.bind('<<ComboboxSelected>>', lambda e: self._on_otio_role_changed())
-        ttk.Label(otio_box, text='Guest Closeup (optional):', style='Info.TLabel').pack(anchor='w')
-        row_g = ttk.Frame(otio_box)
-        row_g.pack(fill='x', pady=(1, 2))
-        self.cmb_otio_guest = ttk.Combobox(row_g, textvariable=self.var_otio_guest_closeup, state='readonly')
-        self.cmb_otio_guest.pack(side='left', fill='x', expand=True)
-        self.lbl_thumb_guest = ttk.Label(row_g, text='No thumb', style='Info.TLabel')
-        self.lbl_thumb_guest.pack(side='left', padx=(6, 0))
-        self.cmb_otio_guest.bind('<<ComboboxSelected>>', lambda e: self._on_otio_role_changed())
-        ttk.Label(otio_box, text='Host Closeup (optional):', style='Info.TLabel').pack(anchor='w')
-        row_h = ttk.Frame(otio_box)
-        row_h.pack(fill='x', pady=(1, 2))
-        self.cmb_otio_host = ttk.Combobox(row_h, textvariable=self.var_otio_host_closeup, state='readonly')
-        self.cmb_otio_host.pack(side='left', fill='x', expand=True)
-        self.lbl_thumb_host = ttk.Label(row_h, text='No thumb', style='Info.TLabel')
-        self.lbl_thumb_host.pack(side='left', padx=(6, 0))
-        self.cmb_otio_host.bind('<<ComboboxSelected>>', lambda e: self._on_otio_role_changed())
-        ttk.Label(otio_box, text='Extra closeups role=path;role=path', style='Info.TLabel').pack(anchor='w')
-        ttk.Entry(otio_box, textvariable=self.var_otio_extras).pack(fill='x', pady=(1, 2))
-        ttk.Label(otio_box, text='OTIO Timeline Name (optional):', style='Info.TLabel').pack(anchor='w')
-        ttk.Entry(otio_box, textvariable=self.var_otio_timeline_name).pack(fill='x')
-        self._adv_open = False
-        self._adv_wrap = None
-        self._adv_btn = None
+        if not self._hide_reduce_gpu_ui:
+            gpu_box = ttk.Frame(self._adv_wrap, style='Section.TFrame')
+            gpu_box.pack(fill='x', pady=(0, 8))
+            ttk.Checkbutton(
+                gpu_box,
+                text='Reduce GPU pressure (slower)',
+                variable=self.var_reduce_gpu,
+                style='Opt.TCheckbutton'
+            ).pack(anchor='w')
+        else:
+            self.var_reduce_gpu.set(False)
+        if not self._force_sync_export:
+            sync_box = ttk.Frame(self._adv_wrap, style='Section.TFrame')
+            sync_box.pack(fill='x', pady=(0, 8))
+            ttk.Checkbutton(
+                sync_box,
+                text='Sync takes and export multichannel\n(uncheck for cleanup-only per file)',
+                variable=self.var_sync_export,
+                style='Opt.TCheckbutton',
+            ).pack(anchor='w')
+        else:
+            self.var_sync_export.set(True)
+        if not self._hide_otio_ui:
+            otio_box = ttk.Frame(self._adv_wrap, style='Section.TFrame')
+            otio_box.pack(fill='x', pady=(0, 8))
+            ttk.Checkbutton(
+                otio_box,
+                text='Generate OTIO active-speaker timeline',
+                variable=self.var_generate_otio,
+                style='Opt.TCheckbutton',
+            ).pack(anchor='w')
+            ttk.Label(otio_box, text='Client for camera assignment:', style='SectionInfo.TLabel').pack(anchor='w')
+            self.cmb_otio_client = ttk.Combobox(otio_box, textvariable=self.var_otio_client, state='readonly')
+            self.cmb_otio_client.pack(fill='x', pady=(1, 2))
+            self.cmb_otio_client.bind('<<ComboboxSelected>>', lambda e: self._on_otio_client_selected())
+            ttk.Label(otio_box, text='Wide Camera (required for OTIO):', style='SectionInfo.TLabel').pack(anchor='w')
+            row_w = ttk.Frame(otio_box, style='Section.TFrame')
+            row_w.pack(fill='x', pady=(1, 2))
+            self.cmb_otio_wide = ttk.Combobox(row_w, textvariable=self.var_otio_wide, state='readonly')
+            self.cmb_otio_wide.pack(side='left', fill='x', expand=True)
+            self.lbl_thumb_wide = ttk.Label(row_w, text='No thumb', style='SectionInfo.TLabel')
+            self.lbl_thumb_wide.pack(side='left', padx=(6, 0))
+            self.cmb_otio_wide.bind('<<ComboboxSelected>>', lambda e: self._on_otio_role_changed())
+            ttk.Label(otio_box, text='Guest Closeup (optional):', style='SectionInfo.TLabel').pack(anchor='w')
+            row_g = ttk.Frame(otio_box, style='Section.TFrame')
+            row_g.pack(fill='x', pady=(1, 2))
+            self.cmb_otio_guest = ttk.Combobox(row_g, textvariable=self.var_otio_guest_closeup, state='readonly')
+            self.cmb_otio_guest.pack(side='left', fill='x', expand=True)
+            self.lbl_thumb_guest = ttk.Label(row_g, text='No thumb', style='SectionInfo.TLabel')
+            self.lbl_thumb_guest.pack(side='left', padx=(6, 0))
+            self.cmb_otio_guest.bind('<<ComboboxSelected>>', lambda e: self._on_otio_role_changed())
+            ttk.Label(otio_box, text='Host Closeup (optional):', style='SectionInfo.TLabel').pack(anchor='w')
+            row_h = ttk.Frame(otio_box, style='Section.TFrame')
+            row_h.pack(fill='x', pady=(1, 2))
+            self.cmb_otio_host = ttk.Combobox(row_h, textvariable=self.var_otio_host_closeup, state='readonly')
+            self.cmb_otio_host.pack(side='left', fill='x', expand=True)
+            self.lbl_thumb_host = ttk.Label(row_h, text='No thumb', style='SectionInfo.TLabel')
+            self.lbl_thumb_host.pack(side='left', padx=(6, 0))
+            self.cmb_otio_host.bind('<<ComboboxSelected>>', lambda e: self._on_otio_role_changed())
+            ttk.Label(otio_box, text='OTIO Timeline Name (optional):', style='SectionInfo.TLabel').pack(anchor='w')
+            ttk.Entry(otio_box, textvariable=self.var_otio_timeline_name).pack(fill='x')
+        else:
+            self.var_generate_otio.set(False)
+
+        queue_card = ttk.Frame(left_body, style='Section.TFrame', padding=10)
+        queue_card.pack(fill='both', expand=True, pady=(0, 0))
+        ttk.Label(queue_card, text='Queue', style='SectionTitle.TLabel').pack(anchor='w', pady=(0, 6))
 
         # Queue controls: filter + actions
-        ctl = ttk.Frame(left_body)
-        ctl.pack(fill='x', pady=(4, 4))
-        ttk.Label(ctl, text='Show:').pack(side='left')
+        ctl = ttk.Frame(queue_card, style='Section.TFrame')
+        ctl.pack(fill='x', pady=(0, 6))
+        ttk.Label(ctl, text='Show:', style='SectionInfo.TLabel').pack(side='left')
         self.status_filter_var = tk.StringVar(value='All')
         self.status_filter = ttk.Combobox(ctl, textvariable=self.status_filter_var, values=['All','Queued','Running','Done','Failed'], state='readonly', width=10)
         self.status_filter.pack(side='left', padx=(6, 0))
         self.status_filter.bind('<<ComboboxSelected>>', lambda e: self._refresh_queue_tree())
+        self.trash_btn = ttk.Button(ctl, text='', width=3, command=self._remove_selected)
+        self.trash_btn.pack(side='right')
+        self._bind_hover(self.trash_btn)
+        self.clear_processed_btn = ttk.Button(ctl, text='', width=3, command=self._clear_processed)
+        self.clear_processed_btn.pack(side='right', padx=(0, 6))
+        self._bind_hover(self.clear_processed_btn)
+        self._set_button_icon(self.trash_btn, 'trash-2')
+        self._set_button_icon(self.clear_processed_btn, 'x')
 
         # Queue tree: grouped folders with child files; multi-select enabled
-        self.queue_tree = ttk.Treeview(left_body, show='tree', selectmode='extended')
+        self.queue_tree = ttk.Treeview(queue_card, show='tree', selectmode='extended', height=14)
         self.queue_tree.pack(fill='both', expand=True)
         # Drag-to-reorder support (when filter is 'All')
         self._drag_iid = None
@@ -2576,12 +2792,6 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                     pass
         self.queue_tree.bind('<Button-3>', _q_menu_popup)
 
-        # Trash can button bottom-right under queue
-        queue_footer = ttk.Frame(left_body)
-        queue_footer.pack(fill='x', pady=(4, 0))
-        self.trash_btn = ttk.Button(queue_footer, text='Remove', width=8, command=self._remove_selected)
-        self.trash_btn.pack(side='right')
-        self._bind_hover(self.trash_btn)
         dnd_enabled = False
         if DND_AVAILABLE:
             try:
@@ -2593,20 +2803,23 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         if not dnd_enabled:
             _install_win_dnd(self.queue_tree, lambda files: self._add_paths(files) or self._enable_run())
 
-        progfrm = ttk.Frame(right)
-        progfrm.pack(fill='x', pady=(8, 6), padx=(12, 12))
+        progfrm = ttk.Frame(right, style='Section.TFrame', padding=12)
+        progfrm.pack(fill='x', pady=(0, 12))
+        ttk.Label(progfrm, text='Progress', style='SectionTitle.TLabel').pack(anchor='w', pady=(0, 6))
         self.progress = ttk.Progressbar(progfrm, mode='determinate')
         self.progress.pack(fill='x')
-        self.overall_label = ttk.Label(progfrm, text='0 of 0 files')
+        self.overall_label = ttk.Label(progfrm, text='0 of 0 files', style='SectionInfo.TLabel')
         self.overall_label.pack(anchor='w', pady=(2, 0))
         # Status line below the main progress bar
-        self.status_label = ttk.Label(right, text='')
-        self.status_label.pack(fill='x', padx=(12, 12), pady=(6, 0))
+        self.status_label = ttk.Label(progfrm, text='', style='SectionInfo.TLabel')
+        self.status_label.pack(fill='x', pady=(6, 0))
 
-        ttk.Label(right, text='Enhanced files', style='Title.TLabel').pack(anchor='w', pady=(10, 2))
-        histfrm = ttk.Frame(right)
-        histfrm.pack(fill='both', expand=True, padx=(12, 12))
-        self.hist = ttk.Treeview(histfrm, columns=('src','out'), show='headings', selectmode='browse')
+        hist_card = ttk.Frame(right, style='Section.TFrame', padding=12)
+        hist_card.pack(fill='x')
+        ttk.Label(hist_card, text='Enhanced files', style='SectionTitle.TLabel').pack(anchor='w', pady=(0, 6))
+        histfrm = ttk.Frame(hist_card, style='Section.TFrame')
+        histfrm.pack(fill='x')
+        self.hist = ttk.Treeview(histfrm, columns=('src','out'), show='headings', selectmode='browse', height=7)
         self.hist.heading('src', text='Source')
         self.hist.heading('out', text='Output')
         # Equal width, left-aligned, stretch to fit
@@ -2639,29 +2852,56 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 pass
         self.hist.bind('<Configure>', _resize_hist_cols)
         self.after(200, _resize_hist_cols)
-        btnhist = ttk.Frame(right)
-        btnhist.pack(fill='x', pady=6, padx=(12, 12))
-        btn_open = ttk.Button(btnhist, text='Open Selected Output', command=self._open_selected_output)
+        self._hist_menu = tk.Menu(self, tearoff=0)
+        self._hist_menu.add_command(label='Open Output', command=self._open_selected_output)
+        self._hist_menu.add_command(label='Reveal in Explorer', command=self._reveal_selected_output)
+        def _hist_menu_popup(e):
+            row_id = self.hist.identify_row(e.y)
+            if row_id:
+                try:
+                    self.hist.selection_set(row_id)
+                    self.hist.focus(row_id)
+                except Exception:
+                    pass
+                try:
+                    self._hist_menu.tk_popup(e.x_root, e.y_root)
+                finally:
+                    try:
+                        self._hist_menu.grab_release()
+                    except Exception:
+                        pass
+        self.hist.bind('<Button-3>', _hist_menu_popup)
+        btnhist = ttk.Frame(hist_card, style='Section.TFrame')
+        btnhist.pack(fill='x', pady=(12, 0))
+        output_actions = ttk.Frame(btnhist, style='Section.TFrame')
+        output_actions.pack(side='left', fill='x', expand=True)
+        btn_open = ttk.Button(output_actions, text='Open Selected Output', command=self._open_selected_output)
         btn_open.pack(side='left')
         self._bind_hover(btn_open)
-        btn_gr = ttk.Button(btnhist, text='Open Preview (Browser)', command=self._open_gradio_preview)
+        btn_gr = ttk.Button(output_actions, text='Open Preview', command=self._open_gradio_preview)
         btn_gr.pack(side='left', padx=(8,0))
         self._bind_hover(btn_gr)
-        # Keep run controls in the same persistent row as "Open Selected Output".
-        bottom_actions = ttk.Frame(btnhist)
+        self._set_button_icon(btn_open, 'external-link')
+        self._set_button_icon(btn_gr, 'external-link')
+        bottom_actions = ttk.Frame(btnhist, style='Section.TFrame')
         bottom_actions.pack(side='right')
+        ctrlfrm = ttk.Frame(bottom_actions, style='Section.TFrame')
+        ctrlfrm.pack(side='left', padx=(0, 10))
+        self.pause_btn = ttk.Button(ctrlfrm, text='', width=3, command=self._toggle_pause, state='disabled')
+        self.pause_btn.pack(side='left')
+        self.cancel_btn = ttk.Button(ctrlfrm, text='', width=3, command=self._cancel_graceful, state='disabled')
+        self.cancel_btn.pack(side='left', padx=(6, 0))
+        self._set_button_icon(self.pause_btn, 'pause')
+        self._set_button_icon(self.cancel_btn, 'x')
         self.run_btn = ttk.Button(bottom_actions, text='Enhance', command=self.run_task, state='disabled', style='Accent.TButton')
-        self.run_btn.pack(side='right')
+        self.run_btn.pack(side='left')
         self.run_btn.bind('<Enter>', lambda e: self.run_btn.configure(style='AccentHover.TButton'))
         self.run_btn.bind('<Leave>', lambda e: self.run_btn.configure(style='Accent.TButton'))
-        ctrlfrm = ttk.Frame(bottom_actions)
-        ctrlfrm.pack(side='right', padx=(8, 0))
-        self.pause_btn = ttk.Button(ctrlfrm, text='Pause', command=self._toggle_pause, state='disabled')
-        self.pause_btn.pack(side='left')
-        self.cancel_btn = ttk.Button(ctrlfrm, text='Cancel', command=self._cancel_graceful, state='disabled')
-        self.cancel_btn.pack(side='left', padx=(6, 0))
+        self._set_button_icon(self.run_btn, 'play')
 
         # Preview handled via Gradio in a browser; no inline preview widgets
+        self._closing = False
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def add_files(self):
         paths = filedialog.askopenfilenames(
@@ -2990,6 +3230,15 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 w.configure(state=state)
         except Exception:
             pass
+        try:
+            row = getattr(self, "_output_dir_row", None)
+            if row is not None:
+                if enabled:
+                    row.pack_forget()
+                elif not row.winfo_manager():
+                    row.pack(fill='x', pady=(2, 0))
+        except Exception:
+            pass
 
     def _choose_otio_video(self, target_var):
         path = filedialog.askopenfilename(
@@ -3179,37 +3428,29 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             wide = str(stored.get("wide", "") or "").strip()
             guest = str(stored.get("guest_closeup", "") or "").strip()
             host = str(stored.get("host_closeup", "") or "").strip()
+            if not wide:
+                videos = [str(v) for v in (self.client_meta.get(client_id, {}).get("video_files", []) or []) if str(v).strip()]
+                guessed = self._auto_suggest_camera_roles(videos)
+                wide = str(guessed.get("wide", "") or "").strip()
+                guest = str(guessed.get("guest_closeup", "") or guest).strip()
+                host = str(guessed.get("host_closeup", "") or host).strip()
+                if guessed:
+                    self.client_camera_roles[client_id] = dict(guessed)
         else:
-            wide = self._otio_label_to_path.get((self.var_otio_wide.get() or "").strip(), "")
-            guest = self._otio_label_to_path.get((self.var_otio_guest_closeup.get() or "").strip(), "")
-            host = self._otio_label_to_path.get((self.var_otio_host_closeup.get() or "").strip(), "")
+            cid = self._get_current_otio_client_id()
+            if cid:
+                return self._build_otio_camera_roles(client_id=cid)
+            videos = [str(p) for p in self.files if _is_video_file(str(p))]
+            guessed = self._auto_suggest_camera_roles(videos)
+            wide = str(guessed.get("wide", "") or "").strip()
+            guest = str(guessed.get("guest_closeup", "") or "").strip()
+            host = str(guessed.get("host_closeup", "") or "").strip()
         if wide:
             roles["wide"] = wide
         if guest:
             roles["guest_closeup"] = guest
         if host:
             roles["host_closeup"] = host
-        raw_extras = (self.var_otio_extras.get() or "").strip()
-        if raw_extras:
-            host_i = 1
-            guest_i = 1
-            for chunk in raw_extras.split(";"):
-                part = chunk.strip()
-                if not part:
-                    continue
-                if "=" not in part:
-                    continue
-                role, path = part.split("=", 1)
-                rr = role.strip().lower()
-                pp = path.strip()
-                if not pp:
-                    continue
-                if rr.startswith("host"):
-                    roles[f"extra_host_{host_i}"] = pp
-                    host_i += 1
-                elif rr.startswith("guest"):
-                    roles[f"extra_guest_{guest_i}"] = pp
-                    guest_i += 1
         return roles
 
     def clear_files(self):
@@ -3288,8 +3529,8 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             import torch as _t
             wav = _t.zeros(256, dtype=_t.float32)
 
-        # Denoise with current seam settings
-        from resemble_enhance.enhancer.inference import denoise
+        # Process with current seam settings
+        from resemble_enhance.enhancer.inference import denoise, enhance
         run_dir = _get_enhancer_run_dir()
         if self.var_seam_safe.get():
             kwargs = dict(chunk_seconds=float(os.environ.get('RESEMBLE_CHUNK_SECONDS', '60.0') or 60.0), overlap_seconds=float(os.environ.get('RESEMBLE_OVERLAP_SECONDS', '4.0') or 4.0), align_max_shift_ratio=0.05, align_disable=False)
@@ -3302,11 +3543,35 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             kwargs.update(chunk_seconds=cs_safe, overlap_seconds=ov_safe, align_max_shift_ratio=0.0, align_disable=True)
         device = 'cuda'
         try:
-            hwav, model_sr = denoise(dwav=wav, sr=sr, device=device, run_dir=run_dir, **kwargs)
+            device = str(self.var_device.get() or 'cuda')
+        except Exception:
+            device = 'cuda'
+
+        def _preview_run(device_):
+            if self.var_denoise_only.get():
+                return denoise(dwav=wav, sr=sr, device=device_, run_dir=run_dir, **kwargs)
+            extra = {}
+            if str(device_).lower() == "cuda":
+                extra.update(nfe=AI_SYNTHESIS_DEFAULT_NFE, solver="midpoint")
+            else:
+                extra.update(nfe=8, solver="euler")
+            return enhance(
+                dwav=wav,
+                sr=sr,
+                device=device_,
+                run_dir=run_dir,
+                tau=AI_SYNTHESIS_DEFAULT_TAU,
+                lambd=AI_SYNTHESIS_DEFAULT_LAMBD,
+                **kwargs,
+                **extra,
+            )
+
+        try:
+            hwav, model_sr = _preview_run(device)
         except Exception:
             # Fallback to CPU or bypass if device fails
             try:
-                hwav, model_sr = denoise(dwav=wav, sr=sr, device='cpu', run_dir=run_dir, **kwargs)
+                hwav, model_sr = _preview_run('cpu')
             except Exception:
                 hwav = wav
                 model_sr = sr
@@ -3675,15 +3940,19 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 self._adv_open = False
                 try:
                     if self._adv_btn:
-                        self._adv_btn.configure(text='Advanced Options [+]')
+                        self._adv_btn.configure(text='Processing & OTIO Options [+]')
                 except Exception:
                     pass
             else:
-                self._adv_wrap.pack(fill='x', pady=(2, 8))
+                pack_kwargs = {"fill": "x", "pady": (2, 8)}
+                if getattr(self, "_adv_hdr", None) is not None:
+                    self._adv_wrap.pack(after=self._adv_hdr, **pack_kwargs)
+                else:
+                    self._adv_wrap.pack(**pack_kwargs)
                 self._adv_open = True
                 try:
                     if self._adv_btn:
-                        self._adv_btn.configure(text='Advanced Options [-]')
+                        self._adv_btn.configure(text='Processing & OTIO Options [-]')
                 except Exception:
                     pass
         except Exception:
@@ -3727,6 +3996,39 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         except Exception:
             return None
 
+    def _on_ai_synthesis_toggle(self) -> None:
+        enabled = False
+        try:
+            enabled = bool(self.var_ai_synthesis.get())
+        except Exception:
+            enabled = False
+        try:
+            self.var_denoise_only.set(not enabled)
+        except Exception:
+            pass
+        if enabled:
+            try:
+                self.var_noise_only.set(False)
+            except Exception:
+                pass
+            try:
+                self.var_wet.set(AI_SYNTHESIS_DEFAULT_WET)
+            except Exception:
+                pass
+            try:
+                self._log("AI enhancement / synthesis enabled with conservative blend to reduce robotic artifacts.")
+            except Exception:
+                pass
+        else:
+            try:
+                self.var_wet.set(1.0)
+            except Exception:
+                pass
+            try:
+                self._log("Denoise-only mode enabled.")
+            except Exception:
+                pass
+
     def _snapshot_run_config(self, chunk_seconds: float, overlap_seconds: float) -> dict:
         try:
             files = [str(p) for p in getattr(self, 'files', [])]
@@ -3739,6 +4041,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         snapshot = {
             "diagnostics_mode": diag,
             "denoise_only_mode": bool(self.var_denoise_only.get()),
+            "ai_synthesis_enabled": not bool(self.var_denoise_only.get()),
             "device": str(self.var_device.get()),
             "profile_camera_sync": bool(self.var_profile.get()),
             "sync_inputs": bool(self.var_sync_export.get()),
@@ -3928,14 +4231,9 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self._enable_run()
 
     def _open_selected_output(self):
-        sel = self.hist.selection()
-        if not sel:
+        path = self._selected_history_output_path()
+        if not path:
             return
-        item = self.hist.item(sel[0])
-        vals = item.get('values') or []
-        if len(vals) < 2:
-            return
-        path = vals[1]
         try:
             if os.name == 'nt':
                 os.startfile(path)  # type: ignore[attr-defined]
@@ -3943,6 +4241,32 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 subprocess.Popen(['open', path])
         except Exception as e:  # noqa: BLE001
             self._log(f"Open failed: {e}")
+
+    def _selected_history_output_path(self) -> str | None:
+        sel = self.hist.selection()
+        if not sel:
+            return None
+        item = self.hist.item(sel[0])
+        vals = item.get('values') or []
+        if len(vals) < 2:
+            return None
+        path = str(vals[1]).strip()
+        return path or None
+
+    def _reveal_selected_output(self):
+        path = self._selected_history_output_path()
+        if not path:
+            return
+        try:
+            target = Path(path)
+            if os.name == 'nt':
+                subprocess.Popen(['explorer', '/select,', str(target)])
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', '-R', str(target)])
+            else:
+                subprocess.Popen(['xdg-open', str(target.parent if target.parent.exists() else target)])
+        except Exception as e:  # noqa: BLE001
+            self._log(f"Reveal failed: {e}")
 
     def run_task(self):
         if not self.files:
@@ -4036,7 +4360,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 # Reset status
                 self.after(0, lambda: self._set_status('Ready'))
                 self.after(0, lambda: self._log("Launching enhancer..."))
-                do_sync = bool(self.var_sync_export.get())
+                do_sync = True if self._force_sync_export else bool(self.var_sync_export.get())
                 if not do_sync:
                     self.after(0, lambda: self._log("Cleanup-only mode: skipping sync/export; writing one output per file."))
                 media_clean = bool(self.var_output_media_clean.get())
@@ -4064,11 +4388,14 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                     # Prefer fast enhance config when Enhance mode is selected
                     if not self.var_denoise_only.get():
                         os.environ['RESEMBLE_FAST_ENHANCE'] = '1'
+                    else:
+                        os.environ.pop('RESEMBLE_FAST_ENHANCE', None)
                     # Diagnostics: disable all post FX besides enhance + alignment
                     if self.var_diag_minimal.get():
                         os.environ['RESEMBLE_DISABLE_TRANSIENT_BLEND'] = '1'
                         os.environ['RESEMBLE_LEAD_GUARD'] = '0'
-                        os.environ['RESEMBLE_WET'] = '1.0'
+                        if self.var_denoise_only.get():
+                            os.environ['RESEMBLE_WET'] = '1.0'
                 except Exception:
                     pass
                 output_override = self._get_output_override()
@@ -4090,7 +4417,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 files_all = list(self.files)
                 # Detect reusable CLEAN outputs so we can skip enhance but still run sync/OTIO.
                 existing_clean_map: dict[str, str] = {}
-                if files_all:
+                if files_all and self._reuse_existing_outputs:
                     reused = 0
                     for fp in files_all:
                         p = _find_existing_clean_for_source(Path(fp))
@@ -4117,6 +4444,8 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                 "No reusable CLEAN outputs detected for current selection; running enhance on queued files."
                             ),
                         )
+                elif files_all and (not self._reuse_existing_outputs):
+                    self.after(0, lambda: self._log("Packaged mode: always reprocessing inputs (existing CLEAN outputs are ignored)."))
                 groups: list[tuple[str, list[str]]] = []
                 batch_by_folder = bool(self.var_batch_folders.get()) or bool(self.var_recursive_folders.get())
                 if batch_by_folder:
@@ -4489,11 +4818,13 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             return
         if self._control.pause.is_set():
             self._control.pause.clear()
-            self.pause_btn.configure(text='Pause')
+            self.pause_btn.configure(text='')
+            self._set_button_icon(self.pause_btn, 'pause')
             self._log('Resumed.')
         else:
             self._control.pause.set()
-            self.pause_btn.configure(text='Resume')
+            self.pause_btn.configure(text='')
+            self._set_button_icon(self.pause_btn, 'play')
             self._log('Pausing after current chunk...')
 
     def _cancel_graceful(self):
@@ -4502,6 +4833,31 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
         self._control.stop_after_chunk.set()
         self.cancel_btn.config(state='disabled')
         self._log('Will stop after current chunk...')
+
+    def _on_close(self):
+        if self._closing:
+            return
+        self._closing = True
+        try:
+            if hasattr(self, '_control'):
+                self._control.cancel_now.set()
+                self._control.stop_after_chunk.set()
+        except Exception:
+            pass
+        try:
+            _terminate_live_subprocesses(timeout_s=1.0)
+        except Exception:
+            pass
+        try:
+            self.quit()
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+        if getattr(sys, "frozen", False):
+            os._exit(0)
 
 
 # --- Alignment and multichannel export helpers (Audalign-based) ---
@@ -6052,6 +6408,55 @@ def _normalize_segments_strict(segments: list[dict], window_start: float, window
     return merged
 
 
+def _apply_camera_pre_switch(segments: list[dict], lead_s: float = 1.0, min_seg_s: float = 0.12) -> list[dict]:
+    """Move camera cut boundaries earlier so incoming shot appears before speech turn."""
+    if not segments:
+        return []
+    out = [dict(s) for s in segments]
+    lead = max(0.0, float(lead_s))
+    min_seg = max(0.02, float(min_seg_s))
+    for i in range(1, len(out)):
+        prev = out[i - 1]
+        cur = out[i]
+        try:
+            if str(prev.get("camera_path", "")) == str(cur.get("camera_path", "")):
+                continue
+            b = float(cur.get("start_s", 0.0))
+            prev_start = float(prev.get("start_s", 0.0))
+            cur_end = float(cur.get("end_s", b))
+            target = float(b - lead)
+            lo = float(prev_start + min_seg)
+            hi = float(cur_end - min_seg)
+            if hi <= lo:
+                continue
+            nb = max(lo, min(hi, target))
+            prev["end_s"] = nb
+            cur["start_s"] = nb
+        except Exception:
+            continue
+    # Drop any degenerate pieces and merge accidental same-cam joins.
+    cleaned = []
+    for s in out:
+        try:
+            ss = float(s.get("start_s", 0.0))
+            ee = float(s.get("end_s", ss))
+            if ee - ss >= min_seg:
+                cleaned.append({**s, "start_s": ss, "end_s": ee})
+        except Exception:
+            continue
+    merged: list[dict] = []
+    for s in cleaned:
+        if not merged:
+            merged.append(s)
+            continue
+        p = merged[-1]
+        if str(p.get("camera_path", "")) == str(s.get("camera_path", "")) and abs(float(p["end_s"]) - float(s["start_s"])) < 1e-6:
+            p["end_s"] = float(s["end_s"])
+        else:
+            merged.append(s)
+    return merged
+
+
 def _estimate_source_offsets_audalign(source_paths: list[str], log=None) -> dict[str, float]:
     def _emit(msg: str) -> None:
         if log:
@@ -6870,6 +7275,9 @@ def _write_active_speaker_otio(
         if e <= s:
             continue
         merged.append({**seg, "start_s": max(0.0, s), "end_s": min(timeline_end_s, e)})
+    merged = _normalize_segments_strict(merged, 0.0, timeline_end_s, hold_cam)
+    # Pre-switch camera by ~2s so incoming shot appears before speech begins.
+    merged = _apply_camera_pre_switch(merged, lead_s=2.0, min_seg_s=0.12)
     merged = _normalize_segments_strict(merged, 0.0, timeline_end_s, hold_cam)
     if not merged:
         _emit("[otio] no valid segments after normalization; skipping OTIO.")
@@ -7952,7 +8360,10 @@ def _export_bw64_with_adm(wav_path: str, channel_names: list[str], sr: int) -> b
     """
     try:
         import soundfile as sf
-        from bw64 import write_bw64
+        bw64_mod = importlib.import_module("bw64")
+        write_bw64 = getattr(bw64_mod, "write_bw64", None)
+        if write_bw64 is None:
+            return False
     except Exception:
         return False
 
@@ -8140,6 +8551,17 @@ def _postprocess_level_shape(paths: list[str], target_rms_db: float = -16.0, max
 
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    _mutex_handle = _acquire_single_instance_mutex(_SINGLE_INSTANCE_MUTEX_NAME)
+    if _mutex_handle is None:
+        _show_single_instance_notice()
+        sys.exit(0)
+    try:
+        app = App()
+        app.mainloop()
+    finally:
+        try:
+            _terminate_live_subprocesses(timeout_s=0.5)
+        except Exception:
+            pass
+        _release_single_instance_mutex(_mutex_handle)
 
