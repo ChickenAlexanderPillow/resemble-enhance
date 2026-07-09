@@ -1555,7 +1555,11 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
             if control.cancel_now.is_set() or control.stop_after_chunk.is_set():
                 raise _Cancelled()
         if chunk_progress_cb:
-            chunk_progress_cb(name or "", i, n)
+            label = name or ""
+            if isinstance(evt, str) and evt.startswith("stage:"):
+                _prefix, stage, detail = (evt.split(":", 2) + ["", ""])[:3]
+                label = f"{label}|{stage}|{detail}"
+            chunk_progress_cb(label, i, n)
 
     done = 0
     out_dirs = set()
@@ -1794,7 +1798,11 @@ def _enhance_in_process(files, device, profile, progress_cb, chunk_progress_cb, 
                 torchaudio.save(str(post_dbg), hwav[None], dest_sr)
             except Exception:
                 pass
+        if chunk_progress_cb:
+            chunk_progress_cb(f"{p}|save|Writing output file", 0, 1)
         torchaudio.save(str(out_path), hwav[None], dest_sr)
+        if chunk_progress_cb:
+            chunk_progress_cb(f"{p}|saved|Output file written", 1, 1)
         done += 1
         if progress_cb:
             progress_cb(done, expected)
@@ -1989,6 +1997,7 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
             m = stage_re.search(line)
             if m:
                 name = m.group(1) or current_file or ""
+                stage = m.group(2).strip()
                 detail = m.group(3).strip()
                 if detail:
                     try:
@@ -1996,7 +2005,7 @@ def run_enhancer_for(files, device="cuda", profile=True, progress_cb=None, chunk
                     except Exception:
                         pass
                     if chunk_progress_cb:
-                        chunk_progress_cb(f"{name}|{detail}", 0, cur_n)
+                        chunk_progress_cb(f"{name}|{stage}|{detail}", 0, cur_n)
                 continue
             m = chunk_re.search(line)
             if m:
@@ -4444,15 +4453,36 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             job_total = int(getattr(self, '_job_total', 0) or total or 1)
             job_done = min(job_total, int(getattr(self, '_job_done', 0) or 0) + int(done or 0))
             pct = job_done * 100.0 / job_total
+            tail_reserve_pct = 0.0
+            try:
+                if self.var_postproc.get():
+                    tail_reserve_pct += 3.0
+                if self.var_sync_export.get():
+                    tail_reserve_pct += 6.0
+            except Exception:
+                tail_reserve_pct = 0.0
+            if tail_reserve_pct and job_done >= job_total:
+                pct = min(pct, 100.0 - tail_reserve_pct)
             set_progress_if_current(pct, f"Job: {job_done} of {job_total} files ({int(pct)}%)")
+
+        def update_tail_stage(label, i, n, start_pct, end_pct):
+            n = max(1, int(n or 1))
+            local_pct = max(0.0, min(1.0, float(i or 0) / float(n)))
+            pct = float(start_pct) + ((float(end_pct) - float(start_pct)) * local_pct)
+            set_progress_if_current(pct, f"{label} - {int(local_pct * 100)}%")
 
         def update_chunk(name, i, n):
             n = max(n or 0, 1)
+            stage_name = ""
             stage_detail = ""
             raw_name = name or ""
             if "|" in raw_name:
                 raw_name, stage_detail = raw_name.split("|", 1)
                 stage_detail = stage_detail.strip()
+                if "|" in stage_detail:
+                    stage_name, stage_detail = stage_detail.split("|", 1)
+                    stage_name = stage_name.strip().lower()
+                    stage_detail = stage_detail.strip()
             if stage_detail:
                 try:
                     if not hasattr(self, "_chunk_last"):
@@ -4469,7 +4499,33 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                     self._chunk_last[raw_name] = (int(i or 0), int(n or 0))
                 except Exception:
                     pass
-            pct = int((i * 100) / n)
+            chunk_frac = min(1.0, max(0.0, (i or 0) / float(n)))
+            stage_progress = {
+                "chunking": 0.02,
+                "merge": 0.74,
+                "sanitize": 0.78,
+                "transients": 0.82,
+                "suppress": 0.88,
+                "gate": 0.93,
+                "complete": 0.96,
+                "save": 0.98,
+                "saved": 0.99,
+            }
+            if stage_name:
+                file_frac = stage_progress.get(stage_name, max(0.02, chunk_frac * 0.70))
+            else:
+                file_frac = 0.02 + (chunk_frac * 0.68)
+            try:
+                tail_reserve = 0.0
+                if self.var_postproc.get():
+                    tail_reserve += 0.03
+                if self.var_sync_export.get():
+                    tail_reserve += 0.06
+                if tail_reserve:
+                    file_frac = min(file_frac, max(0.85, 1.0 - tail_reserve))
+            except Exception:
+                pass
+            pct = int(file_frac * 100)
             base = Path(raw_name).name if raw_name else "-"
             self._chunk_active = True
             # Start time and ETA
@@ -4502,7 +4558,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 group_done = int(getattr(self, '_group_done', 0) or 0)
                 done_files = job_done_base + group_done
                 total_files = int(getattr(self, '_job_total', 0) or 0) or int(getattr(self, '_group_total', 0) or 0) or 1
-                frac = min(1.0, max(0.0, (i or 0) / float(n)))
+                frac = min(0.99, max(0.0, file_frac))
                 overall = (done_files + frac) * 100.0 / total_files
                 jst = getattr(self, '_job_start_time', None)
                 label = f"Job file {min(done_files+1, total_files)}/{total_files}: {base} - {pct}%{eta_txt}"
@@ -4517,7 +4573,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                     gss = int(eta_total % 60)
                     fpm = rate * 60.0
                     label += f" | Job ETA {gmm:02d}:{gss:02d} | {fpm:.2f} files/min"
-                set_progress_if_current(overall, label, update_label_on_decrease=True)
+                set_progress_if_current(overall, label, update_label_on_decrease=bool(stage_detail))
             except Exception:
                 pass
 
@@ -4529,7 +4585,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
             try:
                 # Clean up temp audio/log artifacts from prior runs
                 cleanup_pre_t0 = time.perf_counter()
-                _cleanup_run_artifacts(remove_logs=True)
+                _cleanup_run_artifacts(remove_logs=False)
                 cleanup_pre_dt = time.perf_counter() - cleanup_pre_t0
                 self.after(0, lambda dt=cleanup_pre_dt: self._log(f"Timing: pre-run cleanup {_format_seconds(dt)}"))
                 # Reset status
@@ -4656,6 +4712,14 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                             except Exception as exc:
                                 self.after(0, lambda exc=exc: self._log(f"Output folder error: {exc}"))
                                 group_media_clean_dir = None
+                        if group_media_clean_dir is None:
+                            self.after(
+                                0,
+                                lambda: self._log(
+                                    "Output to 01_MEDIA\\030_AUDIO_CLEAN is enabled, but no 01_MEDIA folder was found. "
+                                    "Falling back to an Enhanced_<timestamp> folder beside the source files."
+                                ),
+                            )
                     group_output_dir = output_override
                     group_do_sync = bool(do_sync and len(gfiles) > 1)
                     if group_do_sync:
@@ -4729,7 +4793,10 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                     )
 
                     # Enhance this group
-                    prefer_cli = (self.var_diag_minimal.get() or (not self.var_denoise_only.get()))
+                    # Keep installed builds on the same in-process execution path as the
+                    # main GUI. The frozen CLI path is useful for dev diagnostics, but it
+                    # has different output/staging behavior and can hide packaged failures.
+                    prefer_cli = (not self._packaged_ui_mode) and (self.var_diag_minimal.get() or (not self.var_denoise_only.get()))
                     if self.var_noise_only.get():
                         prefer_cli = False
                     reduce_gpu = bool(self.var_reduce_gpu.get()) and str(self.var_device.get()).lower() == "cuda"
@@ -4752,6 +4819,39 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                             output_dir=group_output_dir,
                             force_inprocess=reduce_gpu,
                         )
+                        if not results:
+                            raise RuntimeError("Enhancement finished without producing any output files.")
+
+                    def persist_group_results(result_pairs: list[tuple[str, str]], reason: str) -> list[tuple[str, str]]:
+                        """Move staged per-file outputs to a visible final folder."""
+                        persisted: list[tuple[str, str]] = []
+                        fallback_stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                        for src, out in result_pairs:
+                            try:
+                                out_path = Path(out)
+                                if not (out_path.exists() and out_path.stat().st_size > 44):
+                                    continue
+                                if group_media_clean_dir is not None:
+                                    dest_dir = group_media_clean_dir
+                                else:
+                                    output_base = Path(output_override) if output_override else None
+                                    dest_dir = _build_output_dest_dir(Path(src), output_base, fallback_stamp)
+                                dest_dir.mkdir(parents=True, exist_ok=True)
+                                dest = dest_dir / out_path.name
+                                if dest.exists():
+                                    dest = dest_dir / f"{out_path.stem}_{uuid.uuid4().hex[:6]}{out_path.suffix}"
+                                try:
+                                    shutil.move(str(out_path), str(dest))
+                                except Exception:
+                                    shutil.copy2(str(out_path), str(dest))
+                                persisted.append((src, str(dest)))
+                            except Exception as exc:
+                                self.after(0, lambda exc=exc: self._log(f"Fallback output copy failed: {exc}"))
+                        if persisted:
+                            self.after(0, lambda rows=persisted: self._append_history(rows))
+                            self.after(0, lambda n=len(persisted), r=reason: self._log(f"{r}; kept {n} per-file enhanced output(s)."))
+                        return persisted
+
                     if existing_results:
                         results.extend(existing_results)
                     enhance_dt = time.perf_counter() - enhance_t0
@@ -4870,6 +4970,8 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                 n = max(1, n)
                                 pct = int(i * 100 / n)
                                 self._set_status(f"{msg} - {pct}%")
+                                sync_reserved = bool(self.var_sync_export.get())
+                                update_tail_stage(msg, i, n, 91.0, 94.0 if sync_reserved else 99.0)
                                 if self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set():
                                     raise _Cancelled()
                             _postprocess_level_shape(outs, progress_cb=lambda i, n, m: self.after(0, pp_prog, i, n, m))
@@ -4886,6 +4988,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                     # Sync + export per group
                     if group_do_sync and results:
                         sync_t0 = time.perf_counter()
+                        sync_output_written = False
                         try:
                             self.after(0, lambda: self._set_status('Preparing sync'))
                             self.after(0, lambda: self._log("Syncing with Audalign and exporting multichannel..."))
@@ -4904,6 +5007,8 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                 n = max(1, n)
                                 pct = int(i * 100 / n)
                                 self._set_status(f"{msg} - {pct}%")
+                                post_done = bool(self.var_postproc.get())
+                                update_tail_stage(msg, i, n, 94.0 if post_done else 91.0, 99.0)
                                 if self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set():
                                     raise _Cancelled()
                             write_otio = bool(self.var_generate_otio.get())
@@ -4942,6 +5047,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                 otio_out_dir=otio_out_dir,
                             )
                             if out_path:
+                                sync_output_written = True
                                 self.after(0, lambda: self._append_history([(gname, out_path)]))
                                 self.after(0, lambda: self._log(f"Group {gi}: multichannel export written: {out_path}"))
                                 # Remove per-file outputs when a multichannel export is produced
@@ -4961,12 +5067,19 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                                         pass
                             else:
                                 self.after(0, lambda: self._log("Multichannel export failed: no output produced"))
+                                fallback = persist_group_results(results, "Multichannel export failed")
+                                if not fallback:
+                                    raise RuntimeError("Multichannel export failed and no per-file outputs were available.")
                         except Exception as e:
                             if not isinstance(e, _Cancelled):
-                                self.after(0, lambda e=e: self._log(f"Sync/export error: {e}"))
+                                fallback = persist_group_results(results, f"Sync/export error: {e}")
+                                if not fallback:
+                                    raise
                         finally:
                             sync_dt = time.perf_counter() - sync_t0
                             self.after(0, lambda gi=gi, dt=sync_dt: self._log(f"Timing: group {gi} sync/export {_format_seconds(dt)}"))
+                        if not sync_output_written and not results:
+                            raise RuntimeError("No enhanced outputs were produced for this group.")
                     if not (self._control.cancel_now.is_set() or self._control.stop_after_chunk.is_set()):
                         finish_group_progress()
                     group_dt = time.perf_counter() - group_t0
@@ -5000,7 +5113,7 @@ class App((TkinterDnD.Tk if DND_AVAILABLE else tk.Tk)):
                 self._write_run_flag_log(run_snapshot)
                 # Always clean temp artifacts after each run
                 cleanup_post_t0 = time.perf_counter()
-                _cleanup_run_artifacts(remove_logs=True)
+                _cleanup_run_artifacts(remove_logs=False)
                 cleanup_post_dt = time.perf_counter() - cleanup_post_t0
                 run_dt = time.perf_counter() - run_t0
                 self.after(0, lambda dt=cleanup_post_dt: self._log(f"Timing: post-run cleanup {_format_seconds(dt)}"))
